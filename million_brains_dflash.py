@@ -1246,6 +1246,57 @@ def load_models(model_name: str):
 
 
 # =============================================================================
+# LOCAL KAGGLE LOADERS (for models pre-downloaded to /kaggle/working)
+# =============================================================================
+LOCAL_DFLASH_DIR = "/kaggle/working/Qwen3.5-4B-DFlash"
+LOCAL_BASE_DIR = "/kaggle/working/Qwen3.5-4B"
+
+
+def local_dir_exists(path: str) -> bool:
+    """True if a local model dir exists and contains a config.json (i.e. looks like a real HF checkpoint)."""
+    if not os.path.isdir(path):
+        return False
+    return os.path.isfile(os.path.join(path, "config.json"))
+
+
+def load_local_models() -> Tuple[LLM, Any, LLM, Any]:
+    """
+    Load BOTH the DFlash-tuned checkpoint AND the base Qwen 4B model from local
+    /kaggle/working directories that were populated by the previous snapshot_download
+    cell. Raises RuntimeError if either local dir is missing.
+
+    Returns: (dflash_llm, dflash_tokenizer, base_llm, base_tokenizer)
+    """
+    for d in (LOCAL_DFLASH_DIR, LOCAL_BASE_DIR):
+        if not local_dir_exists(d):
+            raise RuntimeError(
+                f"[LOCAL-LOAD] Required local model dir not found or incomplete: {d}\n"
+                f"  -> Re-run the snapshot_download cell so both /kaggle/working/Qwen3.5-4B-DFlash "
+                f"and /kaggle/working/Qwen3.5-4B are populated."
+            )
+
+    def _load_one(path: str, label: str) -> Tuple[LLM, Any]:
+        print(f"\n[LOCAL-LOAD] Loading {label} from {path} ...")
+        tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        llm = LLM(
+            model=path,
+            trust_remote_code=True,
+            dtype="auto",
+            max_model_len=4096,
+            gpu_memory_utilization=0.42,  # split VRAM between the two engines
+            enforce_eager=False,
+        )
+        print(f"[LOCAL-LOAD] {label} engine ready.")
+        return llm, tokenizer
+
+    dflash_llm, dflash_tok = _load_one(LOCAL_DFLASH_DIR, "DFlash-tuned Qwen3.5-4B")
+    base_llm, base_tok = _load_one(LOCAL_BASE_DIR, "Base Qwen3.5-4B")
+    return dflash_llm, dflash_tok, base_llm, base_tok
+
+
+# =============================================================================
 # BENCHMARK HARNESS
 # =============================================================================
 def benchmark(
@@ -1383,7 +1434,19 @@ if __name__ == "__main__":
 
     # 2) Choose & load model (with the exact fallbacks requested)
     model_name, backend = pick_model_name()
-    vllm_llm, tokenizer, hf_model = load_models(model_name)
+    try:
+        # Prefer the two local pre-downloaded checkpoints (DFlash + base Qwen 4B)
+        dflash_llm, dflash_tok, base_llm, base_tok = load_local_models()
+        vllm_llm, tokenizer, hf_model = dflash_llm, dflash_tok, None
+        # 'base_llm' / 'base_tok' are loaded but not yet wired into the benchmark;
+        # available for a future head-to-head Qwen-base vs Qwen-DFlash comparison.
+        _available_engines = {"dflash": dflash_llm, "base": base_llm}
+    except RuntimeError as _local_e:
+        print(_local_e)
+        print(
+            "[LOCAL-LOAD] Falling back to remote pick_model_name() + load_models() path."
+        )
+        vllm_llm, tokenizer, hf_model = load_models(model_name)
 
     # 3) Sanity: force the banner again so it is unmistakable in the log
     print_one_million_brains_banner(_LIVE_PATCH_SUCCESS)
