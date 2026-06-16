@@ -1,6 +1,8 @@
-# million-brains-dflash
+# one-million-brains-speculative-decoding
 
-<img width="1920" height="2400" alt="image" src="https://github.com/user-attachments/assets/3d47988b-261a-479e-bb1f-f074dfadefc2" />
+
+<img width="784" height="1168" alt="image" src="https://github.com/user-attachments/assets/41dd8f5d-7fb1-4437-acd5-ddc00146e6d9" />
+
 
 **Permutation-Gated Feature-Slot Speculative Decoding** — the Fast Million Brains approach.
 
