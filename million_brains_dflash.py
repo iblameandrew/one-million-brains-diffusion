@@ -118,7 +118,7 @@ GPU: T4 / L4 / A10 / A100 all work (uses 1.5B-3B class models by default for hea
 # When this .py is executed directly (plain python / Kaggle script kernel),
 # the guard below performs the equivalent install so the file stays self-contained.
 # =============================================================================
-# !pip install -q vllm transformers accelerate flash-attn --upgrade
+# !pip install -q "transformers>=4.57" safetensors accelerate vllm kagglehub huggingface_hub --upgrade
 try:
     import IPython
 
@@ -139,10 +139,10 @@ if not _in_notebook:
                 "pip",
                 "install",
                 "-q",
-                "vllm",
-                "transformers",
+                "transformers>=4.57",
+                "safetensors",
                 "accelerate",
-                "flash-attn",
+                "vllm",
                 "--upgrade",
             ],
             stdout=subprocess.DEVNULL,
@@ -154,13 +154,33 @@ if not _in_notebook:
             _inst_e,
         )
 else:
-    # In notebook the magic line above (when the user pastes it as its own cell or at top)
-    # will have executed the install. We leave the comment here exactly as the spec demands.
-    pass
+    # Notebook path: pip is usually run via the !pip magic line, but also try subprocess so
+    # kagglehub is available for Kaggle-native model download when huggingface.co DNS fails.
+    import subprocess, sys
+
+    try:
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-q",
+                "transformers>=4.57",
+                "safetensors",
+                "kagglehub",
+                "huggingface_hub",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
 
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
+SCRIPT_VERSION = "2026-06-16q"  # bump when re-uploading to Kaggle to confirm latest script
 K = 4  # number of parallel drafter streams / feature-slots per super-block
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
 BLOCK_SIZE = 6  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
@@ -190,12 +210,66 @@ CTSB_COHERENCE_GAMMA = 0.25  # TAFK weight on discourse coherence
 CTSB_COHERENCE_ETA = 0.15  # TAFK penalty for stylistic jump vs committed prefix
 CTSB_COHERENCE_KAPPA = 0.12  # TAFK bonus for features continuing from previous circuit
 ANCHOR_SLOT = 0  # slot 0 receives extra smoothing inertia (stable chain scribe)
+# Local/offline model paths (Kaggle: attach a HF dataset or pre-download to /kaggle/working)
+PREFER_LOCAL_MODELS = True  # try /kaggle/input + /kaggle/working before any HuggingFace request
+# Kaggle notebook input root (Add Input -> Notebooks -> godelcomplete/qwen3-5-4b-dflash)
+KAGGLE_QWEN_BUNDLE_ROOT = "/kaggle/input/notebooks/godelcomplete/qwen3-5-4b-dflash"
+LOCAL_MODEL_PATH = KAGGLE_QWEN_BUNDLE_ROOT
+LOCAL_BASE_DIR = f"{KAGGLE_QWEN_BUNDLE_ROOT}/Qwen3.5-4B"  # BASE Qwen — generation target (NOT draft)
+LOCAL_DFLASH_DIR = f"{KAGGLE_QWEN_BUNDLE_ROOT}/Qwen3.5-4B-DFlash"  # DFlash draft only
+BASE_BUNDLE_DIR_NAMES = frozenset({"qwen3.5-4b", "qwen3-5-4b"})
+DRAFT_BUNDLE_DIR_NAMES = frozenset({"qwen3.5-4b-dflash", "qwen3-5-4b-dflash"})
+# vLLM load safety for custom DFlash / Qwen3.5 checkpoints (avoid pooling + torch.compile crash)
+VLLM_ENFORCE_EAGER = True  # required for custom architectures on vLLM v1
+VLLM_RUNNER = "generate"  # do not let vLLM pick pooling/embedding runner
+VLLM_FALLBACK_TO_HF = True  # HuggingFace wrapper if vLLM still cannot load the checkpoint
+PREFER_HF_INFERENCE = True  # Qwen3.5-4B is multimodal; HF is more reliable than vLLM on Kaggle T4
+SKIP_VLLM_FOR_QWEN35 = True  # skip vLLM attempts for qwen3_5 / ConditionalGeneration checkpoints
+AUTO_PREFETCH_TO_WORKING = True  # when online, cache a small Qwen checkpoint into /kaggle/working
+PREFETCH_MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"  # safe default for T4/L4 (22 GB)
+KAGGLEHUB_MODEL_HANDLE = "qwen-lm/qwen2.5/transformers/1.5b-instruct"  # Kaggle Models (no huggingface.co DNS needed)
+KAGGLE_DATASET_HANDLE = "ragnar123/qwen2-5-1-5b"  # optional dataset fallback on Kaggle
+# ---------------------------------------------------------------------------
+# ARC DATA — copy-paste into Kaggle:
+#   1) Add competition input "arc-prize-2026-arc-agi-2"
+#   2) Either keep ARC_DATA_PROFILE = "auto" (detects Kaggle mount automatically)
+#      or force: ARC_DATA_PROFILE = "kaggle"
+# Local dev: auto picks data/ when present; or set ARC_DATA_PROFILE = "local"
+# ---------------------------------------------------------------------------
+ARC_DATA_PROFILE = "auto"  # "auto" | "kaggle" | "local" | "off"
+ARC_DATA_SPLIT = "evaluation"  # "training" | "evaluation"
+KAGGLE_ARC_COMPETITION_DIR = (
+    "/kaggle/input/competitions/arc-prize-2026-arc-agi-2"
+)
+LOCAL_ARC_DATA_DIR = "data"
+# Optional explicit overrides (None = derived from profile + split above)
+EVAL_CHALLENGES_PATH = None
+EVAL_SOLUTIONS_PATH = None
+EVAL_MAX_TASKS = None  # cap tasks for smoke tests; None = all tasks in challenges file
+EVAL_MAX_NEW_TOKENS = 512  # per-task generation budget for ARC prompts
+ARC_VISUAL_GRADING = True  # print + display a grade card for every test case
+ARC_PRINT_ALL_ANSWERS = True  # print every prediction vs ground-truth JSON for every test case
+ARC_EVAL_VERBOSE = False  # False = hide MBR realloc/super-block spam during ARC eval
+# ARC generation: "direct" = one greedy/sampled generate (works on HF). "speculative" = classic dflash loop.
+# Speculative with the SAME model as draft+target + draft temp 0.7 vs greedy verify → mass rejection + garbage.
+ARC_EVAL_GENERATION_MODE = "direct"
+ARC_USE_CHAT_TEMPLATE = True  # Qwen3.5 expects chat_template.jinja wrapping
+ARC_DISABLE_THINKING = True  # Qwen3.5: skip <think> blocks that eat token budget
+ARC_ASSISTANT_PREFILL = "[["  # chat prefill anchors generation as a JSON grid
+ARC_GENERATION_TEMPERATURE = 0.0  # greedy JSON for grid tasks
+ARC_RUN_MBR_EVAL = True  # False = skip slow million-brains pass (classic-only smoke tests)
+ARC_SAVE_GRADE_IMAGES = True  # save PNG grade cards (arc_grades/ or /kaggle/working/arc_grades/)
+ARC_SHOW_TRAIN_EXAMPLES = True  # include train pair thumbnails on each grade card
+ARC_ANSWER_REPORT_PATH = None  # None = auto (/kaggle/working/arc_answer_report.json or arc_answer_report.json)
 
 # =============================================================================
 # STANDARD LIBRARY + ML IMPORTS
 # =============================================================================
 import os
 import sys
+import socket
+import argparse
+import re
 import math
 import time
 import random
@@ -216,9 +290,40 @@ import torch.nn.functional as F
 # Heavy libraries (installed above)
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from vllm import LLM, SamplingParams
-from vllm.spec_decode import (
-    draft_model as vllm_draft_module,
-)  # for live patching target
+
+
+def _resolve_vllm_draft_module():
+    """
+    Locate vLLM's draft/spec-decode module across API versions.
+
+    Legacy vLLM (<=0.6): vllm.spec_decode.draft_model (DraftModel)
+    Current vLLM (v1 engine): vllm.v1.spec_decode.draft_model (DraftModelProposer)
+    """
+    import importlib
+    import types
+
+    candidates = (
+        "vllm.spec_decode.draft_model",
+        "vllm.v1.spec_decode.draft_model",
+        "vllm.v1.spec_decode",
+    )
+    for mod_path in candidates:
+        try:
+            return importlib.import_module(mod_path)
+        except ModuleNotFoundError:
+            continue
+
+    print(
+        "[IMPORT] vLLM draft module not found (tried "
+        + ", ".join(candidates)
+        + "); using in-process stub for live-edit fallback."
+    )
+    stub = types.ModuleType("vllm_draft_stub")
+    sys.modules.setdefault("vllm.spec_decode.draft_model", stub)
+    return stub
+
+
+vllm_draft_module = _resolve_vllm_draft_module()  # for live patching target
 
 # =============================================================================
 # FIXED BANK OF 12 PERSONALITY FEATURES
@@ -907,26 +1012,71 @@ def compute_accepted_tokens(
     return accepted, rate
 
 
+def _logprob_from_entry(entry: Any, token_id: int) -> float:
+    """Extract one logprob from a vLLM Logprob object or HF float dict entry."""
+    if entry is None:
+        return -0.8
+    if isinstance(entry, dict):
+        if token_id in entry:
+            val = entry[token_id]
+            if hasattr(val, "logprob"):
+                return float(val.logprob)
+            return float(val)
+        if entry:
+            val = next(iter(entry.values()))
+            if hasattr(val, "logprob"):
+                return float(val.logprob)
+            return float(val)
+    if hasattr(entry, "token") and int(entry.token) == int(token_id):
+        return float(getattr(entry, "logprob", -0.8))
+    return -0.8
+
+
 def extract_logprob_for_token(logprob_dict_or_list: Any, token_id: int) -> float:
     """
     vLLM returns different structures depending on version / prompt_logprobs vs logprobs.
-    This helper is defensive.
+    This helper is defensive (vLLM Logprob objects and HF float dicts).
     """
     try:
-        if isinstance(logprob_dict_or_list, dict):
-            if token_id in logprob_dict_or_list:
-                return float(logprob_dict_or_list[token_id].logprob)
-            # fallback: take the top entry
-            if logprob_dict_or_list:
-                return float(next(iter(logprob_dict_or_list.values())).logprob)
+        return _logprob_from_entry(logprob_dict_or_list, token_id)
+    except Exception:
+        pass
+    try:
         if isinstance(logprob_dict_or_list, list):
             for entry in logprob_dict_or_list:
-                if hasattr(entry, "token") and entry.token == token_id:
-                    return float(getattr(entry, "logprob", -1.0))
-        # last resort neutral
-        return -0.8
+                if isinstance(entry, dict) and token_id in entry:
+                    return _logprob_from_entry(entry, token_id)
+                if hasattr(entry, "token") and int(entry.token) == int(token_id):
+                    return float(getattr(entry, "logprob", -0.8))
     except Exception:
-        return -0.9
+        pass
+    return -0.9
+
+
+def extract_target_logprobs_for_draft(
+    prompt_logprobs: Optional[List[Optional[Dict[int, Any]]]],
+    draft_token_ids: List[int],
+) -> List[float]:
+    """Map each draft token to its target logprob from the prompt tail."""
+    if not prompt_logprobs or not draft_token_ids:
+        return [-0.8] * len(draft_token_ids)
+    tail_start = len(prompt_logprobs) - len(draft_token_ids)
+    out: List[float] = []
+    for i, tid in enumerate(draft_token_ids):
+        pos = tail_start + i
+        if pos < 0 or pos >= len(prompt_logprobs):
+            out.append(-0.8)
+            continue
+        out.append(_logprob_from_entry(prompt_logprobs[pos], tid))
+    return out
+
+
+def make_target_verify_sampling_params() -> SamplingParams:
+    """
+    Target verification forward: prompt logprobs on the drafted suffix.
+    vLLM rejects max_tokens=0; HF fallback ignores the 1 throwaway decode step.
+    """
+    return SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=True)
 
 
 # =============================================================================
@@ -943,6 +1093,7 @@ def million_brains_dflash_generate(
     enable_reallocation: bool = True,
     enable_smoothing: bool = ENABLE_CIRCUIT_SMOOTHING,
     seed: int = 42,
+    verbose: bool = True,
 ) -> Dict[str, Any]:
     """
     Full one-million-brains-dflash loop (permutation-driven feature-slot allocation).
@@ -1054,12 +1205,17 @@ def million_brains_dflash_generate(
         proposals: List[List[int]] = []
         draft_lps: List[List[float]] = []
         for out in outs:
-            tok_ids = list(out.outputs[0].token_ids)[:block_size]
+            if not out.outputs:
+                proposals.append([])
+                draft_lps.append([])
+                continue
+            completion = out.outputs[0]
+            tok_ids = list(completion.token_ids)[:block_size]
             lps = []
-            if out.outputs[0].logprobs:
+            if completion.logprobs:
                 for tid in tok_ids:
                     lp = extract_logprob_for_token(
-                        out.outputs[0].logprobs[-len(tok_ids) :], tid
+                        completion.logprobs[-len(tok_ids) :], tid
                     )
                     lps.append(lp)
             else:
@@ -1102,21 +1258,16 @@ def million_brains_dflash_generate(
         fused_text = tokenizer.decode(fused_proposal, skip_special_tokens=True)
         candidates_for_verify.append(base + fused_text)
 
-        verify_params = SamplingParams(
-            temperature=0.0,
-            max_tokens=0,
-            prompt_logprobs=True,
-        )
+        verify_params = make_target_verify_sampling_params()
         verify_outs = vllm_llm.generate(candidates_for_verify, verify_params)
 
         # Extract target logprobs for the drafted region of each candidate
         target_lps_per_path: List[List[float]] = []
         for j, vout in enumerate(verify_outs):
-            plp = vout.prompt_logprobs or []
-            drafted_lps = []
             target_ids = proposals[j] if j < len(proposals) else fused_proposal
-            for tid in target_ids:
-                drafted_lps.append(extract_logprob_for_token(plp, tid) if plp else -0.6)
+            drafted_lps = extract_target_logprobs_for_draft(
+                vout.prompt_logprobs, target_ids
+            )
             target_lps_per_path.append(drafted_lps)
 
         # 5) Run generalized cumprod acceptance on every path
@@ -1205,32 +1356,38 @@ def million_brains_dflash_generate(
                         active_feature_indices[i] = new_feat
                         feature_reallocations += 1
                         ema_accept[i] = 0.55
-                        print(
-                            f"  [REALLOC] Slot {i} feature {old_name} -> {PERSONALITY_FEATURES[new_feat]} (EMA accept {ema_accept[i]:.3f})"
-                        )
+                        if verbose:
+                            print(
+                                f"  [REALLOC] Slot {i} feature {old_name} -> "
+                                f"{PERSONALITY_FEATURES[new_feat]} (EMA accept {ema_accept[i]:.3f})"
+                            )
 
         # 8) Full rejection handling (equivalent to "Reframe")
         if accepted_len == 0 and enable_reallocation:
             reframe_events += 1
-            print(
-                f"  [DIVERGENCE] Super-block {sb} produced zero accepted tokens. Boosting proposal diversity for next block."
-            )
+            if verbose:
+                print(
+                    f"  [DIVERGENCE] Super-block {sb} produced zero accepted tokens. "
+                    "Boosting proposal diversity for next block."
+                )
 
         # 9) Diagnostic logging (feature-slot view)
-        gmask = GroupThinkMask(
-            k=k,
-            block_size=block_size,
-            phase="integration" if accepted_len > 0 else "draft",
-        )
-        if sb < 2 or accepted_len == 0:
-            smooth_note = (
-                f" | λ={blend_lambda:.2f}"
-                if smoother is not None
-                else ""
+        if verbose:
+            gmask = GroupThinkMask(
+                k=k,
+                block_size=block_size,
+                phase="integration" if accepted_len > 0 else "draft",
             )
-            print(
-                f"    Super-block {sb:02d} | features={active_feature_names} | accepted={accepted_len}/{block_size}{smooth_note} | mask={gmask.describe()}"
-            )
+            if sb < 2 or accepted_len == 0:
+                smooth_note = (
+                    f" | λ={blend_lambda:.2f}"
+                    if smoother is not None
+                    else ""
+                )
+                print(
+                    f"    Super-block {sb:02d} | features={active_feature_names} | "
+                    f"accepted={accepted_len}/{block_size}{smooth_note} | mask={gmask.describe()}"
+                )
 
         if len(generated_ids) >= max_new_tokens:
             break
@@ -1310,10 +1467,12 @@ def classic_dflash_generate(
 
         # Target verification forward on the single extended candidate
         candidate = current_text + tokenizer.decode(draft_ids, skip_special_tokens=True)
-        vsp = SamplingParams(temperature=0.0, max_tokens=0, prompt_logprobs=True)
-        vout = vllm_llm.generate([candidate], vsp)[0]
-        plp = vout.prompt_logprobs or []
-        target_lps = [extract_logprob_for_token(plp, tid) for tid in draft_ids]
+        vout = vllm_llm.generate(
+            [candidate], make_target_verify_sampling_params()
+        )[0]
+        target_lps = extract_target_logprobs_for_draft(
+            vout.prompt_logprobs, draft_ids
+        )
 
         acc, rate = compute_accepted_tokens(draft_ids, target_lps, draft_lps)
         acceptance_history.append(rate)
@@ -1375,7 +1534,7 @@ class MillionBrainsDFlashDraftModel:
 # LIVE EDIT / MONKEY-PATCH SECTION (the "preemptive" DFlash injection)
 # This must run immediately after the pip install and before heavy model loading.
 # Strategy:
-#   1. Attempt to locate vllm.spec_decode.draft_model on disk and surgically
+#   1. Attempt to locate vllm.spec_decode / vllm.v1.spec_decode draft_model on disk and surgically
 #      overwrite key classes / methods with one-million-brains-dflash versions (file fallback).
 #   2. Always perform runtime monkey-patching via subclass + module replacement.
 #   3. Inject a global "MILLION_BRAINS_DFLASH" symbol so user code can detect the patch.
@@ -1509,7 +1668,9 @@ class MillionBrainsDFlashDraftModel:  # type: ignore
 
         # Subclass replacement (what user code importing DraftModel will see)
         try:
-            OriginalDraft = getattr(vllm_draft_module, "DraftModel", None)
+            OriginalDraft = getattr(vllm_draft_module, "DraftModel", None) or getattr(
+                vllm_draft_module, "DraftModelProposer", None
+            )
             if OriginalDraft is not None:
 
                 class PatchedDraftModel(OriginalDraft):  # type: ignore
@@ -1524,12 +1685,16 @@ class MillionBrainsDFlashDraftModel:  # type: ignore
                             "[PatchedDraftModel] Runtime subclass active - one-million-brains-dflash ready"
                         )
 
-                vllm_draft_module.DraftModel = PatchedDraftModel
+                draft_cls_name = getattr(OriginalDraft, "__name__", "DraftModel")
+                if hasattr(vllm_draft_module, "DraftModel"):
+                    vllm_draft_module.DraftModel = PatchedDraftModel
+                if hasattr(vllm_draft_module, "DraftModelProposer"):
+                    vllm_draft_module.DraftModelProposer = PatchedDraftModel
                 sys.modules.setdefault("dflash", type(sys)("dflash"))
                 sys.modules["dflash"].DraftModel = PatchedDraftModel
                 sys.modules["dflash"].MILLION_BRAINS_DFLASH_PATCHED = True
                 print(
-                    "    [RUNTIME PATCH] vllm.spec_decode.draft_model.DraftModel replaced with one-million-brains-dflash feature-slot aware subclass"
+                    f"    [RUNTIME PATCH] {vllm_draft_module.__name__}.{draft_cls_name} replaced with one-million-brains-dflash feature-slot aware subclass"
                 )
             else:
                 # No original DraftModel - still expose our allocator
@@ -1581,6 +1746,7 @@ def print_one_million_brains_banner(success: bool = True):
             " Patch status: %s"
             % ("SUCCESS (file+runtime)" if _LIVE_PATCH_SUCCESS else "RUNTIME ONLY")
         )
+        print(f" Script version: {SCRIPT_VERSION}")
     else:
         print(
             " ONE-MILLION-BRAINS-FLASH INITIALIZED (DEGRADED - patch encountered errors, pure-Python fallback active)"
@@ -1594,8 +1760,322 @@ print_one_million_brains_banner(_LIVE_PATCH_SUCCESS)
 
 
 # =============================================================================
-# MODEL LOADING WITH FALLBACK (z-lab/Qwen3.5-4B-DFlash first, then real Qwen)
+# MODEL LOADING WITH FALLBACK (local/offline first, then HuggingFace when online)
 # =============================================================================
+def _on_kaggle() -> bool:
+    return os.path.isdir("/kaggle/working")
+
+
+def network_available(host: str = "huggingface.co", port: int = 443, timeout: float = 3.0) -> bool:
+    """Return False when Kaggle internet is off or DNS cannot resolve the host."""
+    try:
+        socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        return True
+    except OSError:
+        return False
+
+
+def any_download_channel_available() -> bool:
+    """True if at least one known model download endpoint resolves."""
+    for host in ("kaggle.com", "huggingface.co", "hf.co"):
+        if network_available(host):
+            return True
+    return False
+
+
+def local_dir_exists(path: str) -> bool:
+    """True if a local model dir exists and contains a config.json (i.e. looks like a real HF checkpoint)."""
+    if not path or not os.path.isdir(path):
+        return False
+    return os.path.isfile(os.path.join(path, "config.json"))
+
+
+def resolve_checkpoint_dir(path: str, max_depth: int = 3) -> Optional[str]:
+    """
+    Return the directory that directly contains config.json.
+    Handles Kaggle notebook-input mounts where weights may be one level nested.
+    """
+    if not path or not os.path.isdir(path):
+        return None
+    if local_dir_exists(path):
+        return os.path.abspath(path)
+
+    found: List[str] = []
+
+    def _walk(base: str, depth: int) -> None:
+        if depth > max_depth or not os.path.isdir(base):
+            return
+        if local_dir_exists(base):
+            found.append(os.path.abspath(base))
+            return
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            return
+        for entry in entries:
+            _walk(os.path.join(base, entry), depth + 1)
+
+    _walk(path, 0)
+    if not found:
+        return None
+    return sorted(found, key=_resolve_checkpoint_priority)[0]
+
+
+def _resolve_checkpoint_priority(path: str) -> Tuple[int, int, int, str]:
+    """When a mount nests BASE + DFlash, prefer the full causal-LM checkpoint."""
+    name = os.path.basename(path).lower()
+    draft_rank = 1 if is_dflash_draft_checkpoint(path) else 0
+    size_rank = 0
+    if "4b" in name or "4-b" in name:
+        size_rank -= 10
+    elif "3b" in name or "3-b" in name:
+        size_rank -= 8
+    elif "1.5b" in name or "1_5b" in name:
+        size_rank -= 5
+    if "qwen" in name:
+        size_rank -= 3
+    return (draft_rank, size_rank, -len(name), path)
+
+
+def _checkpoint_priority(path: str) -> Tuple[int, int, str]:
+    """Lower tuple sorts earlier: prefer DFlash-tuned, then larger Qwen, then lexicographic."""
+    name = os.path.basename(path).lower()
+    score = 0
+    if "dflash" in name:
+        score -= 100
+    if "qwen" in name:
+        score -= 20
+    if "1.5b" in name or "1_5b" in name:
+        score -= 5
+    if "3b" in name or "3-b" in name:
+        score -= 8
+    if "4b" in name or "4-b" in name:
+        score -= 10
+    if "7b" in name or "7-b" in name:
+        score -= 12
+    return (score, -len(name), path)
+
+
+def discover_hf_hub_cache_checkpoints() -> List[str]:
+    """Find materialized snapshots under the HuggingFace hub cache."""
+    found: List[str] = []
+    for cache_root in (
+        os.path.expanduser("~/.cache/huggingface/hub"),
+        "/root/.cache/huggingface/hub",
+    ):
+        if not os.path.isdir(cache_root):
+            continue
+        try:
+            entries = os.listdir(cache_root)
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.startswith("models--"):
+                continue
+            snapshots_dir = os.path.join(cache_root, entry, "snapshots")
+            if not os.path.isdir(snapshots_dir):
+                continue
+            try:
+                snaps = os.listdir(snapshots_dir)
+            except OSError:
+                continue
+            for snap in snaps:
+                snap_path = os.path.join(snapshots_dir, snap)
+                if local_dir_exists(snap_path):
+                    found.append(os.path.abspath(snap_path))
+    return found
+
+
+def discover_local_checkpoints(
+    extra_roots: Optional[List[str]] = None,
+    max_depth: int = 4,
+) -> List[str]:
+    """
+    Scan Kaggle input/working trees (and HF hub cache) for HuggingFace-style checkpoints.
+    Typical dataset mount: /kaggle/input/<dataset>/<model-dir>/config.json
+    """
+    roots: List[str] = []
+    if extra_roots:
+        roots.extend(extra_roots)
+    for root in (
+        "/kaggle/working",
+        "/kaggle/input",
+        os.path.expanduser("~/.cache/kagglehub"),
+        "/root/.cache/kagglehub",
+    ):
+        if os.path.isdir(root) and root not in roots:
+            roots.append(root)
+
+    found: List[str] = list(discover_hf_hub_cache_checkpoints())
+
+    def _walk(base: str, depth: int) -> None:
+        if depth > max_depth or not os.path.isdir(base):
+            return
+        if local_dir_exists(base):
+            found.append(os.path.abspath(base))
+            return
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            return
+        for entry in entries:
+            _walk(os.path.join(base, entry), depth + 1)
+
+    for root in roots:
+        _walk(root, 0)
+
+    ranked = sorted(set(found), key=_checkpoint_priority)
+    return ranked
+
+
+def resolve_local_model_path(prefer_generation: bool = True) -> Optional[str]:
+    """Pick the best available on-disk checkpoint without touching the network."""
+    explicit = [p for p in (LOCAL_BASE_DIR, LOCAL_DFLASH_DIR, LOCAL_MODEL_PATH) if p]
+    resolved_list: List[str] = []
+    seen: set = set()
+    for path in explicit:
+        resolved = resolve_checkpoint_dir(path)
+        if resolved and resolved not in seen:
+            seen.add(resolved)
+            if resolved != os.path.abspath(path):
+                print(f"[LOCAL-LOAD] Resolved nested checkpoint: {path} -> {resolved}")
+            resolved_list.append(resolved)
+
+    if prefer_generation:
+        for resolved in resolved_list:
+            if is_full_causal_lm_checkpoint(resolved):
+                return resolved
+    if resolved_list:
+        return resolved_list[0]
+
+    discovered = discover_local_checkpoints()
+    if discovered:
+        print(f"[LOCAL-LOAD] Auto-discovered {len(discovered)} local checkpoint(s):")
+        for p in discovered:
+            role = "FULL" if is_full_causal_lm_checkpoint(p) else (
+                "DRAFT" if is_dflash_draft_checkpoint(p) else "UNKNOWN"
+            )
+            print(f"    - {p} [{role}]")
+        if prefer_generation:
+            for p in discovered:
+                if is_full_causal_lm_checkpoint(p):
+                    return p
+        return discovered[0]
+    return None
+
+
+def _prefetch_target_dir() -> str:
+    short = PREFETCH_MODEL_ID.split("/")[-1]
+    if _on_kaggle():
+        return os.path.join("/kaggle/working", short)
+    return os.path.join(os.getcwd(), short)
+
+
+def prefetch_via_kagglehub(target_dir: str) -> Optional[str]:
+    """Download via Kaggle Models API — works when huggingface.co DNS fails."""
+    if not KAGGLEHUB_MODEL_HANDLE:
+        return None
+    try:
+        import kagglehub
+
+        print(
+            f"[PREFETCH] Kaggle Models: {KAGGLEHUB_MODEL_HANDLE} -> {target_dir}"
+        )
+        downloaded = kagglehub.model_download(
+            KAGGLEHUB_MODEL_HANDLE,
+            output_dir=target_dir,
+        )
+        for candidate in (downloaded, target_dir):
+            if local_dir_exists(candidate):
+                print(f"[PREFETCH] Kaggle Models cached at {candidate}")
+                return os.path.abspath(candidate)
+    except Exception as e:
+        print(f"[PREFETCH] Kaggle Models failed ({type(e).__name__}: {e})")
+    return None
+
+
+def prefetch_via_kaggle_dataset() -> Optional[str]:
+    """Fallback: attach/download a public Kaggle dataset that ships the weights."""
+    if not KAGGLE_DATASET_HANDLE:
+        return None
+    try:
+        import kagglehub
+
+        print(f"[PREFETCH] Kaggle Dataset: {KAGGLE_DATASET_HANDLE}")
+        dataset_path = kagglehub.dataset_download(KAGGLE_DATASET_HANDLE)
+        discovered = discover_local_checkpoints(extra_roots=[dataset_path], max_depth=5)
+        if discovered:
+            print(f"[PREFETCH] Dataset checkpoint: {discovered[0]}")
+            return discovered[0]
+    except Exception as e:
+        print(f"[PREFETCH] Kaggle Dataset failed ({type(e).__name__}: {e})")
+    return None
+
+
+def prefetch_via_huggingface(target_dir: str) -> Optional[str]:
+    """Download from HuggingFace Hub when DNS to huggingface.co/hf.co works."""
+    if not network_available("huggingface.co") and not network_available("hf.co"):
+        return None
+    try:
+        from huggingface_hub import snapshot_download
+
+        print(
+            f"[PREFETCH] HuggingFace: {PREFETCH_MODEL_ID} -> {target_dir}"
+        )
+        snapshot_download(
+            repo_id=PREFETCH_MODEL_ID,
+            local_dir=target_dir,
+            local_dir_use_symlinks=False,
+        )
+        if local_dir_exists(target_dir):
+            print(f"[PREFETCH] HuggingFace cached at {target_dir}")
+            return target_dir
+    except Exception as e:
+        print(f"[PREFETCH] HuggingFace failed ({type(e).__name__}: {e})")
+    return None
+
+
+def ensure_model_available() -> Optional[str]:
+    """
+    Ensure a usable on-disk checkpoint exists before vLLM load.
+    Order: existing local -> HF hub cache -> Kaggle Models -> Kaggle Dataset -> HuggingFace.
+    """
+    existing = resolve_local_model_path()
+    if existing:
+        return existing
+
+    if not AUTO_PREFETCH_TO_WORKING:
+        return None
+
+    if not any_download_channel_available():
+        print(
+            "[PREFETCH] No download channel reachable (Kaggle Internet is likely OFF). "
+            "Turn Internet ON in notebook Settings, or attach a model dataset."
+        )
+        return None
+
+    target_dir = _prefetch_target_dir()
+    if local_dir_exists(target_dir):
+        print(f"[PREFETCH] Reusing cached model at {target_dir}")
+        return target_dir
+
+    for fetcher in (
+        lambda: prefetch_via_kagglehub(target_dir),
+        prefetch_via_kaggle_dataset,
+        lambda: prefetch_via_huggingface(target_dir),
+    ):
+        path = fetcher()
+        if path and local_dir_exists(path):
+            return path
+
+    return resolve_local_model_path()
+
+
+def maybe_prefetch_model_to_working() -> Optional[str]:
+    """Backward-compatible alias used by main()."""
+    return ensure_model_available()
+
+
 def pick_model_name() -> Tuple[str, str]:
     """
     VRAM-aware + fallback logic exactly as requested.
@@ -1609,6 +2089,30 @@ def pick_model_name() -> Tuple[str, str]:
         props = torch.cuda.get_device_properties(0)
         gpu_mem_gb = props.total_memory / (1024**3)
         print(f"[GPU] Detected {props.name} with {gpu_mem_gb:.1f} GB VRAM")
+
+    if PREFER_LOCAL_MODELS:
+        local_path = resolve_local_model_path()
+        if local_path:
+            print(f"[MODEL] Using local checkpoint (no HuggingFace HEAD requests): {local_path}")
+            return local_path, "vllm"
+
+    ensure_model_available()
+    local_path = resolve_local_model_path()
+    if local_path:
+        print(f"[MODEL] Using local checkpoint after prefetch: {local_path}")
+        return local_path, "vllm"
+
+    if not any_download_channel_available():
+        raise RuntimeError(
+            "[MODEL] No local checkpoint found and no download channel is reachable.\n"
+            "  Fix (pick one):\n"
+            "    1. Kaggle Settings -> Internet -> ON, restart kernel, re-run ALL cells from the top.\n"
+            "    2. Add dataset 'ragnar123/qwen2-5-1-5b' (or any HF model dataset) as notebook Input.\n"
+            "    3. Set LOCAL_MODEL_PATH = '/kaggle/input/<your-dataset>/<model-folder>' at the top.\n"
+            "    4. Run this once with Internet ON:\n"
+            "         import kagglehub\n"
+            f"         kagglehub.model_download('{KAGGLEHUB_MODEL_HANDLE}', output_dir='/kaggle/working/Qwen2.5-1.5B-Instruct')"
+        )
 
     candidates = [
         "z-lab/Qwen3.5-4B-DFlash",  # the requested fictional/special model
@@ -1635,102 +2139,2584 @@ def pick_model_name() -> Tuple[str, str]:
     return "Qwen/Qwen2.5-1.5B-Instruct", "vllm"
 
 
+def _read_hf_config(model_path: str) -> Dict[str, Any]:
+    cfg_path = os.path.join(model_path, "config.json")
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _list_checkpoint_weight_keys(model_path: str) -> List[str]:
+    """Read tensor key names from safetensors index or shard files."""
+    keys: List[str] = []
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                index_data = json.load(f)
+            keys.extend(list(index_data.get("weight_map", {}).keys()))
+        except Exception:
+            pass
+    if keys:
+        return keys
+
+    safe_open = None
+    try:
+        from safetensors import safe_open as _safe_open
+
+        safe_open = _safe_open
+    except ImportError:
+        pass
+
+    try:
+        entries = sorted(os.listdir(model_path))
+    except OSError:
+        return keys
+
+    for fname in entries:
+        if not fname.endswith(".safetensors"):
+            continue
+        if "model" not in fname.lower():
+            continue
+        fpath = os.path.join(model_path, fname)
+        if safe_open is not None:
+            try:
+                with safe_open(fpath, framework="pt") as shard:
+                    keys.extend(list(shard.keys()))
+            except Exception:
+                pass
+        else:
+            keys.append(fname)
+    return keys
+
+
+def _checkpoint_has_weight_files(model_path: str) -> bool:
+    try:
+        for fname in os.listdir(model_path):
+            if fname.endswith((".safetensors", ".bin")) and "model" in fname.lower():
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _checkpoint_vocab_size(cfg: Dict[str, Any]) -> Optional[int]:
+    vocab = cfg.get("vocab_size")
+    if vocab:
+        return int(vocab)
+    text_cfg = cfg.get("text_config") or {}
+    vocab = text_cfg.get("vocab_size")
+    return int(vocab) if vocab else None
+
+
+def _checkpoint_model_info(model_path: str) -> Dict[str, Any]:
+    cfg: Dict[str, Any] = {}
+    try:
+        cfg = _read_hf_config(model_path)
+    except Exception:
+        pass
+    archs = [str(a) for a in (cfg.get("architectures") or [])]
+    model_type = str(cfg.get("model_type", ""))
+    return {
+        "architectures": archs,
+        "model_type": model_type,
+        "vocab_size": _checkpoint_vocab_size(cfg),
+        "is_qwen35": model_type == "qwen3_5"
+        or any("Qwen3_5" in a for a in archs),
+        "is_multimodal": bool(cfg.get("vision_config") or cfg.get("video_token_id")),
+        "is_text_generator": any(
+            tag in a
+            for a in archs
+            for tag in ("CausalLM", "ConditionalGeneration", "ImageTextToText")
+        ),
+    }
+
+
+def bundle_folder_role(model_path: str) -> Optional[str]:
+    """
+    Trust Kaggle bundle folder names over weight heuristics.
+    Qwen3.5-4B = base Qwen for generation. Qwen3.5-4B-DFlash = draft only.
+    """
+    if not model_path:
+        return None
+    name = os.path.basename(os.path.abspath(model_path)).lower()
+    if name in DRAFT_BUNDLE_DIR_NAMES or name.endswith("-dflash"):
+        return "draft"
+    if "dflash" in name and "qwen" in name:
+        return "draft"
+    if name in BASE_BUNDLE_DIR_NAMES:
+        return "base"
+    if "qwen" in name and "4b" in name and "dflash" not in name:
+        return "base"
+    return None
+
+
+def print_checkpoint_diagnostics(model_path: str, indent: str = "        ") -> None:
+    """Emit architecture/weight hints to simplify Kaggle debugging."""
+    if not model_path or not local_dir_exists(model_path):
+        print(f"{indent}(missing or no config.json)")
+        return
+    info = _checkpoint_model_info(model_path)
+    keys = _list_checkpoint_weight_keys(model_path)
+    has_embed = any("embed_tokens" in k for k in keys)
+    has_fc = any(".fc.weight" in k or k.endswith("fc.weight") for k in keys)
+    print(
+        f"{indent}arch={info['architectures']} model_type={info['model_type']!r} "
+        f"vocab={info['vocab_size']} embed={has_embed} fc={has_fc} "
+        f"weights={len(keys)} shard(s)"
+    )
+
+
+def is_full_causal_lm_checkpoint(model_path: str) -> bool:
+    """Positive check: checkpoint has embedding table(s) and can generate text."""
+    if not local_dir_exists(model_path):
+        return False
+
+    if bundle_folder_role(model_path) == "base":
+        return True
+
+    keys = _list_checkpoint_weight_keys(model_path)
+    if any("embed_tokens" in k for k in keys):
+        return True
+    if any("lm_head" in k for k in keys):
+        return True
+
+    try:
+        cfg = _read_hf_config(model_path)
+        info = _checkpoint_model_info(model_path)
+        if not info["is_text_generator"]:
+            return False
+        if not info["vocab_size"]:
+            return False
+        if _checkpoint_has_weight_files(model_path):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def is_dflash_draft_checkpoint(model_path: str) -> bool:
+    """
+    DFlash draft weights ship fc/hidden_norm but not embed_tokens.
+    Folder-name rules take priority: Qwen3.5-4B is NEVER a draft.
+    """
+    if not local_dir_exists(model_path):
+        return False
+
+    role = bundle_folder_role(model_path)
+    if role == "base":
+        return False
+    if role == "draft":
+        return True
+
+    if is_full_causal_lm_checkpoint(model_path):
+        return False
+
+    name_l = os.path.basename(model_path).lower()
+    if "dflash" in name_l:
+        return True
+
+    keys = _list_checkpoint_weight_keys(model_path)
+    if keys:
+        has_fc = any(".fc.weight" in k or k.endswith("fc.weight") for k in keys)
+        has_hidden_norm = any("hidden_norm" in k for k in keys)
+        if has_fc or has_hidden_norm:
+            return True
+
+    try:
+        cfg = _read_hf_config(model_path)
+        archs = [str(a) for a in (cfg.get("architectures") or [])]
+        if any("dflash" in a.lower() or "draft" in a.lower() for a in archs):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def discover_qwen_dflash_bundle_paths() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Resolve BASE + DFLASH folders for the qwen3.5-4b-dflash Kaggle bundle.
+    Checks KAGGLE_QWEN_BUNDLE_ROOT first, then scans /kaggle/input.
+    """
+    base_candidates: List[str] = []
+    draft_candidates: List[str] = []
+
+    bundle_root = KAGGLE_QWEN_BUNDLE_ROOT
+    if bundle_root and os.path.isdir(bundle_root):
+        base_candidate = os.path.join(bundle_root, "Qwen3.5-4B")
+        draft_candidate = os.path.join(bundle_root, "Qwen3.5-4B-DFlash")
+        if local_dir_exists(base_candidate):
+            base_candidates.append(os.path.abspath(base_candidate))
+        if local_dir_exists(draft_candidate):
+            draft_candidates.append(os.path.abspath(draft_candidate))
+
+    for raw, bucket in (
+        (LOCAL_BASE_DIR, base_candidates),
+        (LOCAL_DFLASH_DIR, draft_candidates),
+        (LOCAL_MODEL_PATH, base_candidates),
+    ):
+        if not raw:
+            continue
+        resolved = resolve_checkpoint_dir(raw)
+        if not resolved:
+            continue
+        if is_dflash_draft_checkpoint(resolved):
+            draft_candidates.append(resolved)
+        elif is_full_causal_lm_checkpoint(resolved):
+            base_candidates.append(resolved)
+
+    if os.path.isdir("/kaggle/input"):
+        found: List[str] = []
+
+        def _walk(base: str, depth: int) -> None:
+            if depth > 6 or not os.path.isdir(base):
+                return
+            if local_dir_exists(base):
+                found.append(os.path.abspath(base))
+                return
+            try:
+                entries = sorted(os.listdir(base))
+            except OSError:
+                return
+            for entry in entries:
+                if entry.startswith("."):
+                    continue
+                _walk(os.path.join(base, entry), depth + 1)
+
+        _walk("/kaggle/input", 0)
+        for path in found:
+            name = os.path.basename(path).lower()
+            if "dflash" in name and is_dflash_draft_checkpoint(path):
+                draft_candidates.append(path)
+            elif is_full_causal_lm_checkpoint(path) and "dflash" not in name:
+                base_candidates.append(path)
+
+    def _uniq(paths: List[str]) -> List[str]:
+        out: List[str] = []
+        seen: set = set()
+        for p in paths:
+            if p and p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out
+
+    base_candidates = _uniq(base_candidates)
+    draft_candidates = _uniq(draft_candidates)
+
+    def _base_rank(path: str) -> Tuple[int, int, str]:
+        name = os.path.basename(path).lower()
+        score = 0
+        if "dflash" in name:
+            score += 1000
+        if name in ("qwen3.5-4b", "qwen3-5-4b"):
+            score -= 50
+        if "4b" in name:
+            score -= 10
+        if "qwen" in name:
+            score -= 5
+        return (score, -len(name), path)
+
+    def _draft_rank(path: str) -> Tuple[int, str]:
+        name = os.path.basename(path).lower()
+        score = 0 if "dflash" in name else 1
+        return (score, path)
+
+    base = sorted(base_candidates, key=_base_rank)[0] if base_candidates else None
+    draft = sorted(draft_candidates, key=_draft_rank)[0] if draft_candidates else None
+    return base, draft
+
+
+def find_paired_dflash_draft(base_path: str) -> Optional[str]:
+    """Locate a DFlash draft sibling for a full base checkpoint."""
+    candidates: List[str] = []
+
+    explicit = resolve_checkpoint_dir(LOCAL_DFLASH_DIR)
+    if explicit and is_dflash_draft_checkpoint(explicit):
+        candidates.append(explicit)
+
+    search_roots: List[str] = []
+    for root in (base_path, os.path.dirname(base_path), LOCAL_MODEL_PATH):
+        if root and os.path.isdir(root) and root not in search_roots:
+            search_roots.append(root)
+
+    for search_root in search_roots:
+        try:
+            for entry in sorted(os.listdir(search_root)):
+                if "dflash" not in entry.lower():
+                    continue
+                resolved = resolve_checkpoint_dir(os.path.join(search_root, entry))
+                if resolved and is_dflash_draft_checkpoint(resolved):
+                    candidates.append(resolved)
+        except OSError:
+            pass
+
+    def _draft_priority(path: str) -> Tuple[int, str]:
+        name = os.path.basename(path).lower()
+        score = 0 if "dflash" in name else 1
+        return (score, path)
+
+    ranked = sorted(set(candidates), key=_draft_priority)
+    return ranked[0] if ranked else None
+
+
+def find_paired_base_checkpoint(dflash_path: str) -> Optional[str]:
+    """Locate a full causal-LM checkpoint to pair with a DFlash draft directory."""
+    candidates: List[str] = []
+
+    explicit = resolve_checkpoint_dir(LOCAL_BASE_DIR)
+    if explicit and is_full_causal_lm_checkpoint(explicit):
+        candidates.append(explicit)
+
+    parent = os.path.dirname(dflash_path)
+    if os.path.isdir(parent):
+        try:
+            for entry in sorted(os.listdir(parent)):
+                sibling = os.path.join(parent, entry)
+                resolved = resolve_checkpoint_dir(sibling)
+                if (
+                    resolved
+                    and resolved != dflash_path
+                    and is_full_causal_lm_checkpoint(resolved)
+                ):
+                    candidates.append(resolved)
+        except OSError:
+            pass
+
+    for discovered in discover_local_checkpoints():
+        if discovered != dflash_path and is_full_causal_lm_checkpoint(discovered):
+            candidates.append(discovered)
+
+    def _base_priority(path: str) -> Tuple[int, int, str]:
+        name = os.path.basename(path).lower()
+        score = 0
+        if "dflash" in name:
+            score += 1000
+        if "qwen" in name:
+            score -= 10
+        if "4b" in name:
+            score -= 8
+        if "base" in name or "instruct" in name:
+            score -= 6
+        return (score, -len(name), path)
+
+    ranked = sorted(set(candidates), key=_base_priority)
+    if ranked:
+        return ranked[0]
+
+    print("[LOAD] No paired BASE model found for DFlash draft. Checked:")
+    print(f"    LOCAL_BASE_DIR -> {resolve_checkpoint_dir(LOCAL_BASE_DIR) or 'MISSING'}")
+    parent = os.path.dirname(dflash_path)
+    if os.path.isdir(parent):
+        try:
+            for entry in sorted(os.listdir(parent)):
+                print(f"    sibling: {os.path.join(parent, entry)}")
+        except OSError:
+            pass
+    return None
+
+
+def resolve_generation_model_path(requested_path: str) -> Tuple[str, Optional[str]]:
+    """
+    Return (generation_path, optional_dflash_draft_path).
+    DFlash draft dirs are rerouted to their paired base causal LM.
+    """
+    resolved = resolve_checkpoint_dir(requested_path) or requested_path
+    if not local_dir_exists(resolved):
+        return requested_path, None
+
+    role = bundle_folder_role(resolved)
+    if role == "base":
+        draft = find_paired_dflash_draft(resolved)
+        print(f"[LOAD] Base Qwen checkpoint: {resolved}")
+        if draft:
+            print(f"[LOAD] Paired DFlash draft: {draft}")
+        return resolved, draft
+
+    if is_full_causal_lm_checkpoint(resolved):
+        draft = find_paired_dflash_draft(resolved)
+        return resolved, draft
+
+    if not is_dflash_draft_checkpoint(resolved):
+        return resolved, None
+
+    base = find_paired_base_checkpoint(resolved)
+    if base:
+        print(f"[LOAD] DFlash DRAFT checkpoint: {resolved}")
+        print(f"[LOAD] Generation will use paired BASE model: {base}")
+        return base, resolved
+
+    raise RuntimeError(
+        "[LOAD] Found a DFlash draft checkpoint but no paired base model.\n"
+        f"  Draft: {resolved}\n"
+        "  DFlash drafts lack embed_tokens / lm_head and cannot generate text alone.\n"
+        "  Fix: place the base Qwen checkpoint beside the draft (e.g. .../Qwen3.5-4B)\n"
+        f"  or set LOCAL_BASE_DIR (currently {LOCAL_BASE_DIR!r})."
+    )
+
+
+def _guess_causal_lm_architecture(config: Dict[str, Any]) -> Optional[str]:
+    model_type = str(config.get("model_type", "")).lower()
+    archs = [str(a) for a in (config.get("architectures") or [])]
+    if model_type == "qwen3_5" or any("Qwen3_5" in a for a in archs):
+        return "Qwen3_5ForConditionalGeneration"
+    mapping = {
+        "qwen3_moe": "Qwen3MoeForCausalLM",
+        "qwen3": "Qwen3ForCausalLM",
+        "qwen2_moe": "Qwen2MoeForCausalLM",
+        "qwen2": "Qwen2ForCausalLM",
+        "llama": "LlamaForCausalLM",
+        "mistral": "MistralForCausalLM",
+    }
+    for key, arch in mapping.items():
+        if key in model_type:
+            return arch
+    for arch in archs:
+        if "CausalLM" in arch or "ConditionalGeneration" in arch:
+            return arch
+    return None
+
+
+def _should_skip_vllm(model_path: str) -> bool:
+    """Qwen3.5 multimodal checkpoints routinely fail vLLM on Kaggle; prefer HF."""
+    if PREFER_HF_INFERENCE:
+        return True
+    if not SKIP_VLLM_FOR_QWEN35:
+        return False
+    try:
+        info = _checkpoint_model_info(model_path)
+        return info["is_qwen35"] or info["is_multimodal"]
+    except Exception:
+        return False
+
+
+def _load_hf_generation_model(
+    model_path: str,
+    *,
+    dtype: torch.dtype,
+    local_only: bool,
+) -> Any:
+    """Load the correct HF class for plain LMs and Qwen3.5 multimodal text generation."""
+    info = _checkpoint_model_info(model_path)
+    common: Dict[str, Any] = {
+        "torch_dtype": dtype,
+        "device_map": "auto",
+        "trust_remote_code": True,
+        "local_files_only": local_only and os.path.isdir(model_path),
+        "low_cpu_mem_usage": True,
+        "attn_implementation": "sdpa",
+    }
+    errors: List[str] = []
+
+    if info["is_qwen35"] or info["is_multimodal"]:
+        print(
+            f"[LOAD][HF] Qwen3.5/multimodal checkpoint: "
+            f"arch={info['architectures']} — using text-only generate path"
+        )
+        for label, loader in (
+            ("AutoModelForImageTextToText", "transformers.AutoModelForImageTextToText"),
+            ("AutoModelForCausalLM", "transformers.AutoModelForCausalLM"),
+        ):
+            try:
+                import importlib
+
+                mod = importlib.import_module("transformers")
+                cls = getattr(mod, label)
+                return cls.from_pretrained(model_path, **common)
+            except Exception as exc:
+                errors.append(f"{label}: {type(exc).__name__}: {exc}")
+
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_path, **common)
+    except Exception as exc:
+        errors.append(f"AutoModelForCausalLM: {type(exc).__name__}: {exc}")
+        raise RuntimeError(
+            "[LOAD][HF] Failed to load generation model from "
+            f"{model_path}.\n  " + "\n  ".join(errors)
+        ) from exc
+
+
+def _needs_custom_vllm_handling(model_path: str) -> bool:
+    path_l = model_path.lower()
+    if any(tag in path_l for tag in ("dflash", "qwen3", "custom")):
+        return True
+    try:
+        cfg = _read_hf_config(model_path)
+    except Exception:
+        return False
+    archs = [str(a) for a in (cfg.get("architectures") or [])]
+    if any("Embedding" in a or "Pooling" in a for a in archs):
+        return True
+    if cfg.get("is_embedding_model") or cfg.get("pooler_config"):
+        return True
+    return False
+
+
+def _build_vllm_attempts(
+    model_path: str, gpu_memory_utilization: float
+) -> List[Dict[str, Any]]:
+    custom = _needs_custom_vllm_handling(model_path)
+    base: Dict[str, Any] = {
+        "model": model_path,
+        "trust_remote_code": True,
+        "dtype": "auto",
+        "max_model_len": 4096,
+        "gpu_memory_utilization": gpu_memory_utilization,
+    }
+
+    hf_overrides: Dict[str, Any] = {}
+    if os.path.isfile(os.path.join(model_path, "config.json")):
+        try:
+            cfg = _read_hf_config(model_path)
+            archs = [str(a) for a in (cfg.get("architectures") or [])]
+            print(f"[LOAD] HF config architectures: {archs}")
+            if is_dflash_draft_checkpoint(model_path):
+                print("[LOAD] Skipping architecture rewrite for DFlash draft checkpoint.")
+            elif any("Embedding" in a or "Pooling" in a for a in archs):
+                guessed = _guess_causal_lm_architecture(cfg)
+                if guessed:
+                    hf_overrides["architectures"] = [guessed]
+                    print(f"[LOAD] Rewriting architectures for vLLM -> {[guessed]}")
+        except Exception as exc:
+            print(f"[LOAD] Could not inspect config.json: {exc}")
+
+    attempts: List[Dict[str, Any]] = []
+    if custom or hf_overrides or VLLM_ENFORCE_EAGER:
+        attempts.append(
+            {
+                **base,
+                "runner": VLLM_RUNNER,
+                "enforce_eager": True,
+                **({"hf_overrides": hf_overrides} if hf_overrides else {}),
+            }
+        )
+    attempts.append(
+        {
+            **base,
+            "runner": VLLM_RUNNER,
+            "enforce_eager": VLLM_ENFORCE_EAGER,
+            **({"hf_overrides": hf_overrides} if hf_overrides else {}),
+        }
+    )
+    attempts.append({**base, "enforce_eager": True})
+    return attempts
+
+
+@dataclass
+class _HFCompletionOutput:
+    token_ids: List[int]
+    text: str
+    logprobs: Optional[List[Dict[int, float]]] = None
+
+
+@dataclass
+class _HFRequestOutput:
+    outputs: List[_HFCompletionOutput]
+    prompt_logprobs: Optional[List[Optional[Dict[int, float]]]] = None
+
+
+class HFGenerateEngine:
+    """Fallback engine when vLLM cannot load a custom DFlash / Qwen3.5 checkpoint."""
+
+    def __init__(
+        self,
+        model_path: str,
+        tokenizer: Any,
+        *,
+        dflash_draft_path: Optional[str] = None,
+        local_only: bool = True,
+    ):
+        if is_dflash_draft_checkpoint(model_path):
+            raise ValueError(
+                f"Refusing to load DFlash draft as causal LM: {model_path}"
+            )
+
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        print(f"[LOAD][HF] Loading causal LM from {model_path} ...")
+        if dflash_draft_path:
+            print(f"[LOAD][HF] (DFlash draft reserved for future speculative path: {dflash_draft_path})")
+        self.tokenizer = tokenizer
+        self.model_path = model_path
+        self.dflash_draft_path = dflash_draft_path
+        self.model = _load_hf_generation_model(
+            model_path,
+            dtype=dtype,
+            local_only=local_only,
+        ).eval()
+        self.device = next(self.model.parameters()).device
+        emb = self.model.get_input_embeddings()
+        if emb is None or emb.weight.numel() == 0:
+            raise RuntimeError(
+                f"[LOAD][HF] Model at {model_path} has no usable embed_tokens — "
+                "this is likely a DFlash draft checkpoint, not a base causal LM."
+            )
+        print("[LOAD][HF] HuggingFace generate engine ready (vLLM-compatible API).")
+
+    def _encode(self, text: str) -> torch.Tensor:
+        prompt = text if text and str(text).strip() else " "
+        encoded = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            add_special_tokens=True,
+            truncation=True,
+            max_length=4096,
+        )
+        input_ids = encoded["input_ids"].to(self.device)
+        if input_ids.shape[1] == 0:
+            fallback_id = (
+                getattr(self.tokenizer, "bos_token_id", None)
+                or self.tokenizer.eos_token_id
+                or 0
+            )
+            input_ids = torch.tensor([[fallback_id]], device=self.device, dtype=torch.long)
+        return input_ids
+
+    def _decode_ids(self, ids: List[int]) -> str:
+        return self.tokenizer.decode(ids, skip_special_tokens=True)
+
+    def _prompt_logprobs_for_ids(self, input_ids: torch.Tensor) -> List[Optional[Dict[int, float]]]:
+        out: List[Optional[Dict[int, float]]] = [None]
+        if input_ids.shape[1] < 2:
+            return out
+        with torch.inference_mode():
+            logits = self.model(input_ids).logits[0]
+        for pos in range(1, input_ids.shape[1]):
+            token_id = int(input_ids[0, pos].item())
+            logp = torch.log_softmax(logits[pos - 1], dim=-1)[token_id].item()
+            out.append({token_id: logp})
+        return out
+
+    def _sample_ids(
+        self, input_ids: torch.Tensor, max_tokens: int, temperature: float, top_p: float
+    ) -> Tuple[List[int], List[Dict[int, float]]]:
+        if input_ids.shape[1] == 0:
+            raise ValueError("Refusing to generate from empty input_ids")
+
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0
+        gen_kwargs: Dict[str, Any] = {
+            "max_new_tokens": max_tokens,
+            "pad_token_id": pad_id,
+            "return_dict_in_generate": True,
+            "output_scores": True,
+        }
+        if temperature <= 0:
+            gen_kwargs["do_sample"] = False
+        else:
+            gen_kwargs["do_sample"] = True
+            gen_kwargs["temperature"] = max(float(temperature), 1e-5)
+            gen_kwargs["top_p"] = float(top_p)
+
+        with torch.inference_mode():
+            outputs = self.model.generate(input_ids, **gen_kwargs)
+
+        prompt_len = input_ids.shape[1]
+        new_ids = outputs.sequences[0, prompt_len:].tolist()
+        step_logprobs: List[Dict[int, float]] = []
+        if outputs.scores:
+            for step_idx, tid in enumerate(new_ids):
+                if step_idx >= len(outputs.scores):
+                    break
+                logp = torch.log_softmax(outputs.scores[step_idx][0], dim=-1)[tid].item()
+                step_logprobs.append({tid: logp})
+        else:
+            step_logprobs = [{tid: 0.0} for tid in new_ids]
+        return new_ids, step_logprobs
+
+    def generate(
+        self, prompts: List[str], sampling_params: Any
+    ) -> List[_HFRequestOutput]:
+        """
+        vLLM-compatible generate. Accepts one SamplingParams for all prompts,
+        or a list of SamplingParams (one per prompt) for heterogeneous K-stream drafting.
+        """
+        results: List[_HFRequestOutput] = []
+        if isinstance(sampling_params, list):
+            sp_list: List[Any] = list(sampling_params)
+            if not sp_list:
+                sp_list = [SamplingParams(max_tokens=16)]
+            if len(sp_list) < len(prompts):
+                sp_list.extend([sp_list[-1]] * (len(prompts) - len(sp_list)))
+        else:
+            sp_list = [sampling_params] * len(prompts)
+
+        for prompt, sp in zip(prompts, sp_list):
+            max_tokens = int(getattr(sp, "max_tokens", 0) or 0)
+            temperature = float(getattr(sp, "temperature", 1.0) or 0.0)
+            top_p = float(getattr(sp, "top_p", 1.0) or 1.0)
+            want_prompt_logprobs = bool(getattr(sp, "prompt_logprobs", False))
+
+            input_ids = self._encode(prompt)
+            prompt_logprobs = (
+                self._prompt_logprobs_for_ids(input_ids) if want_prompt_logprobs else None
+            )
+            if max_tokens <= 0:
+                results.append(_HFRequestOutput(outputs=[], prompt_logprobs=prompt_logprobs))
+                continue
+            new_ids, step_logprobs = self._sample_ids(
+                input_ids, max_tokens=max_tokens, temperature=temperature, top_p=top_p
+            )
+            results.append(
+                _HFRequestOutput(
+                    outputs=[
+                        _HFCompletionOutput(
+                            token_ids=new_ids,
+                            text=self._decode_ids(new_ids),
+                            logprobs=step_logprobs,
+                        )
+                    ],
+                    prompt_logprobs=prompt_logprobs,
+                )
+            )
+        return results
+
+
+def create_inference_engine(
+    model_path: str,
+    tokenizer: Any,
+    *,
+    gpu_memory_utilization: float = 0.88,
+    dflash_draft_path: Optional[str] = None,
+) -> Any:
+    """Create vLLM engine with custom-checkpoint safeguards; HF fallback on failure."""
+    gen_path, auto_draft = resolve_generation_model_path(model_path)
+    draft_path = dflash_draft_path or auto_draft
+    local_only = os.path.isdir(gen_path)
+
+    if _should_skip_vllm(gen_path):
+        reason = (
+            "PREFER_HF_INFERENCE=True"
+            if PREFER_HF_INFERENCE
+            else "Qwen3.5 multimodal checkpoint"
+        )
+        print(f"[LOAD] Skipping vLLM ({reason}); using HuggingFace generate engine.")
+        return HFGenerateEngine(
+            gen_path,
+            tokenizer,
+            dflash_draft_path=draft_path,
+            local_only=local_only,
+        )
+
+    attempts = _build_vllm_attempts(gen_path, gpu_memory_utilization)
+    last_err: Optional[BaseException] = None
+    for idx, kwargs in enumerate(attempts, start=1):
+        try:
+            if idx > 1:
+                print(f"[LOAD] vLLM retry {idx}/{len(attempts)}: {kwargs}")
+            llm = LLM(**kwargs)
+            print("[LOAD] vLLM engine ready.")
+            if draft_path:
+                setattr(llm, "dflash_draft_path", draft_path)
+            return llm
+        except Exception as exc:
+            last_err = exc
+            print(f"[LOAD] vLLM attempt {idx} failed: {type(exc).__name__}: {exc}")
+
+    if VLLM_FALLBACK_TO_HF:
+        print(
+            "[LOAD] All vLLM attempts failed; using HuggingFace generate fallback."
+        )
+        return HFGenerateEngine(
+            gen_path,
+            tokenizer,
+            dflash_draft_path=draft_path,
+            local_only=local_only,
+        )
+
+    raise RuntimeError(
+        f"Failed to load inference engine for {gen_path}"
+    ) from last_err
+
+
+def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
+    """
+    Fail fast before ARC eval if the engine cannot tokenize/generate.
+    Catches stale Kaggle copies (old HFGenerateEngine manual-forward loop) and
+    DFlash drafts mistakenly loaded as causal LMs.
+    """
+    engine_label = (
+        "HF-fallback"
+        if isinstance(llm, HFGenerateEngine)
+        else getattr(type(llm), "__name__", str(type(llm)))
+    )
+    gen_path = getattr(llm, "model_path", None)
+    draft_path = getattr(llm, "dflash_draft_path", None)
+    print("\n[VERIFY] Inference engine smoke test")
+    print(f"    script   : {SCRIPT_VERSION}")
+    print(f"    engine   : {engine_label}")
+    if gen_path:
+        print(f"    generate : {gen_path}")
+    if draft_path:
+        print(f"    dflash   : {draft_path} (draft only — not used for generation)")
+
+    probe = "ARC smoke test."
+    encoded = tokenizer(probe, return_tensors="pt", add_special_tokens=True)
+    if encoded["input_ids"].shape[1] == 0:
+        raise RuntimeError(
+            "[VERIFY] Tokenizer produced empty input_ids. "
+            "Load tokenizer from the paired BASE model, not the DFlash draft."
+        )
+
+    sp = SamplingParams(temperature=0.0, max_tokens=1)
+    try:
+        out = llm.generate([probe], sp)[0]
+    except Exception as exc:
+        hint = ""
+        if "cannot reshape tensor of 0 elements" in str(exc):
+            hint = (
+                "\n  Likely cause: DFlash draft loaded as causal LM, or stale script "
+                f"(need SCRIPT_VERSION={SCRIPT_VERSION} in banner)."
+            )
+        raise RuntimeError(
+            f"[VERIFY] Engine smoke test failed: {type(exc).__name__}: {exc}{hint}"
+        ) from exc
+
+    n_new = len(out.outputs[0].token_ids) if out.outputs else 0
+    if n_new < 1:
+        raise RuntimeError(
+            "[VERIFY] Engine returned zero new tokens on smoke prompt."
+        )
+    print(f"    smoke    : OK ({n_new} token generated)")
+
+
 def load_models(model_name: str):
     """
-    Load one vLLM engine (fast path for both classic and the proposal/verification steps of one-million-brains-dflash).
+    Load one inference engine (vLLM preferred; HF fallback for custom DFlash checkpoints).
     Also load a lightweight HF tokenizer copy for decode/encode consistency.
-    We keep everything in FP16/BF16; no quantization to stay mainstream & simple.
     """
+    local_only = os.path.isdir(model_name) and local_dir_exists(model_name)
+    if local_only:
+        gen_path, draft_path = resolve_generation_model_path(model_name)
+    else:
+        gen_path, draft_path = model_name, None
+    load_label = gen_path if local_only else f"{gen_path} (remote)"
     print(
-        f"\n[LOAD] Initializing vLLM engine for {model_name} (this can take 30-120s on first download)..."
+        f"\n[LOAD] Initializing inference engine for {load_label}"
+        + ("" if local_only else " (this can take 30-120s on first download)...")
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if draft_path:
+        print(f"[LOAD] DFlash draft reserved: {draft_path}")
+    tokenizer = AutoTokenizer.from_pretrained(
+        gen_path,
+        trust_remote_code=True,
+        local_files_only=local_only,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # vLLM engine - mainstream path
-    llm = LLM(
-        model=model_name,
-        trust_remote_code=True,
-        dtype="auto",
-        max_model_len=4096,
+    llm = create_inference_engine(
+        gen_path,
+        tokenizer,
         gpu_memory_utilization=0.88,
-        enforce_eager=False,  # graph capture for speed where possible
+        dflash_draft_path=draft_path,
     )
-    print("[LOAD] vLLM engine ready.")
+    if isinstance(llm, HFGenerateEngine):
+        setattr(llm, "model_path", gen_path)
+    elif draft_path:
+        setattr(llm, "dflash_draft_path", draft_path)
+    setattr(llm, "generation_model_path", gen_path)
 
-    # Also expose a tiny HF model for any future hidden-state needs (optional, lazy)
     hf_model = None
-    try:
-        # Only load if we have headroom; otherwise we synthesize pooled states.
-        if torch.cuda.get_device_properties(0).total_memory > 14 * (1024**3):
-            hf_model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.bfloat16
-                if torch.cuda.is_bf16_supported()
-                else torch.float16,
-                device_map="auto",
-                trust_remote_code=True,
-                low_cpu_mem_usage=True,
-            ).eval()
-            print(
-                "[LOAD] Optional HF reference model also resident for hidden-state introspection."
-            )
-    except Exception:
-        pass
+    if isinstance(llm, HFGenerateEngine):
+        hf_model = llm.model
+    else:
+        try:
+            if torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory > 14 * (1024**3):
+                hf_model = _load_hf_generation_model(
+                    gen_path,
+                    dtype=torch.bfloat16
+                    if torch.cuda.is_bf16_supported()
+                    else torch.float16,
+                    local_only=local_only,
+                ).eval()
+                print(
+                    "[LOAD] Optional HF reference model also resident for hidden-state introspection."
+                )
+        except Exception:
+            pass
 
     return llm, tokenizer, hf_model
 
 
 # =============================================================================
-# LOCAL KAGGLE LOADERS (for models pre-downloaded to /kaggle/working)
+# LOCAL KAGGLE LOADERS (optional dual-engine path when both checkpoints exist)
 # =============================================================================
-LOCAL_DFLASH_DIR = "/kaggle/working/Qwen3.5-4B-DFlash"
-LOCAL_BASE_DIR = "/kaggle/working/Qwen3.5-4B"
-
-
-def local_dir_exists(path: str) -> bool:
-    """True if a local model dir exists and contains a config.json (i.e. looks like a real HF checkpoint)."""
-    if not os.path.isdir(path):
-        return False
-    return os.path.isfile(os.path.join(path, "config.json"))
-
-
-def load_local_models() -> Tuple[LLM, Any, LLM, Any]:
+def load_local_models() -> Tuple[LLM, Any, Optional[LLM], Optional[Any]]:
     """
-    Load BOTH the DFlash-tuned checkpoint AND the base Qwen 4B model from local
-    /kaggle/working directories that were populated by the previous snapshot_download
-    cell. Raises RuntimeError if either local dir is missing.
+    Load local checkpoints without network access.
 
-    Returns: (dflash_llm, dflash_tokenizer, base_llm, base_tokenizer)
+    DFlash draft checkpoints are NEVER used for generation directly.
+    A paired BASE causal LM must exist (LOCAL_BASE_DIR or sibling folder).
+
+    Returns: (primary_llm, primary_tokenizer, optional_second_llm, optional_second_tokenizer)
     """
-    for d in (LOCAL_DFLASH_DIR, LOCAL_BASE_DIR):
-        if not local_dir_exists(d):
-            raise RuntimeError(
-                f"[LOCAL-LOAD] Required local model dir not found or incomplete: {d}\n"
-                f"  -> Re-run the snapshot_download cell so both /kaggle/working/Qwen3.5-4B-DFlash "
-                f"and /kaggle/working/Qwen3.5-4B are populated."
+    print("\n[LOCAL-LOAD] Checkpoint inventory:")
+    print(f"    ROOT   {KAGGLE_QWEN_BUNDLE_ROOT} -> "
+          f"{'OK' if os.path.isdir(KAGGLE_QWEN_BUNDLE_ROOT) else 'MISSING'}")
+    for tag, raw in (
+        ("BASE", LOCAL_BASE_DIR),
+        ("DFLASH", LOCAL_DFLASH_DIR),
+        ("MODEL", LOCAL_MODEL_PATH),
+    ):
+        resolved = resolve_checkpoint_dir(raw) if raw else None
+        role = "n/a"
+        if resolved:
+            named = bundle_folder_role(resolved)
+            role = (
+                "BASE" if named == "base"
+                else "DRAFT" if named == "draft"
+                else (
+                    "FULL"
+                    if is_full_causal_lm_checkpoint(resolved)
+                    else ("DRAFT" if is_dflash_draft_checkpoint(resolved) else "UNKNOWN")
+                )
             )
+        print(f"    {tag:<6} {raw or '—'} -> {resolved or 'MISSING'} [{role}]")
+        if resolved:
+            print_checkpoint_diagnostics(resolved)
 
-    def _load_one(path: str, label: str) -> Tuple[LLM, Any]:
-        print(f"\n[LOCAL-LOAD] Loading {label} from {path} ...")
-        tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+    bundle_base, bundle_dflash = discover_qwen_dflash_bundle_paths()
+    if bundle_base or bundle_dflash:
+        print("[LOCAL-LOAD] Auto-discovered qwen3.5-4b-dflash bundle:")
+        print(f"    BASE   -> {bundle_base or 'MISSING'}")
+        print(f"    DFLASH -> {bundle_dflash or 'MISSING'}")
+
+    def _load_generation_engine(
+        gen_path: str,
+        *,
+        label: str,
+        gpu_util: float,
+        draft_path: Optional[str] = None,
+    ) -> Tuple[LLM, Any]:
+        print(f"\n[LOCAL-LOAD] {label}")
+        print(f"    generation: {gen_path}")
+        if draft_path:
+            print(f"    dflash    : {draft_path} (draft — not used for token generation)")
+        tokenizer = AutoTokenizer.from_pretrained(
+            gen_path, trust_remote_code=True, local_files_only=True
+        )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        llm = LLM(
-            model=path,
-            trust_remote_code=True,
-            dtype="auto",
-            max_model_len=4096,
-            gpu_memory_utilization=0.42,  # split VRAM between the two engines
-            enforce_eager=False,
+        llm = create_inference_engine(
+            gen_path,
+            tokenizer,
+            gpu_memory_utilization=gpu_util,
+            dflash_draft_path=draft_path,
         )
-        print(f"[LOCAL-LOAD] {label} engine ready.")
+        if isinstance(llm, HFGenerateEngine):
+            setattr(llm, "model_path", gen_path)
+        setattr(llm, "generation_model_path", gen_path)
+        backend = "HF-fallback" if isinstance(llm, HFGenerateEngine) else "vLLM"
+        print(
+            f"[LOCAL-LOAD] {os.path.basename(gen_path)} engine ready ({backend})."
+        )
         return llm, tokenizer
 
-    dflash_llm, dflash_tok = _load_one(LOCAL_DFLASH_DIR, "DFlash-tuned Qwen3.5-4B")
-    base_llm, base_tok = _load_one(LOCAL_BASE_DIR, "Base Qwen3.5-4B")
-    return dflash_llm, dflash_tok, base_llm, base_tok
+    # Always load Qwen3.5-4B as the base/generation model — never classify it as draft.
+    base_path = resolve_checkpoint_dir(LOCAL_BASE_DIR)
+    if not base_path and os.path.isdir(KAGGLE_QWEN_BUNDLE_ROOT):
+        base_path = os.path.join(KAGGLE_QWEN_BUNDLE_ROOT, "Qwen3.5-4B")
+        if not local_dir_exists(base_path):
+            base_path = None
+
+    if base_path and local_dir_exists(base_path):
+        dflash_path = resolve_checkpoint_dir(LOCAL_DFLASH_DIR)
+        if not dflash_path and os.path.isdir(KAGGLE_QWEN_BUNDLE_ROOT):
+            candidate = os.path.join(KAGGLE_QWEN_BUNDLE_ROOT, "Qwen3.5-4B-DFlash")
+            if local_dir_exists(candidate):
+                dflash_path = candidate
+        gen_llm, gen_tok = _load_generation_engine(
+            base_path,
+            label="Base Qwen3.5-4B (generation)",
+            gpu_util=0.85,
+            draft_path=dflash_path if dflash_path and is_dflash_draft_checkpoint(dflash_path) else None,
+        )
+        if dflash_path:
+            setattr(gen_llm, "dflash_draft_path", dflash_path)
+        return gen_llm, gen_tok, None, None
+
+    ensure_model_available()
+    primary = resolve_local_model_path()
+    if primary is None:
+        raise RuntimeError(
+            "[LOCAL-LOAD] No usable local checkpoint found after prefetch.\n"
+            "  Expected one of:\n"
+            f"    - {LOCAL_DFLASH_DIR}\n"
+            f"    - {LOCAL_BASE_DIR}\n"
+            f"    - LOCAL_MODEL_PATH = {LOCAL_MODEL_PATH!r}\n"
+            "    - any */config.json under /kaggle/input, /kaggle/working, or HF hub cache\n"
+            "  Turn Kaggle Internet ON and re-run from the top, or add dataset "
+            f"'{KAGGLE_DATASET_HANDLE}' as notebook Input.\n"
+            "  If using DFlash: also attach the paired BASE model at LOCAL_BASE_DIR "
+            f"({LOCAL_BASE_DIR!r})."
+        )
+
+    gen_path, draft_path = resolve_generation_model_path(primary)
+    llm, tok = _load_generation_engine(
+        gen_path,
+        label="Primary local checkpoint",
+        gpu_util=0.85,
+        draft_path=draft_path,
+    )
+    return llm, tok, None, None
+
+
+# =============================================================================
+# ARC-AGI DATASET EVALUATION (parameterized paths; data/ is not in git)
+# =============================================================================
+ARC_SPLIT_FILES = {
+    "training": (
+        "arc-agi_training_challenges.json",
+        "arc-agi_training_solutions.json",
+    ),
+    "evaluation": (
+        "arc-agi_evaluation_challenges.json",
+        "arc-agi_evaluation_solutions.json",
+    ),
+}
+
+
+def discover_kaggle_arc_competition_dir() -> Optional[str]:
+    """Find the ARC Prize competition mount under /kaggle/input/competitions."""
+    if os.path.isdir(KAGGLE_ARC_COMPETITION_DIR):
+        return KAGGLE_ARC_COMPETITION_DIR
+    comp_root = "/kaggle/input/competitions"
+    if not os.path.isdir(comp_root):
+        return None
+    try:
+        entries = sorted(os.listdir(comp_root))
+    except OSError:
+        return None
+    for name in entries:
+        if "arc" not in name.lower():
+            continue
+        candidate = os.path.join(comp_root, name)
+        if os.path.isfile(
+            os.path.join(candidate, "arc-agi_training_challenges.json")
+        ) or os.path.isfile(
+            os.path.join(candidate, "arc-agi_evaluation_challenges.json")
+        ):
+            return candidate
+    return None
+
+
+def arc_paths_for_split(base_dir: str, split: str) -> Tuple[str, str]:
+    if split not in ARC_SPLIT_FILES:
+        raise ValueError(
+            f"Unknown ARC_DATA_SPLIT={split!r}. Use one of: {list(ARC_SPLIT_FILES)}"
+        )
+    challenges_name, solutions_name = ARC_SPLIT_FILES[split]
+    return (
+        os.path.join(base_dir, challenges_name),
+        os.path.join(base_dir, solutions_name),
+    )
+
+
+def arc_split_files_present(base_dir: str, split: str) -> bool:
+    challenges_path, solutions_path = arc_paths_for_split(base_dir, split)
+    return os.path.isfile(challenges_path) and os.path.isfile(solutions_path)
+
+
+def resolve_arc_eval_paths(
+    *,
+    profile: Optional[str] = None,
+    split: Optional[str] = None,
+    challenges_override: Optional[str] = None,
+    solutions_override: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str], str]:
+    """
+    Resolve ARC challenges/solutions paths from profile toggles.
+
+    Returns (challenges_path, solutions_path, source_label).
+    """
+    profile = profile or ARC_DATA_PROFILE
+    split = split or ARC_DATA_SPLIT
+
+    if challenges_override and solutions_override:
+        return challenges_override, solutions_override, "explicit override"
+
+    if profile == "off":
+        return None, None, "off"
+
+    if challenges_override or solutions_override:
+        return challenges_override, solutions_override, "partial override"
+
+    if profile in ("kaggle", "auto"):
+        kaggle_dir = discover_kaggle_arc_competition_dir()
+        if kaggle_dir and arc_split_files_present(kaggle_dir, split):
+            ch, sol = arc_paths_for_split(kaggle_dir, split)
+            return ch, sol, f"kaggle:{kaggle_dir}"
+        if profile == "kaggle":
+            ch, sol = arc_paths_for_split(KAGGLE_ARC_COMPETITION_DIR, split)
+            return ch, sol, f"kaggle:{KAGGLE_ARC_COMPETITION_DIR}"
+
+    if profile in ("local", "auto"):
+        local_dir = os.path.abspath(LOCAL_ARC_DATA_DIR)
+        if arc_split_files_present(local_dir, split):
+            ch, sol = arc_paths_for_split(local_dir, split)
+            return ch, sol, f"local:{local_dir}"
+
+    return None, None, "unresolved"
+
+
+def print_arc_data_config(
+    challenges_path: Optional[str],
+    solutions_path: Optional[str],
+    source: str,
+) -> None:
+    print("\n[ARC DATA]")
+    print(f"    profile : {ARC_DATA_PROFILE}")
+    print(f"    split   : {ARC_DATA_SPLIT}")
+    print(f"    source  : {source}")
+    if challenges_path:
+        print(f"    challenges: {challenges_path}")
+    if solutions_path:
+        print(f"    solutions : {solutions_path}")
+    if ARC_DATA_PROFILE == "local":
+        print(
+            "    Kaggle paste tip: set ARC_DATA_PROFILE = \"kaggle\" at the top of this file."
+        )
+    if not challenges_path or not solutions_path:
+        print("    ARC eval: disabled (demo benchmark only).")
+
+
+def _require_dataset_file(path: Optional[str], label: str) -> str:
+    if not path:
+        raise ValueError(
+            f"{label} path is required for ARC evaluation. "
+            "Pass --eval-challenges and --eval-solutions, or set EVAL_*_PATH toggles."
+        )
+    resolved = os.path.abspath(path)
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(f"{label} not found: {resolved}")
+    return resolved
+
+
+def load_arc_dataset(challenges_path: str, solutions_path: str) -> Dict[str, Any]:
+    """Load paired ARC-AGI challenges + solutions JSON files."""
+    challenges_path = _require_dataset_file(challenges_path, "Challenges")
+    solutions_path = _require_dataset_file(solutions_path, "Solutions")
+    with open(challenges_path, "r", encoding="utf-8") as f:
+        challenges = json.load(f)
+    with open(solutions_path, "r", encoding="utf-8") as f:
+        solutions = json.load(f)
+    if not isinstance(challenges, dict) or not isinstance(solutions, dict):
+        raise ValueError("ARC JSON files must be objects keyed by task id.")
+    return {"challenges": challenges, "solutions": solutions}
+
+
+def format_arc_prompt(task_id: str, task: Dict[str, Any], test_index: int = 0) -> str:
+    """Turn one ARC task into a text prompt with train demos + one test input."""
+    lines = [
+        f"ARC-AGI task {task_id}. Infer the grid transformation from the training pairs.",
+        "Output format: a single JSON 2D array of integers (cell colors 0-9 only).",
+        "Example: [[0,1,2],[3,4,5]]",
+        "Do not include markdown fences, explanations, or any text before/after the array.",
+    ]
+    for i, example in enumerate(task.get("train", []), start=1):
+        lines.append(f"Train {i} input: {json.dumps(example['input'])}")
+        lines.append(f"Train {i} output: {json.dumps(example['output'])}")
+    test_inputs = task.get("test", [])
+    if test_index >= len(test_inputs):
+        raise IndexError(
+            f"Task {task_id} has {len(test_inputs)} test inputs; requested index {test_index}."
+        )
+    lines.append(f"Test input: {json.dumps(test_inputs[test_index]['input'])}")
+    lines.append("Test output JSON array:")
+    return "\n".join(lines)
+
+
+def apply_arc_chat_prompt(tokenizer: Any, user_content: str) -> str:
+    """Wrap ARC content with the model's chat template (required for Qwen3.5)."""
+    messages: List[Dict[str, str]] = [
+        {
+            "role": "system",
+            "content": (
+                "You solve ARC-AGI grid puzzles. Reply with exactly one JSON 2D array "
+                "of integers (values 0-9). No markdown, no explanation, no thinking."
+            ),
+        },
+        {"role": "user", "content": user_content},
+    ]
+    template_kwargs: Dict[str, Any] = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+    }
+    if ARC_DISABLE_THINKING:
+        template_kwargs["enable_thinking"] = False
+    if ARC_ASSISTANT_PREFILL:
+        messages.append({"role": "assistant", "content": ARC_ASSISTANT_PREFILL})
+        template_kwargs["add_generation_prompt"] = False
+        template_kwargs["continue_final_message"] = True
+
+    if not hasattr(tokenizer, "apply_chat_template"):
+        return user_content
+
+    try:
+        return tokenizer.apply_chat_template(messages, **template_kwargs)
+    except TypeError:
+        template_kwargs.pop("enable_thinking", None)
+        try:
+            return tokenizer.apply_chat_template(messages, **template_kwargs)
+        except Exception as exc:
+            print(f"[ARC] chat template failed ({exc}); using raw prompt.")
+    except Exception as exc:
+        print(f"[ARC] chat template failed ({exc}); using raw prompt.")
+    return user_content
+
+
+def build_arc_inference_prompt(
+    tokenizer: Any, task_id: str, task: Dict[str, Any], test_index: int = 0
+) -> str:
+    raw = format_arc_prompt(task_id, task, test_index=test_index)
+    if ARC_USE_CHAT_TEMPLATE:
+        return apply_arc_chat_prompt(tokenizer, raw)
+    return raw
+
+
+def _strip_model_artifacts(text: str) -> str:
+    """Remove thinking blocks and markdown fences from model output."""
+    if not text:
+        return ""
+    cleaned = text
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace("```", "")
+    return cleaned.strip()
+
+
+def _repair_truncated_json_array(fragment: str) -> Optional[str]:
+    """Close unbalanced brackets and drop a dangling partial final row."""
+    s = fragment.strip()
+    if not s.startswith("["):
+        return None
+    s = re.sub(r",\s*\[[^\]]*$", "", s)
+    s = re.sub(r",\s*$", "", s)
+    opens = s.count("[") - s.count("]")
+    if opens > 0:
+        s = s + ("]" * opens)
+    return s
+
+
+def _balanced_bracket_span_at(text: str, start: int) -> Optional[str]:
+    """Return one balanced [...] span from start, or a repaired truncated span."""
+    if start < 0 or start >= len(text) or text[start] != "[":
+        return None
+    depth = 0
+    for j in range(start, len(text)):
+        if text[j] == "[":
+            depth += 1
+        elif text[j] == "]":
+            depth -= 1
+            if depth == 0:
+                return text[start : j + 1]
+    return _repair_truncated_json_array(text[start:])
+
+
+def _balanced_bracket_spans(text: str) -> List[str]:
+    """Extract all bracket spans with proper nesting."""
+    spans: List[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] != "[":
+            i += 1
+            continue
+        span = _balanced_bracket_span_at(text, i)
+        if span:
+            spans.append(span)
+            if text[i : i + len(span)] == span:
+                i += len(span)
+            else:
+                i += 1
+        else:
+            i += 1
+    return spans
+
+
+def _grid_attempt_text_variants(text: str) -> List[str]:
+    """
+    Qwen often emits a broken first grid then restarts with a second [[...]].
+    Try the full text, the suffix from the last [[, and prefill repairs.
+    """
+    variants: List[str] = []
+    if not text:
+        return variants
+
+    def _add(candidate: str) -> None:
+        candidate = candidate.strip()
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+
+    _add(text)
+    last_anchor = text.rfind("[[")
+    if last_anchor > 0:
+        _add(text[last_anchor:])
+    for anchor in re.finditer(r"\[\[", text):
+        _add(text[anchor.start() :])
+
+    stripped = text.lstrip()
+    if stripped and not stripped.startswith("["):
+        _add((ARC_ASSISTANT_PREFILL or "[[") + stripped)
+    elif (
+        ARC_ASSISTANT_PREFILL
+        and stripped.startswith("[")
+        and not stripped.startswith(ARC_ASSISTANT_PREFILL)
+    ):
+        _add(ARC_ASSISTANT_PREFILL + stripped[1:])
+    return variants
+
+
+def _is_valid_arc_grid(parsed: Any) -> bool:
+    if not isinstance(parsed, list) or not parsed:
+        return False
+    if not all(isinstance(row, list) for row in parsed):
+        return False
+    return all(
+        isinstance(cell, int) and 0 <= cell <= 9
+        for row in parsed
+        for cell in row
+    )
+
+
+def _parse_grid_from_row_pattern(text: str) -> Optional[List[List[int]]]:
+    """Fallback: stitch [n,n,n] row literals after the last [[ restart."""
+    anchor = text.rfind("[[")
+    chunk = text[anchor:] if anchor >= 0 else text
+    rows: List[List[int]] = []
+    width: Optional[int] = None
+    for match in re.finditer(r"\[\s*(\d+(?:\s*,\s*\d+)*)\s*\]", chunk):
+        try:
+            row = json.loads("[" + match.group(1) + "]")
+        except json.JSONDecodeError:
+            rows = []
+            width = None
+            continue
+        if not row or not all(isinstance(c, int) and 0 <= c <= 9 for c in row):
+            rows = []
+            width = None
+            continue
+        if width is None:
+            width = len(row)
+        if len(row) != width:
+            rows = []
+            width = None
+            continue
+        rows.append(row)
+    return rows if rows else None
+
+
+def extract_arc_generated_suffix(result: Dict[str, Any], prompt: str) -> str:
+    """Return only model-new text (exclude the prompt prefix)."""
+    if result.get("generated_text"):
+        gen = str(result["generated_text"])
+    else:
+        final = str(result.get("final_text", ""))
+        if final.startswith(prompt):
+            gen = final[len(prompt) :]
+        else:
+            gen = final
+    gen = _strip_model_artifacts(gen)
+    if ARC_ASSISTANT_PREFILL and gen and not gen.lstrip().startswith("["):
+        gen = ARC_ASSISTANT_PREFILL + gen
+    return gen
+
+
+def arc_direct_generate(
+    vllm_llm: Any,
+    tokenizer: Any,
+    prompt: str,
+    max_new_tokens: int = 128,
+    *,
+    temperature: float = ARC_GENERATION_TEMPERATURE,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """
+    Single-pass generation for ARC eval (recommended on HF fallback).
+    Avoids the classic speculative loop that rejects tokens when draft≠target sampling.
+    """
+    del seed  # temperature 0 is deterministic; seed reserved for API compatibility
+    sp = SamplingParams(
+        temperature=float(temperature),
+        top_p=1.0,
+        max_tokens=int(max_new_tokens),
+    )
+    out = vllm_llm.generate([prompt], sp)[0]
+    gen_ids: List[int] = []
+    if out.outputs:
+        gen_ids = list(out.outputs[0].token_ids)
+    generated_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+    result: Dict[str, Any] = {
+        "final_text": prompt + generated_text,
+        "generated_text": generated_text,
+        "generated_ids": gen_ids,
+        "num_tokens": len(gen_ids),
+        "num_superblocks": 1,
+        "total_accepted": len(gen_ids),
+        "avg_accepted_per_block": float(len(gen_ids)),
+        "feature_reallocations": 0,
+        "acceptance_history": [1.0] if gen_ids else [0.0],
+        "feature_history": [["DirectGenerate"]],
+        "reframe_events": 0,
+        "generation_mode": "direct",
+    }
+    gen_suffix = extract_arc_generated_suffix(result, prompt)
+    parsed_grid = parse_grid_from_text(gen_suffix, only_after=None)
+    if parsed_grid is not None:
+        result["parsed_grid"] = parsed_grid
+        result["generated_text"] = json.dumps(parsed_grid, separators=(",", ":"))
+    return result
+
+
+def arc_classic_generate(
+    vllm_llm: Any,
+    tokenizer: Any,
+    prompt: str,
+    max_new_tokens: int = 128,
+    block_size: int = 8,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """Dispatch classic ARC generation: direct (default) or speculative dflash loop."""
+    if ARC_EVAL_GENERATION_MODE == "direct":
+        return arc_direct_generate(
+            vllm_llm, tokenizer, prompt, max_new_tokens=max_new_tokens, seed=seed
+        )
+    res = classic_dflash_generate(
+        vllm_llm,
+        tokenizer,
+        prompt,
+        max_new_tokens=max_new_tokens,
+        block_size=block_size,
+        seed=seed,
+    )
+    res["generation_mode"] = "speculative"
+    if "generated_text" not in res:
+        res["generated_text"] = extract_arc_generated_suffix(res, prompt)
+    return res
+
+
+def parse_grid_from_text(
+    text: str, *, only_after: Optional[str] = "Test output"
+) -> Optional[List[List[int]]]:
+    """Best-effort extraction of a 2D integer grid from model text."""
+    search_text = _strip_model_artifacts(text or "")
+    if only_after and only_after in search_text:
+        search_text = search_text.split(only_after, 1)[-1]
+
+    seen_raw: set = set()
+    candidates: List[Tuple[int, List[List[int]]]] = []
+    for variant in _grid_attempt_text_variants(search_text):
+        # Explicit [[ anchors — do not stop at the first broken attempt.
+        for anchor in re.finditer(r"\[\[", variant):
+            raw = _balanced_bracket_span_at(variant, anchor.start())
+            if not raw or raw in seen_raw:
+                continue
+            seen_raw.add(raw)
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if _is_valid_arc_grid(parsed):
+                candidates.append((anchor.start(), parsed))
+
+        for raw in _balanced_bracket_spans(variant):
+            if raw in seen_raw:
+                continue
+            seen_raw.add(raw)
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if _is_valid_arc_grid(parsed):
+                candidates.append((variant.rfind(raw), parsed))
+
+    if not candidates:
+        for variant in _grid_attempt_text_variants(search_text):
+            row_grid = _parse_grid_from_row_pattern(variant)
+            if row_grid is not None:
+                return row_grid
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[-1][1]
+
+
+def grids_equal(pred: List[List[int]], gold: List[List[int]]) -> bool:
+    return pred == gold
+
+
+# Standard ARC-AGI palette (colors 0–9)
+ARC_PALETTE_RGB: List[Tuple[int, int, int]] = [
+    (0, 0, 0),
+    (0, 116, 217),
+    (255, 65, 54),
+    (46, 204, 64),
+    (255, 220, 0),
+    (170, 170, 170),
+    (240, 18, 190),
+    (255, 133, 27),
+    (127, 219, 255),
+    (135, 12, 37),
+]
+
+
+def _arc_grade_output_dir() -> str:
+    out = "/kaggle/working/arc_grades" if _on_kaggle() else "arc_grades"
+    os.makedirs(out, exist_ok=True)
+    return out
+
+
+def grid_cell_stats(
+    pred: Optional[List[List[int]]], gold: List[List[int]]
+) -> Dict[str, Any]:
+    """Compare pred vs gold; report match rate and shape mismatch."""
+    gh, gw = len(gold), len(gold[0]) if gold else 0
+    if pred is None:
+        return {
+            "parsed": False,
+            "correct": False,
+            "gold_shape": (gh, gw),
+            "pred_shape": None,
+            "matching_cells": 0,
+            "gold_cells": gh * gw,
+            "match_rate": 0.0,
+            "shape_match": False,
+        }
+    ph, pw = len(pred), len(pred[0]) if pred else 0
+    shape_match = (ph, pw) == (gh, gw)
+    matching = 0
+    if shape_match:
+        for r in range(ph):
+            for c in range(pw):
+                if pred[r][c] == gold[r][c]:
+                    matching += 1
+    total = gh * gw
+    return {
+        "parsed": True,
+        "correct": shape_match and matching == total,
+        "gold_shape": (gh, gw),
+        "pred_shape": (ph, pw),
+        "matching_cells": matching,
+        "gold_cells": total,
+        "match_rate": matching / max(1, total),
+        "shape_match": shape_match,
+    }
+
+
+def _grade_verdict_label(stats: Dict[str, Any]) -> str:
+    if not stats["parsed"]:
+        return "UNPARSED"
+    if stats["correct"]:
+        return "PASS"
+    if not stats["shape_match"]:
+        return "FAIL (shape)"
+    return "FAIL"
+
+
+def _ansi_cell(value: int, glyph: str = "  ") -> str:
+    value = max(0, min(9, int(value)))
+    r, g, b = ARC_PALETTE_RGB[value]
+    return f"\033[48;2;{r};{g};{b}m{glyph}\033[0m"
+
+
+def _ansi_diff_cell(pred_val: Optional[int], gold_val: int) -> str:
+    if pred_val is None:
+        return "\033[48;2;64;64;64m??\033[0m"
+    if pred_val == gold_val:
+        return _ansi_cell(gold_val, "OK")
+    return "\033[48;2;180;0;0mXX\033[0m"
+
+
+def _render_grid_ascii(
+    grid: List[List[int]],
+    *,
+    title: str,
+    diff_against: Optional[List[List[int]]] = None,
+    pred_for_diff: Optional[List[List[int]]] = None,
+) -> List[str]:
+    lines = [title]
+    if not grid:
+        lines.append("  (empty)")
+        return lines
+    for r, row in enumerate(grid):
+        cells = []
+        for c, val in enumerate(row):
+            if diff_against is not None:
+                if (
+                    pred_for_diff is not None
+                    and r < len(pred_for_diff)
+                    and c < len(pred_for_diff[r])
+                ):
+                    pv = pred_for_diff[r][c]
+                else:
+                    pv = None
+                gv = diff_against[r][c] if r < len(diff_against) and c < len(diff_against[r]) else 0
+                cells.append(_ansi_diff_cell(pv, gv))
+            else:
+                cells.append(_ansi_cell(val))
+        lines.append("  " + "".join(cells))
+    return lines
+
+
+def _align_grid_columns(blocks: List[List[str]]) -> List[str]:
+    """Place multiple ASCII grid blocks side-by-side."""
+    if not blocks:
+        return []
+    heights = [len(b) for b in blocks]
+    max_h = max(heights)
+    padded = [b + [""] * (max_h - len(b)) for b in blocks]
+    merged: List[str] = []
+    for row_idx in range(max_h):
+        merged.append("    ".join(p[row_idx] for p in padded))
+    return merged
+
+
+def format_grid_json(grid: Optional[List[List[int]]]) -> str:
+    """Compact JSON for terminal answer comparison."""
+    if grid is None:
+        return "(unparsed — model did not return a valid 2D integer grid)"
+    return json.dumps(grid, separators=(",", ":"))
+
+
+def generation_timing_stats(elapsed_s: float, num_tokens: int) -> Dict[str, Any]:
+    """Elapsed wall time + tokens/sec for one generation call."""
+    elapsed = max(0.0, float(elapsed_s))
+    tokens = max(0, int(num_tokens or 0))
+    return {
+        "elapsed_s": elapsed,
+        "num_tokens": tokens,
+        "tps": tokens / max(elapsed, 1e-6),
+    }
+
+
+def format_timing_line(timing: Dict[str, Any]) -> str:
+    return (
+        f"{timing['num_tokens']} tokens in {timing['elapsed_s']:.2f}s "
+        f"({timing['tps']:.2f} tok/s)"
+    )
+
+
+def arc_eval_log(message: str) -> None:
+    """Print + flush so Kaggle notebooks show ARC progress immediately."""
+    print(message, flush=True)
+
+
+def print_arc_answer_comparison(
+    *,
+    task_id: str,
+    task_idx: int,
+    num_tasks: int,
+    test_index: int,
+    gold: List[List[int]],
+    classic_pred: Optional[List[List[int]]],
+    mbr_pred: Optional[List[List[int]]],
+    classic_stats: Dict[str, Any],
+    mbr_stats: Dict[str, Any],
+    classic_raw_text: Optional[str] = None,
+    mbr_raw_text: Optional[str] = None,
+    classic_timing: Optional[Dict[str, Any]] = None,
+    mbr_timing: Optional[Dict[str, Any]] = None,
+    split: str = ARC_DATA_SPLIT,
+) -> None:
+    """Print ground truth and both model answers side-by-side (JSON grids)."""
+    bar = "=" * 80
+    print(f"\n{bar}")
+    print(
+        f"ARC ANSWER vs GROUND TRUTH  |  task {task_idx + 1}/{num_tasks}  "
+        f"|  id={task_id}  |  split={split}  |  test #{test_index}"
+    )
+    print(bar)
+
+    print("\nGROUND TRUTH (gold labels):")
+    print(format_grid_json(gold))
+
+    c_tag = _grade_verdict_label(classic_stats)
+    c_time = (
+        f"  |  {format_timing_line(classic_timing)}"
+        if classic_timing
+        else ""
+    )
+    print(f"\nCLASSIC PREDICTION [{c_tag}] "
+          f"({classic_stats['matching_cells']}/{classic_stats['gold_cells']} cells, "
+          f"{classic_stats['match_rate'] * 100:.1f}% match){c_time}:")
+    print(format_grid_json(classic_pred))
+    if classic_pred is None and classic_raw_text:
+        tail = classic_raw_text[-800:] if len(classic_raw_text) > 800 else classic_raw_text
+        print("CLASSIC raw model output (tail):")
+        print(tail)
+
+    m_tag = _grade_verdict_label(mbr_stats)
+    m_time = (
+        f"  |  {format_timing_line(mbr_timing)}"
+        if mbr_timing
+        else ""
+    )
+    print(f"\nMILLION-BRAINS PREDICTION [{m_tag}] "
+          f"({mbr_stats['matching_cells']}/{mbr_stats['gold_cells']} cells, "
+          f"{mbr_stats['match_rate'] * 100:.1f}% match){m_time}:")
+    print(format_grid_json(mbr_pred))
+    if mbr_pred is None and mbr_raw_text:
+        tail = mbr_raw_text[-800:] if len(mbr_raw_text) > 800 else mbr_raw_text
+        print("MBR raw model output (tail):")
+        print(tail)
+
+    if classic_pred and gold:
+        print("\nCELL-BY-CELL (classic vs gold) — XX=mismatch, ok=match:")
+        for r in range(len(gold)):
+            row_markers = []
+            for c in range(len(gold[r])):
+                if r >= len(classic_pred) or c >= len(classic_pred[r]):
+                    row_markers.append("??")
+                elif classic_pred[r][c] == gold[r][c]:
+                    row_markers.append("ok")
+                else:
+                    row_markers.append("XX")
+            print(f"  row {r}: " + " ".join(row_markers))
+
+    if mbr_pred and gold:
+        print("\nCELL-BY-CELL (million-brains vs gold) — XX=mismatch, ok=match:")
+        for r in range(len(gold)):
+            row_markers = []
+            for c in range(len(gold[r])):
+                if r >= len(mbr_pred) or c >= len(mbr_pred[r]):
+                    row_markers.append("??")
+                elif mbr_pred[r][c] == gold[r][c]:
+                    row_markers.append("ok")
+                else:
+                    row_markers.append("XX")
+            print(f"  row {r}: " + " ".join(row_markers))
+
+    print(bar, flush=True)
+
+
+def print_arc_classic_interim(
+    *,
+    task_id: str,
+    task_idx: int,
+    num_tasks: int,
+    test_index: int,
+    gold: List[List[int]],
+    classic_pred: Optional[List[List[int]]],
+    classic_stats: Dict[str, Any],
+    classic_timing: Dict[str, Any],
+    classic_raw_tail: Optional[str] = None,
+    split: str = ARC_DATA_SPLIT,
+) -> None:
+    """Print classic result + timing immediately (before slow MBR pass finishes)."""
+    c_tag = _grade_verdict_label(classic_stats)
+    arc_eval_log(
+        f"\n[ARC] {task_idx + 1}/{num_tasks} {task_id} test#{test_index} "
+        f"— CLASSIC done [{c_tag}] | {format_timing_line(classic_timing)}"
+    )
+    arc_eval_log(f"  GOLD    : {format_grid_json(gold)}")
+    arc_eval_log(
+        f"  CLASSIC : {format_grid_json(classic_pred)} "
+        f"({classic_stats['matching_cells']}/{classic_stats['gold_cells']} cells)"
+    )
+    if classic_raw_tail and not classic_stats.get("parsed"):
+        last_anchor = classic_raw_tail.rfind("[[")
+        snippet = (
+            classic_raw_tail[last_anchor : last_anchor + 800]
+            if last_anchor >= 0
+            else classic_raw_tail[-800:]
+        )
+        arc_eval_log(f"  CLASSIC raw (unparsed, last [[ attempt): {snippet}")
+    if ARC_RUN_MBR_EVAL:
+        arc_eval_log("  (running million-brains pass next…)")
+
+
+def print_arc_full_answer_report(
+    comparisons: List[Dict[str, Any]], split: str
+) -> None:
+    """Final digest: every task's predictions vs ground truth."""
+    bar = "=" * 80
+    print(f"\n{bar}")
+    print(f"ARC FULL ANSWER REPORT  ({split} split — all tasks vs ground truth)")
+    print(bar)
+    print(
+        f"{'Task':<14} {'Test':>4}  {'Classic':<10} {'MBR':<10}  "
+        f"{'Classic TPS':>12}  {'MBR TPS':>10}  Gold"
+    )
+    print("-" * 80)
+    for rec in comparisons:
+        gold_s = rec.get("gold_json", "[]")
+        if len(gold_s) > 36:
+            gold_s = gold_s[:33] + "..."
+        c_timing = rec.get("classic_timing") or {}
+        m_timing = rec.get("mbr_timing") or {}
+        c_tps = f"{c_timing.get('tps', 0.0):.2f} tok/s"
+        m_tps = f"{m_timing.get('tps', 0.0):.2f} tok/s"
+        c_elapsed = f"{c_timing.get('elapsed_s', 0.0):.1f}s"
+        m_elapsed = f"{m_timing.get('elapsed_s', 0.0):.1f}s"
+        print(
+            f"{rec['task_id']:<14} {rec['test_index']:>4}  "
+            f"{rec['classic_verdict']:<10} {rec['mbr_verdict']:<10}  "
+            f"{c_tps:>6} ({c_elapsed:>5})  {m_tps:>6} ({m_elapsed:>5})  {gold_s}"
+        )
+        classic_s = rec.get("classic_json", "(unparsed)")
+        mbr_s = rec.get("mbr_json", "(unparsed)")
+        if len(classic_s) > 76:
+            classic_s = classic_s[:73] + "..."
+        if len(mbr_s) > 76:
+            mbr_s = mbr_s[:73] + "..."
+        print(f"    gold   : {rec.get('gold_json', '[]')}")
+        print(
+            f"    classic: {classic_s}  "
+            f"[{format_timing_line(c_timing) if c_timing else 'n/a'}]"
+        )
+        print(
+            f"    mbr    : {mbr_s}  "
+            f"[{format_timing_line(m_timing) if m_timing else 'n/a'}]"
+        )
+        print("-" * 80)
+    print(bar)
+
+
+def print_arc_grade_card(
+    *,
+    task_id: str,
+    task_idx: int,
+    num_tasks: int,
+    test_index: int,
+    test_input: List[List[int]],
+    gold: List[List[int]],
+    classic_pred: Optional[List[List[int]]],
+    mbr_pred: Optional[List[List[int]]],
+    classic_stats: Dict[str, Any],
+    mbr_stats: Dict[str, Any],
+    split: str = ARC_DATA_SPLIT,
+) -> None:
+    """Terminal grade card: test input vs gold answer key vs both predictions."""
+    c_verdict = _grade_verdict_label(classic_stats)
+    m_verdict = _grade_verdict_label(mbr_stats)
+    c_icon = "✓" if classic_stats["correct"] else "✗"
+    m_icon = "✓" if mbr_stats["correct"] else "✗"
+
+    bar = "═" * 78
+    print(f"\n╔{bar}╗")
+    print(
+        f"║  ARC GRADE  task {task_idx + 1}/{num_tasks}  id={task_id}  "
+        f"split={split}  test=#{test_index}"
+        f"{' ' * max(0, 18 - len(task_id))}║"
+    )
+    print(
+        f"║  CLASSIC {c_icon} {c_verdict:<14}  |  "
+        f"MILLION-BRAINS {m_icon} {m_verdict:<14}"
+        f"{' ' * 22}║"
+    )
+    print(f"╠{bar}╣")
+
+    blocks = [
+        _render_grid_ascii(test_input, title="TEST INPUT (challenge)"),
+        _render_grid_ascii(gold, title="GOLD SOLUTION (test set labels)"),
+        _render_grid_ascii(
+            classic_pred if classic_pred else [[-1]],
+            title=f"CLASSIC PRED [{c_verdict}]",
+        )
+        if classic_pred
+        else ["CLASSIC PRED [UNPARSED]", "  (model output not a valid grid)"],
+        _render_grid_ascii(
+            mbr_pred if mbr_pred else [[-1]],
+            title=f"MBR PRED [{m_verdict}]",
+        )
+        if mbr_pred
+        else ["MBR PRED [UNPARSED]", "  (model output not a valid grid)"],
+    ]
+    for line in _align_grid_columns(blocks):
+        print(f"║ {line:<76} ║")
+
+    print(f"╠{bar}╣")
+    print(
+        f"║  CLASSIC match: {classic_stats['matching_cells']:>3}/{classic_stats['gold_cells']:<3} "
+        f"({classic_stats['match_rate'] * 100:5.1f}%)  "
+        f"shape {classic_stats['pred_shape'] or '—'} vs gold {classic_stats['gold_shape']}"
+        f"{' ' * 8}║"
+    )
+    print(
+        f"║  MBR match:     {mbr_stats['matching_cells']:>3}/{mbr_stats['gold_cells']:<3} "
+        f"({mbr_stats['match_rate'] * 100:5.1f}%)  "
+        f"shape {mbr_stats['pred_shape'] or '—'} vs gold {mbr_stats['gold_shape']}"
+        f"{' ' * 8}║"
+    )
+    print(f"╚{bar}╝")
+
+    if classic_pred and classic_stats["shape_match"]:
+        diff_lines = _align_grid_columns(
+            [
+                _render_grid_ascii(
+                    gold,
+                    title="DIFF vs GOLD (classic)",
+                    diff_against=gold,
+                    pred_for_diff=classic_pred,
+                ),
+                _render_grid_ascii(
+                    gold,
+                    title="DIFF vs GOLD (mbr)",
+                    diff_against=gold,
+                    pred_for_diff=mbr_pred,
+                ),
+            ]
+        )
+        print("  Diff overlay (OK=match, XX=mismatch, ??=missing):")
+        for line in diff_lines:
+            print(f"  {line}")
+
+
+def _draw_grid_matplotlib(ax, grid: List[List[int]], title: str) -> None:
+    import numpy as np
+
+    arr = np.array(grid, dtype=np.int32)
+    cmap_colors = [
+        [r / 255, g / 255, b / 255, 1.0] for r, g, b in ARC_PALETTE_RGB
+    ]
+    from matplotlib.colors import ListedColormap
+
+    cmap = ListedColormap(cmap_colors)
+    ax.imshow(arr, cmap=cmap, vmin=0, vmax=9, interpolation="nearest")
+    ax.set_title(title, fontsize=9, fontweight="bold")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(1.2)
+
+
+def _draw_diff_matplotlib(
+    ax, pred: Optional[List[List[int]]], gold: List[List[int]], title: str
+) -> None:
+    import numpy as np
+
+    gh, gw = len(gold), len(gold[0])
+    diff = np.zeros((gh, gw, 3), dtype=float)
+    for r in range(gh):
+        for c in range(gw):
+            gv = gold[r][c]
+            if pred is None or r >= len(pred) or c >= len(pred[0]):
+                diff[r, c] = (0.35, 0.35, 0.35)  # unparsed / out of bounds
+            elif pred[r][c] == gv:
+                pr, pg, pb = ARC_PALETTE_RGB[gv]
+                diff[r, c] = (pr / 255 * 0.55, pg / 255 * 0.55, pb / 255 * 0.55)
+            else:
+                diff[r, c] = (0.9, 0.1, 0.1)  # wrong cell
+    ax.imshow(diff, interpolation="nearest")
+    ax.set_title(title, fontsize=9, fontweight="bold")
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
+def save_arc_grade_image(
+    *,
+    task_id: str,
+    test_index: int,
+    test_input: List[List[int]],
+    gold: List[List[int]],
+    classic_pred: Optional[List[List[int]]],
+    mbr_pred: Optional[List[List[int]]],
+    classic_stats: Dict[str, Any],
+    mbr_stats: Dict[str, Any],
+    train_pairs: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[str]:
+    """Save a PNG grade card contrasting predictions against the test-set gold grid."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None
+
+    c_verdict = _grade_verdict_label(classic_stats)
+    m_verdict = _grade_verdict_label(mbr_stats)
+    n_train = min(len(train_pairs or []), 3) if ARC_SHOW_TRAIN_EXAMPLES else 0
+    ncols = 5 + n_train
+    fig_w = max(10, 2.2 * ncols)
+    fig, axes = plt.subplots(1, ncols, figsize=(fig_w, 3.2))
+    if ncols == 1:
+        axes = [axes]
+
+    col = 0
+    if n_train:
+        for i in range(n_train):
+            pair = train_pairs[i]
+            _draw_grid_matplotlib(
+                axes[col],
+                pair["input"],
+                f"Train {i + 1} in",
+            )
+            col += 1
+
+    _draw_grid_matplotlib(axes[col], test_input, "TEST INPUT")
+    col += 1
+    _draw_grid_matplotlib(axes[col], gold, "GOLD (test labels)")
+    col += 1
+    if classic_pred:
+        _draw_grid_matplotlib(axes[col], classic_pred, f"CLASSIC [{c_verdict}]")
+    else:
+        axes[col].text(0.5, 0.5, "UNPARSED", ha="center", va="center", fontsize=12)
+        axes[col].set_title(f"CLASSIC [{c_verdict}]")
+        axes[col].axis("off")
+    col += 1
+    if mbr_pred:
+        _draw_grid_matplotlib(axes[col], mbr_pred, f"MBR [{m_verdict}]")
+    else:
+        axes[col].text(0.5, 0.5, "UNPARSED", ha="center", va="center", fontsize=12)
+        axes[col].set_title(f"MBR [{m_verdict}]")
+        axes[col].axis("off")
+    col += 1
+    _draw_diff_matplotlib(
+        axes[col],
+        classic_pred,
+        gold,
+        f"Classic diff ({classic_stats['match_rate'] * 100:.0f}%)",
+    )
+
+    c_color = "#2ecc40" if classic_stats["correct"] else "#ff4136"
+    m_color = "#2ecc40" if mbr_stats["correct"] else "#ff4136"
+    fig.suptitle(
+        f"ARC {task_id} test #{test_index}  |  "
+        f"Classic: {c_verdict}  |  MBR: {m_verdict}",
+        fontsize=11,
+        fontweight="bold",
+        color="#222222",
+    )
+    fig.text(
+        0.5,
+        0.02,
+        f"Classic {classic_stats['matching_cells']}/{classic_stats['gold_cells']} cells  "
+        f"|  MBR {mbr_stats['matching_cells']}/{mbr_stats['gold_cells']} cells",
+        ha="center",
+        fontsize=9,
+    )
+    classic_ax_idx = n_train + 2
+    mbr_ax_idx = n_train + 3
+    for ax, color in (
+        (axes[classic_ax_idx], c_color),
+        (axes[mbr_ax_idx], m_color),
+    ):
+        for spine in ax.spines.values():
+            spine.set_edgecolor(color)
+            spine.set_linewidth(3)
+
+    plt.tight_layout(rect=[0, 0.05, 1, 0.92])
+    out_path = os.path.join(
+        _arc_grade_output_dir(), f"{task_id}_test{test_index}_grade.png"
+    )
+    fig.savefig(out_path, dpi=130, facecolor="white")
+    plt.close(fig)
+    return out_path
+
+
+def display_arc_grade_image(image_path: str) -> None:
+    """Show grade PNG inline when running in a Jupyter/Kaggle notebook."""
+    if not image_path or not os.path.isfile(image_path):
+        return
+    try:
+        from IPython.display import Image, display
+
+        display(Image(filename=image_path))
+    except Exception:
+        print(f"[ARC GRADE] saved image: {image_path}")
+
+
+def grade_arc_test_case(
+    *,
+    task_id: str,
+    task_idx: int,
+    num_tasks: int,
+    test_index: int,
+    test_input: List[List[int]],
+    gold: List[List[int]],
+    classic_pred: Optional[List[List[int]]],
+    mbr_pred: Optional[List[List[int]]],
+    train_pairs: Optional[List[Dict[str, Any]]] = None,
+    split: str = ARC_DATA_SPLIT,
+) -> Dict[str, Any]:
+    """Full visual grading for one test case: stats + terminal card + optional PNG."""
+    classic_stats = grid_cell_stats(classic_pred, gold)
+    mbr_stats = grid_cell_stats(mbr_pred, gold)
+
+    if ARC_VISUAL_GRADING:
+        print_arc_grade_card(
+            task_id=task_id,
+            task_idx=task_idx,
+            num_tasks=num_tasks,
+            test_index=test_index,
+            test_input=test_input,
+            gold=gold,
+            classic_pred=classic_pred,
+            mbr_pred=mbr_pred,
+            classic_stats=classic_stats,
+            mbr_stats=mbr_stats,
+            split=split,
+        )
+
+    image_path = None
+    if ARC_VISUAL_GRADING and ARC_SAVE_GRADE_IMAGES:
+        image_path = save_arc_grade_image(
+            task_id=task_id,
+            test_index=test_index,
+            test_input=test_input,
+            gold=gold,
+            classic_pred=classic_pred,
+            mbr_pred=mbr_pred,
+            classic_stats=classic_stats,
+            mbr_stats=mbr_stats,
+            train_pairs=train_pairs,
+        )
+        if image_path:
+            display_arc_grade_image(image_path)
+
+    return {
+        "classic_stats": classic_stats,
+        "mbr_stats": mbr_stats,
+        "image_path": image_path,
+    }
+
+
+def print_arc_gradeboard(per_task: List[Dict[str, Any]], split: str) -> None:
+    """Final at-a-glance scoreboard for every challenged task."""
+    print("\n" + "━" * 78)
+    print(f"ARC GRADEBOARD  ({split} split — contrasted against test-set gold labels)")
+    print("━" * 78)
+    print(f"{'Task ID':<12} {'Tests':>5}  {'Classic':>16}  {'Million-Brains':>16}")
+    print("-" * 78)
+    for rec in per_task:
+        tid = rec["task_id"]
+        tests = len(rec.get("classic", []))
+        c_pass = sum(1 for r in rec["classic"] if r.get("correct"))
+        m_pass = sum(1 for r in rec["mbr"] if r.get("correct"))
+        c_bar = "█" * c_pass + "░" * max(0, tests - c_pass)
+        m_bar = "█" * m_pass + "░" * max(0, tests - m_pass)
+        print(
+            f"{tid:<12} {tests:>5}  {c_pass}/{tests} {c_bar:<8}  {m_pass}/{tests} {m_bar}"
+        )
+    print("━" * 78)
+
+
+def evaluate_arc_dataset(
+    vllm_llm: LLM,
+    tokenizer: Any,
+    challenges_path: str,
+    solutions_path: str,
+    *,
+    max_tasks: Optional[int] = EVAL_MAX_TASKS,
+    max_new_tokens: int = EVAL_MAX_NEW_TOKENS,
+    k: int = K,
+    block_size: int = BLOCK_SIZE,
+    enable_reallocation: bool = ENABLE_FEATURE_REALLOCATION,
+    seed: int = SEED,
+    split: str = ARC_DATA_SPLIT,
+    visual_grading: bool = ARC_VISUAL_GRADING,
+) -> Dict[str, Any]:
+    """
+    Run classic vs million-brains-dflash on an ARC-AGI split.
+    Requires explicit challenges + solutions paths (typically under data/, gitignored).
+    """
+    dataset = load_arc_dataset(challenges_path, solutions_path)
+    challenges = dataset["challenges"]
+    solutions = dataset["solutions"]
+
+    task_ids = sorted(challenges.keys())
+    if max_tasks is not None:
+        task_ids = task_ids[: max(0, int(max_tasks))]
+
+    print("\n" + "=" * 80)
+    print("ARC-AGI EVALUATION")
+    print("=" * 80)
+    print(f"Challenges: {os.path.abspath(challenges_path)}")
+    print(f"Solutions:  {os.path.abspath(solutions_path)}")
+    print(f"Tasks:      {len(task_ids)}")
+    print(f"Split:      {split}")
+    print(f"Visual grading: {visual_grading} (save images: {ARC_SAVE_GRADE_IMAGES})")
+    print(f"Print all answers vs gold: {ARC_PRINT_ALL_ANSWERS}")
+    print(f"ARC eval verbose (MBR internals): {ARC_EVAL_VERBOSE}")
+    print(
+        f"ARC generation mode: {ARC_EVAL_GENERATION_MODE} "
+        f"(chat_template={ARC_USE_CHAT_TEMPLATE}, temp={ARC_GENERATION_TEMPERATURE})"
+    )
+    print(f"ARC run MBR eval: {ARC_RUN_MBR_EVAL}")
+    if visual_grading and ARC_SAVE_GRADE_IMAGES:
+        print(f"Grade images: {_arc_grade_output_dir()}/")
+    print("-" * 80)
+
+    allocator = PermutationFeatureSlotAllocator(
+        internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=k
+    )
+
+    summary = {
+        "challenges_path": os.path.abspath(challenges_path),
+        "solutions_path": os.path.abspath(solutions_path),
+        "num_tasks": len(task_ids),
+        "classic": {"correct": 0, "parsed": 0, "tests": 0, "time": 0.0, "tokens": 0},
+        "mbr": {"correct": 0, "parsed": 0, "tests": 0, "time": 0.0, "tokens": 0},
+        "per_task": [],
+        "answer_comparisons": [],
+    }
+
+    for task_idx, task_id in enumerate(task_ids):
+        if task_id not in solutions:
+            print(f"[ARC] Skipping {task_id}: no entry in solutions file")
+            continue
+
+        task = challenges[task_id]
+        gold_tests = solutions[task_id]
+        num_tests = min(len(task.get("test", [])), len(gold_tests))
+
+        task_record = {
+            "task_id": task_id,
+            "classic": [],
+            "mbr": [],
+        }
+
+        for test_index in range(num_tests):
+            prompt = build_arc_inference_prompt(
+                tokenizer, task_id, task, test_index=test_index
+            )
+            gold = gold_tests[test_index]
+            test_input = task["test"][test_index]["input"]
+
+            arc_eval_log(
+                f"\n[ARC] >>> task {task_idx + 1}/{len(task_ids)} {task_id} "
+                f"test#{test_index} — starting CLASSIC pass "
+                f"({ARC_EVAL_GENERATION_MODE})…"
+            )
+            t0 = time.perf_counter()
+            classic_res = arc_classic_generate(
+                vllm_llm,
+                tokenizer,
+                prompt,
+                max_new_tokens=max_new_tokens,
+                block_size=max(6, block_size),
+                seed=seed + test_index,
+            )
+            classic_elapsed = time.perf_counter() - t0
+            classic_timing = generation_timing_stats(
+                classic_elapsed, classic_res["num_tokens"]
+            )
+            summary["classic"]["time"] += classic_elapsed
+            summary["classic"]["tokens"] += classic_res["num_tokens"]
+            summary["classic"]["tests"] += 1
+
+            classic_answer_text = extract_arc_generated_suffix(classic_res, prompt)
+            classic_pred = parse_grid_from_text(classic_answer_text, only_after=None)
+            classic_stats_early = grid_cell_stats(classic_pred, gold)
+
+            if ARC_PRINT_ALL_ANSWERS:
+                print_arc_classic_interim(
+                    task_id=task_id,
+                    task_idx=task_idx,
+                    num_tasks=len(task_ids),
+                    test_index=test_index,
+                    gold=gold,
+                    classic_pred=classic_pred,
+                    classic_stats=classic_stats_early,
+                    classic_timing=classic_timing,
+                    classic_raw_tail=classic_answer_text,
+                    split=split,
+                )
+
+            if ARC_RUN_MBR_EVAL:
+                arc_eval_log(
+                    f"[ARC] >>> task {task_idx + 1}/{len(task_ids)} {task_id} "
+                    f"test#{test_index} — starting MILLION-BRAINS pass…"
+                )
+                t0 = time.perf_counter()
+                mbr_res = million_brains_dflash_generate(
+                    vllm_llm,
+                    tokenizer,
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    k=k,
+                    block_size=block_size,
+                    allocator=allocator,
+                    enable_reallocation=enable_reallocation,
+                    seed=seed + test_index,
+                    verbose=ARC_EVAL_VERBOSE,
+                )
+                mbr_elapsed = time.perf_counter() - t0
+                mbr_timing = generation_timing_stats(mbr_elapsed, mbr_res["num_tokens"])
+                summary["mbr"]["time"] += mbr_elapsed
+                summary["mbr"]["tokens"] += mbr_res["num_tokens"]
+                mbr_answer_text = extract_arc_generated_suffix(mbr_res, prompt)
+                mbr_pred = parse_grid_from_text(mbr_answer_text, only_after=None)
+                arc_eval_log(
+                    f"[ARC] <<< task {task_idx + 1}/{len(task_ids)} {task_id} "
+                    f"test#{test_index} — MBR done | {format_timing_line(mbr_timing)}"
+                )
+            else:
+                mbr_res = {
+                    "final_text": prompt,
+                    "generated_text": "",
+                    "num_tokens": 0,
+                    "generation_mode": "skipped",
+                }
+                mbr_timing = generation_timing_stats(0.0, 0)
+                mbr_answer_text = ""
+                mbr_pred = None
+                arc_eval_log(
+                    f"[ARC] --- task {task_idx + 1}/{len(task_ids)} {task_id} "
+                    f"test#{test_index} — MBR skipped (ARC_RUN_MBR_EVAL=False)"
+                )
+            summary["mbr"]["tests"] += 1
+
+            grade_info = grade_arc_test_case(
+                task_id=task_id,
+                task_idx=task_idx,
+                num_tasks=len(task_ids),
+                test_index=test_index,
+                test_input=test_input,
+                gold=gold,
+                classic_pred=classic_pred,
+                mbr_pred=mbr_pred,
+                train_pairs=task.get("train") if ARC_SHOW_TRAIN_EXAMPLES else None,
+                split=split,
+            ) if visual_grading else {
+                "classic_stats": grid_cell_stats(classic_pred, gold),
+                "mbr_stats": grid_cell_stats(mbr_pred, gold),
+                "image_path": None,
+            }
+
+            classic_stats = grade_info["classic_stats"]
+            mbr_stats = grade_info["mbr_stats"]
+
+            comparison_rec = {
+                "task_id": task_id,
+                "task_idx": task_idx,
+                "test_index": test_index,
+                "split": split,
+                "gold": gold,
+                "gold_json": format_grid_json(gold),
+                "classic_pred": classic_pred,
+                "classic_json": format_grid_json(classic_pred),
+                "mbr_pred": mbr_pred,
+                "mbr_json": format_grid_json(mbr_pred),
+                "classic_verdict": _grade_verdict_label(classic_stats),
+                "mbr_verdict": _grade_verdict_label(mbr_stats),
+                "classic_correct": classic_stats["correct"],
+                "mbr_correct": mbr_stats["correct"],
+                "classic_match_rate": classic_stats["match_rate"],
+                "mbr_match_rate": mbr_stats["match_rate"],
+                "classic_timing": classic_timing,
+                "mbr_timing": mbr_timing,
+                "classic_mode": classic_res.get("generation_mode"),
+                "mbr_mode": mbr_res.get("generation_mode"),
+            }
+            summary["answer_comparisons"].append(comparison_rec)
+
+            if ARC_PRINT_ALL_ANSWERS:
+                print_arc_answer_comparison(
+                    task_id=task_id,
+                    task_idx=task_idx,
+                    num_tasks=len(task_ids),
+                    test_index=test_index,
+                    gold=gold,
+                    classic_pred=classic_pred,
+                    mbr_pred=mbr_pred,
+                    classic_stats=classic_stats,
+                    mbr_stats=mbr_stats,
+                    classic_raw_text=classic_answer_text,
+                    mbr_raw_text=mbr_answer_text,
+                    classic_timing=classic_timing,
+                    mbr_timing=mbr_timing,
+                    split=split,
+                )
+
+            if classic_stats["parsed"]:
+                summary["classic"]["parsed"] += 1
+            if classic_stats["correct"]:
+                summary["classic"]["correct"] += 1
+            if mbr_stats["parsed"]:
+                summary["mbr"]["parsed"] += 1
+            if mbr_stats["correct"]:
+                summary["mbr"]["correct"] += 1
+
+            task_record["classic"].append(
+                {
+                    "test_index": test_index,
+                    "parsed": classic_stats["parsed"],
+                    "correct": classic_stats["correct"],
+                    "match_rate": classic_stats["match_rate"],
+                    "matching_cells": classic_stats["matching_cells"],
+                    "gold_cells": classic_stats["gold_cells"],
+                    "prediction": classic_pred,
+                    "gold": gold,
+                    "elapsed_s": classic_timing["elapsed_s"],
+                    "num_tokens": classic_timing["num_tokens"],
+                    "tps": classic_timing["tps"],
+                }
+            )
+            task_record["mbr"].append(
+                {
+                    "test_index": test_index,
+                    "parsed": mbr_stats["parsed"],
+                    "correct": mbr_stats["correct"],
+                    "match_rate": mbr_stats["match_rate"],
+                    "matching_cells": mbr_stats["matching_cells"],
+                    "gold_cells": mbr_stats["gold_cells"],
+                    "prediction": mbr_pred,
+                    "gold": gold,
+                    "elapsed_s": mbr_timing["elapsed_s"],
+                    "num_tokens": mbr_timing["num_tokens"],
+                    "tps": mbr_timing["tps"],
+                }
+            )
+            if grade_info.get("image_path"):
+                task_record.setdefault("grade_images", []).append(
+                    grade_info["image_path"]
+                )
+
+        summary["per_task"].append(task_record)
+        c_ok = sum(1 for r in task_record["classic"] if r["correct"])
+        m_ok = sum(1 for r in task_record["mbr"] if r["correct"])
+        c_task_tps = (
+            sum(r.get("num_tokens", 0) for r in task_record["classic"])
+            / max(1e-6, sum(r.get("elapsed_s", 0.0) for r in task_record["classic"]))
+        )
+        m_task_tps = (
+            sum(r.get("num_tokens", 0) for r in task_record["mbr"])
+            / max(1e-6, sum(r.get("elapsed_s", 0.0) for r in task_record["mbr"]))
+        )
+        print(
+            f"[ARC] {task_idx + 1:4d}/{len(task_ids)} {task_id} "
+            f"classic {c_ok}/{num_tests} ({c_task_tps:.2f} tok/s) | "
+            f"mbr {m_ok}/{num_tests} ({m_task_tps:.2f} tok/s)"
+        )
+
+    def _rates(bucket: Dict[str, Any]) -> Dict[str, float]:
+        tests = max(1, bucket["tests"])
+        return {
+            "accuracy": bucket["correct"] / tests,
+            "parse_rate": bucket["parsed"] / tests,
+            "tps": bucket["tokens"] / max(1e-6, bucket["time"]),
+        }
+
+    summary["classic"].update(_rates(summary["classic"]))
+    summary["mbr"].update(_rates(summary["mbr"]))
+    summary["split"] = split
+
+    if visual_grading:
+        print_arc_gradeboard(summary["per_task"], split)
+
+    if ARC_PRINT_ALL_ANSWERS and summary["answer_comparisons"]:
+        print_arc_full_answer_report(summary["answer_comparisons"], split)
+        report_path = ARC_ANSWER_REPORT_PATH
+        if report_path is None:
+            report_path = (
+                "/kaggle/working/arc_answer_report.json"
+                if _on_kaggle()
+                else "arc_answer_report.json"
+            )
+        try:
+            with open(report_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "split": split,
+                        "num_comparisons": len(summary["answer_comparisons"]),
+                        "comparisons": summary["answer_comparisons"],
+                    },
+                    f,
+                    indent=2,
+                )
+            print(f"[ARC] Wrote full answer report: {report_path}")
+        except Exception as exc:
+            print(f"[ARC] Could not write answer report: {exc}")
+
+    print("\n" + "=" * 80)
+    print("ARC-AGI RESULTS")
+    print("=" * 80)
+    print(
+        f"{'Metric':<28} {'Classic':>14} {'Million-Brains':>18}"
+    )
+    print("-" * 62)
+    print(
+        f"{'Test cases':<28} {summary['classic']['tests']:>14} {summary['mbr']['tests']:>18}"
+    )
+    print(
+        f"{'Parsed outputs':<28} {summary['classic']['parsed']:>14} {summary['mbr']['parsed']:>18}"
+    )
+    print(
+        f"{'Exact matches':<28} {summary['classic']['correct']:>14} {summary['mbr']['correct']:>18}"
+    )
+    print(
+        f"{'Accuracy':<28} {summary['classic']['accuracy']:>13.2%} {summary['mbr']['accuracy']:>17.2%}"
+    )
+    print(
+        f"{'Parse rate':<28} {summary['classic']['parse_rate']:>13.2%} {summary['mbr']['parse_rate']:>17.2%}"
+    )
+    print(
+        f"{'Total elapsed (s)':<28} {summary['classic']['time']:>14.2f} {summary['mbr']['time']:>18.2f}"
+    )
+    print(
+        f"{'Avg elapsed / test (s)':<28} "
+        f"{summary['classic']['time'] / max(1, summary['classic']['tests']):>14.2f} "
+        f"{summary['mbr']['time'] / max(1, summary['mbr']['tests']):>18.2f}"
+    )
+    print(
+        f"{'Tokens / sec':<28} {summary['classic']['tps']:>14.2f} {summary['mbr']['tps']:>18.2f}"
+    )
+    print("=" * 80 + "\n")
+    return summary
+
+
+def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="one-million-brains-dflash benchmark and ARC-AGI evaluation"
+    )
+    parser.add_argument(
+        "--arc-profile",
+        choices=("local", "kaggle", "auto", "off"),
+        default=ARC_DATA_PROFILE,
+        help="ARC data source: local data/, Kaggle competition input, auto-detect, or off",
+    )
+    parser.add_argument(
+        "--arc-split",
+        choices=tuple(ARC_SPLIT_FILES.keys()),
+        default=ARC_DATA_SPLIT,
+        help="ARC split to score (training or evaluation)",
+    )
+    parser.add_argument(
+        "--eval-challenges",
+        default=EVAL_CHALLENGES_PATH,
+        help="Override ARC challenges JSON path",
+    )
+    parser.add_argument(
+        "--eval-solutions",
+        default=EVAL_SOLUTIONS_PATH,
+        help="Override ARC solutions JSON path",
+    )
+    parser.add_argument(
+        "--eval-max-tasks",
+        type=int,
+        default=EVAL_MAX_TASKS,
+        help="Limit number of ARC tasks (default: all)",
+    )
+    parser.add_argument(
+        "--eval-max-new-tokens",
+        type=int,
+        default=EVAL_MAX_NEW_TOKENS,
+        help="Per-task generation budget for ARC evaluation",
+    )
+    parser.add_argument(
+        "--run-demo-benchmark",
+        action="store_true",
+        help="Also run the built-in single-prompt demo benchmark",
+    )
+    parser.add_argument(
+        "--demo-only",
+        action="store_true",
+        help="Run only the demo benchmark (ignore ARC paths even if set)",
+    )
+    parser.add_argument(
+        "--no-arc-visuals",
+        action="store_true",
+        help="Disable per-challenge visual grade cards and PNG exports",
+    )
+    # parse_known_args: Jupyter/Kaggle/Colab inject `-f <kernel.json>` into sys.argv
+    args, _unknown = parser.parse_known_args(argv)
+    challenges_path, solutions_path, source = resolve_arc_eval_paths(
+        profile=args.arc_profile,
+        split=args.arc_split,
+        challenges_override=args.eval_challenges,
+        solutions_override=args.eval_solutions,
+    )
+    args.eval_challenges = challenges_path
+    args.eval_solutions = solutions_path
+    args.arc_source = source
+    return args
 
 
 # =============================================================================
@@ -1863,70 +4849,131 @@ def benchmark(
 # MAIN ENTRY POINT (Kaggle script style - just run the file)
 # =============================================================================
 if __name__ == "__main__":
+    args = parse_cli_args()
+
     print(
         "\n[million_brains_dflash.py] Starting full one-million-brains-dflash (Fast Million Brains) Kaggle run"
     )
+    print(f"    SCRIPT_VERSION={SCRIPT_VERSION}")
     print(
         f"    K={K}, BLOCK_SIZE={BLOCK_SIZE}, ENABLE_FEATURE_REALLOCATION={ENABLE_FEATURE_REALLOCATION}"
     )
     print(f"    SEED={SEED}, TARGET_MAX_TOKENS={TARGET_MAX_TOKENS}")
+    print_arc_data_config(
+        args.eval_challenges, args.eval_solutions, args.arc_source
+    )
 
     # 1) Live-edit banner was already printed right after the patcher ran.
 
-    # 2) Choose & load model (with the exact fallbacks requested)
-    model_name, backend = pick_model_name()
+    # 2) Optional one-time prefetch when Kaggle Internet is enabled
+    ensure_model_available()
+
+    # 3) Choose & load model (local/offline first; remote only when online)
+    model_name = "unknown"
     try:
-        # Prefer the two local pre-downloaded checkpoints (DFlash + base Qwen 4B)
-        dflash_llm, dflash_tok, base_llm, base_tok = load_local_models()
-        vllm_llm, tokenizer, hf_model = dflash_llm, dflash_tok, None
-        # 'base_llm' / 'base_tok' are loaded but not yet wired into the benchmark;
-        # available for a future head-to-head Qwen-base vs Qwen-DFlash comparison.
-        _available_engines = {"dflash": dflash_llm, "base": base_llm}
+        if PREFER_LOCAL_MODELS:
+            dflash_llm, dflash_tok, base_llm, base_tok = load_local_models()
+            vllm_llm, tokenizer, hf_model = dflash_llm, dflash_tok, None
+            model_name = resolve_local_model_path() or LOCAL_DFLASH_DIR or "local"
+            if base_llm is not None:
+                _available_engines = {"dflash": dflash_llm, "base": base_llm}
+        else:
+            raise RuntimeError("PREFER_LOCAL_MODELS=False — use remote path")
     except RuntimeError as _local_e:
         print(_local_e)
-        print(
-            "[LOCAL-LOAD] Falling back to remote pick_model_name() + load_models() path."
-        )
+        print("[LOCAL-LOAD] Falling back to remote model resolution...")
+        model_name, backend = pick_model_name()
         vllm_llm, tokenizer, hf_model = load_models(model_name)
 
-    # 3) Sanity: force the banner again so it is unmistakable in the log
+    # 4) Sanity: force the banner again so it is unmistakable in the log
     print_one_million_brains_banner(_LIVE_PATCH_SUCCESS)
 
-    # 4) Run the benchmark (the thing the user actually cares about)
-    results = benchmark(
-        vllm_llm, tokenizer, BENCHMARK_PROMPT, max_new=TARGET_MAX_TOKENS
-    )
+    verify_inference_engine(vllm_llm, tokenizer)
 
-    # 5) Final summary line (useful when scanning Kaggle logs)
-    print(
-        "[FINAL] Classic TPS: %.2f | MILLION-BRAINS TPS: %.2f | reallocs: %d | Avg accept: %.2f"
-        % (
-            results["classic"]["tps"],
-            results["mbr"]["tps"],
-            results["mbr"].get("feature_reallocations", 0),
-            results["mbr"]["avg_accepted_per_block"],
-        )
+    # 5) Evaluation / benchmark
+    results: Dict[str, Any] = {}
+    run_arc_eval = (
+        not args.demo_only
+        and args.eval_challenges
+        and args.eval_solutions
     )
+    run_demo = args.demo_only or args.run_demo_benchmark or not run_arc_eval
+
+    if run_arc_eval:
+        results["arc"] = evaluate_arc_dataset(
+            vllm_llm,
+            tokenizer,
+            args.eval_challenges,
+            args.eval_solutions,
+            max_tasks=args.eval_max_tasks,
+            max_new_tokens=args.eval_max_new_tokens,
+            split=args.arc_split,
+            visual_grading=ARC_VISUAL_GRADING and not args.no_arc_visuals,
+        )
+
+    if run_demo:
+        results["demo"] = benchmark(
+            vllm_llm, tokenizer, BENCHMARK_PROMPT, max_new=TARGET_MAX_TOKENS
+        )
+
+    # 6) Final summary line (useful when scanning Kaggle logs)
+    if "demo" in results:
+        demo = results["demo"]
+        print(
+            "[FINAL][demo] Classic TPS: %.2f | MILLION-BRAINS TPS: %.2f | reallocs: %d | Avg accept: %.2f"
+            % (
+                demo["classic"]["tps"],
+                demo["mbr"]["tps"],
+                demo["mbr"].get("feature_reallocations", 0),
+                demo["mbr"]["avg_accepted_per_block"],
+            )
+        )
+    if "arc" in results:
+        arc = results["arc"]
+        print(
+            "[FINAL][arc] Classic acc: %.2f%% | MBR acc: %.2f%% | tests: %d"
+            % (
+                arc["classic"]["accuracy"] * 100,
+                arc["mbr"]["accuracy"] * 100,
+                arc["classic"]["tests"],
+            )
+        )
 
     # Optional: write a small artifact so the Kaggle "Output" pane has something
+    artifact_path = (
+        "/kaggle/working/million_brains_dflash_results.json"
+        if _on_kaggle()
+        else "million_brains_dflash_results.json"
+    )
     try:
-        with open("/kaggle/working/million_brains_dflash_results.json", "w") as f:
-            json.dump(
-                {
-                    "classic": {
-                        k: v for k, v in results["classic"].items() if k != "final_text"
-                    },
-                    "mbr": {
-                        k: v for k, v in results["mbr"].items() if k != "final_text"
-                    },
-                    "model": model_name,
-                    "k": K,
-                    "block_size": BLOCK_SIZE,
+        payload: Dict[str, Any] = {
+            "model": model_name,
+            "k": K,
+            "block_size": BLOCK_SIZE,
+        }
+        if "demo" in results:
+            payload["demo"] = {
+                "classic": {
+                    k: v
+                    for k, v in results["demo"]["classic"].items()
+                    if k != "final_text"
                 },
-                f,
-                indent=2,
-            )
-        print("[ARTIFACT] Wrote /kaggle/working/million_brains_dflash_results.json")
+                "mbr": {
+                    k: v
+                    for k, v in results["demo"]["mbr"].items()
+                    if k != "final_text"
+                },
+            }
+        if "arc" in results:
+            arc_out = dict(results["arc"])
+            arc_out.pop("per_task", None)
+            payload["arc"] = arc_out
+            payload["eval_challenges"] = args.eval_challenges
+            payload["eval_solutions"] = args.eval_solutions
+
+        with open(artifact_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        print(f"[ARTIFACT] Wrote {artifact_path}")
     except Exception:
         pass
 

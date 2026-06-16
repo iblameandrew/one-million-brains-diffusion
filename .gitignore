@@ -44,6 +44,10 @@ Thumbs.db
 *.log
 *.tmp
 
+# Local datasets (pass paths via --eval-challenges / --eval-solutions)
+data/
+arc_grades/
+
 # Kaggle outputs (if any)
 *.json
 *.csv
