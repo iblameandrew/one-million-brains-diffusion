@@ -1,5 +1,8 @@
 # million-brains-dflash
 
+<img width="1920" height="2400" alt="image" src="https://github.com/user-attachments/assets/3d47988b-261a-479e-bb1f-f074dfadefc2" />
+
+
 **Permutation-Gated Feature-Slot Speculative Decoding** — the Fast Million Brains approach.
 
 A complete, self-contained, runnable Kaggle script (`million_brains_dflash.py`) that implements an advanced, diversity-driven speculative decoding architecture on top of vLLM.
