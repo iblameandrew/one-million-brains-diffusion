@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-million_brains_dflash.py - million-brains-dflash: Permutation-Gated Feature-Slot Allocator + 12 Personality Features
+million_brains_dflash.py - one-million-brains-dflash: Permutation-Gated Feature-Slot Allocator + 12 Personality Features
               + Token-Level Cross-Stream Integration + Adaptive Feature Reallocation
               (the Fast Million Brains approach)
 
 This is a complete, self-contained, heavily commented Kaggle script.
 It installs vLLM, preemptively live-edits (monkey-patches + file fallback) the DFlash / vLLM draft mechanisms,
-injects the full million-brains-dflash combinatorial architecture (honoring the Fast Million Brains approach),
-then runs a rigorous benchmark comparing classic (single-path Para-DFlash style) vs. full million-brains-dflash
+injects the full one-million-brains-dflash combinatorial architecture (honoring the Fast Million Brains approach),
+then runs a rigorous benchmark comparing classic (single-path Para-DFlash style) vs. full one-million-brains-dflash
 (K=4 dynamic feature-slot allocation).
 
 ===============================================================================
@@ -29,7 +29,7 @@ Base Para-DFlash Core (generalized speculative / block-parallel drafting):
   number of accepted tokens (variable per super-block). This is exactly the multi-step
   speculative acceptance generalized across K branches.
 
-million-brains-dflash Permutation-Gated Feature-Slot Allocator (Fast Million Brains approach):
+one-million-brains-dflash Permutation-Gated Feature-Slot Allocator (Fast Million Brains approach):
 - This directly implements the Fast Million Brains approach: a compact bank of 12 high-signal
   personality features is combinatorially permuted at every super-block into K parallel
   "brains" (feature-slots). By rapidly re-allocating different thinking styles across many
@@ -97,7 +97,7 @@ Permutation Hashing (rigorous core):
 Kaggle rules followed strictly:
 - Starts with !pip install -q vllm transformers accelerate flash-attn --upgrade
 - Immediate robust LIVE EDIT section (file overwrite fallback + runtime sys.modules + subclass)
-- Prints the exact " MILLION-BRAINS-DFLASH INITIALIZED " banner.
+- Prints the exact " ONE-MILLION-BRAINS-DFLASH INITIALIZED " banner.
 - Easy toggles at the very top after shebang/imports.
 - Ends with full head-to-head benchmark: tokens/sec, avg accepted tokens, feature-slot reallocation
   count, allocator decisions, and side-by-side generated samples.
@@ -531,7 +531,7 @@ def extract_logprob_for_token(logprob_dict_or_list: Any, token_id: int) -> float
 
 
 # =============================================================================
-# MILLION-BRAINS-DFLASH GENERATE (the full algorithm)
+# ONE-MILLION-BRAINS-DFLASH GENERATE (the full algorithm)
 # =============================================================================
 def million_brains_dflash_generate(
     vllm_llm: LLM,
@@ -545,7 +545,7 @@ def million_brains_dflash_generate(
     seed: int = 42,
 ) -> Dict[str, Any]:
     """
-    Full million-brains-dflash loop (permutation-driven feature-slot allocation).
+    Full one-million-brains-dflash loop (permutation-driven feature-slot allocation).
 
     - Uses vLLM for fast batched proposal across K feature-slotted streams
       (the "drafter forward" for the entire super-block horizon).
@@ -836,7 +836,7 @@ def classic_dflash_generate(
 
 
 # =============================================================================
-# FMBDFLASHDRAFTMODEL (module-level so patcher and file-injection can always see it)
+# ONEMILLIONBRAINSDFLASHDRAFTMODEL (module-level so patcher and file-injection can always see it)
 # =============================================================================
 class MillionBrainsDFlashDraftModel:
     """
@@ -864,18 +864,18 @@ class MillionBrainsDFlashDraftModel:
 # This must run immediately after the pip install and before heavy model loading.
 # Strategy:
 #   1. Attempt to locate vllm.spec_decode.draft_model on disk and surgically
-#      overwrite key classes / methods with million-brains-dflash versions (file fallback).
+#      overwrite key classes / methods with one-million-brains-dflash versions (file fallback).
 #   2. Always perform runtime monkey-patching via subclass + module replacement.
 #   3. Inject a global "MILLION_BRAINS_DFLASH" symbol so user code can detect the patch.
-#   4. Emit the exact required banner on success.
+#   4. Emit the exact "ONE-MILLION-BRAINS-DFLASH INITIALIZED" banner on success.
 # =============================================================================
 def _live_edit_dflash() -> bool:
     """
     Robust live-edit routine. Returns True if any patch (file or runtime) succeeded.
-    Performs the million-brains-dflash injection into vLLM's draft mechanisms.
+    Performs the one-million-brains-dflash injection into vLLM's draft mechanisms.
     """
     patched = False
-    print("\n[PREEMPTIVE DFLASH LIVE-EDIT] Scanning for DFlashDraftModel / vLLM draft components (million-brains-dflash injection)...")
+    print("\n[PREEMPTIVE DFLASH LIVE-EDIT] Scanning for DFlashDraftModel / vLLM draft components (one-million-brains-dflash injection)...")
 
     # --- Step 1: File-level overwrite (fallback when source is writable) ---
     try:
@@ -910,7 +910,7 @@ def _live_edit_dflash() -> bool:
                 original = fh.read()
 
             # We do not brutally rewrite the whole file (fragile across vLLM versions).
-            # Instead we append a large million-brains-dflash injection comment block + a small
+            # Instead we append a large one-million-brains-dflash injection comment block + a small
             # "MillionBrainsDFlashDraftModel" subclass at the bottom, then try to swap at runtime.
             injection = f"""
 # =============================================================================
@@ -941,7 +941,7 @@ except Exception:
 class MillionBrainsDFlashDraftModel:  # type: ignore
     \"\"\"
     File-injected stand-in for DFlashDraftModel.
-    The full million-brains-dflash (PermutationFeatureSlotAllocator + 12 personality features
+    The full one-million-brains-dflash (PermutationFeatureSlotAllocator + 12 personality features
     + cross-stream integration + adaptive feature reallocation, the Fast Million Brains
     approach) lives in the calling million_brains_dflash.py. This object carries the
     feature-slot allocation hook.
@@ -958,13 +958,13 @@ class MillionBrainsDFlashDraftModel:  # type: ignore
             return self.feature_allocator(pooled_state, step)
         return list(range(min(self.k, 12)))
 
-# End of million-brains-dflash injection
+# End of one-million-brains-dflash injection
 """
             if "MILLION-BRAINS-DFLASH INJECTION" not in original:
                 try:
                     with open(target_file, "a", encoding="utf-8") as fh:
                         fh.write("\n" + injection)
-                    print(f"    [FILE PATCH] Appended million-brains-dflash injection to {target_file}")
+                    print(f"    [FILE PATCH] Appended one-million-brains-dflash injection to {target_file}")
                     patched = True
                 except Exception as e:
                     print(f"    [FILE PATCH] Could not append (likely read-only FS): {e}")
@@ -996,13 +996,13 @@ class MillionBrainsDFlashDraftModel:  # type: ignore
                         )
                         self.k = K
                         self.block_size = BLOCK_SIZE
-                        print("[PatchedDraftModel] Runtime subclass active - million-brains-dflash ready")
+                        print("[PatchedDraftModel] Runtime subclass active - one-million-brains-dflash ready")
 
                 vllm_draft_module.DraftModel = PatchedDraftModel
                 sys.modules.setdefault("dflash", type(sys)("dflash"))
                 sys.modules["dflash"].DraftModel = PatchedDraftModel
                 sys.modules["dflash"].MILLION_BRAINS_DFLASH_PATCHED = True
-                print("    [RUNTIME PATCH] vllm.spec_decode.draft_model.DraftModel replaced with million-brains-dflash feature-slot aware subclass")
+                print("    [RUNTIME PATCH] vllm.spec_decode.draft_model.DraftModel replaced with one-million-brains-dflash feature-slot aware subclass")
             else:
                 # No original DraftModel - still expose our allocator
                 sys.modules.setdefault("dflash", type(sys)("dflash"))
@@ -1023,14 +1023,14 @@ class MillionBrainsDFlashDraftModel:  # type: ignore
     return patched
 
 
-# Execute the live edit immediately (this is the moment the "DFlash library" is hijacked with million-brains-dflash)
+# Execute the live edit immediately (this is the moment the "DFlash library" is hijacked with one-million-brains-dflash)
 _LIVE_PATCH_SUCCESS = _live_edit_dflash()
 
 
 # =============================================================================
 # REQUIRED BANNER (exact string required by the spec)
 # =============================================================================
-def print_million_brains_banner(success: bool = True):
+def print_one_million_brains_banner(success: bool = True):
     banner = r"""
 ================================================================================
   ███████╗███╗   ███╗██████╗       ██████╗ ███████╗██╗      █████╗ ███████╗██╗  ██╗
@@ -1043,15 +1043,15 @@ def print_million_brains_banner(success: bool = True):
 """
     print(banner)
     if success:
-        print(" MILLION-BRAINS-DFLASH INITIALIZED  |  K=%d  |  FEATURES=%d  |  REALLOCATION=%s" % (
+        print(" ONE-MILLION-BRAINS-DFLASH INITIALIZED  |  K=%d  |  FEATURES=%d  |  REALLOCATION=%s" % (
             K, NUM_PERSONALITY_FEATURES, str(ENABLE_FEATURE_REALLOCATION).upper()))
         print(" Patch status: %s" % ("SUCCESS (file+runtime)" if _LIVE_PATCH_SUCCESS else "RUNTIME ONLY"))
     else:
-        print(" MILLION-BRAINS-DFLASH INITIALIZED (DEGRADED - patch encountered errors, pure-Python fallback active)")
+        print(" ONE-MILLION-BRAINS-DFLASH INITIALIZED (DEGRADED - patch encountered errors, pure-Python fallback active)")
     print("================================================================================\n")
 
 
-print_million_brains_banner(_LIVE_PATCH_SUCCESS)
+print_one_million_brains_banner(_LIVE_PATCH_SUCCESS)
 
 
 # =============================================================================
@@ -1096,7 +1096,7 @@ def pick_model_name() -> Tuple[str, str]:
 
 def load_models(model_name: str):
     """
-    Load one vLLM engine (fast path for both classic and the proposal/verification steps of million-brains-dflash).
+    Load one vLLM engine (fast path for both classic and the proposal/verification steps of one-million-brains-dflash).
     Also load a lightweight HF tokenizer copy for decode/encode consistency.
     We keep everything in FP16/BF16; no quantization to stay mainstream & simple.
     """
@@ -1147,7 +1147,7 @@ def benchmark(
     """
     Head-to-head:
       - Classic Para-DFlash (K=1, plain cumprod speculative)
-      - million-brains-dflash (K=4, dynamic permutation-based feature-slot allocation - the Fast Million Brains approach)
+      - one-million-brains-dflash (K=4, dynamic permutation-based feature-slot allocation - the Fast Million Brains approach)
     Reports tokens/sec, avg accepted tokens per block, feature reallocation count,
     and sample text from both modes.
     """
@@ -1168,7 +1168,7 @@ def benchmark(
     classic_tps = classic_res["num_tokens"] / max(1e-6, t_classic)
 
     # --- MILLION-BRAINS ---
-    print("\n[MILLION-BRAINS] Running full million-brains-dflash (permutation feature-slot allocator + cross-stream integration + adaptive reallocation) ...")
+    print("\n[MILLION-BRAINS] Running full one-million-brains-dflash (permutation feature-slot allocator + cross-stream integration + adaptive reallocation) ...")
     t0 = time.perf_counter()
     allocator = PermutationFeatureSlotAllocator(internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=K)
     mbr_res = million_brains_dflash_generate(
@@ -1190,7 +1190,7 @@ def benchmark(
     print("RESULTS")
     print("=" * 80)
 
-    print(f"\n{'Metric':<30} {'Classic (K=1)':>18} {'million-brains-dflash (K=4)':>22}")
+    print(f"\n{'Metric':<30} {'Classic (K=1)':>18} {'one-million-brains-dflash (K=4)':>22}")
     print("-" * 72)
     print(f"{'Generated tokens':<30} {classic_res['num_tokens']:>18} {mbr_res['num_tokens']:>22}")
     print(f"{'Wall time (s)':<30} {t_classic:>18.2f} {t_mbr:>22.2f}")
@@ -1202,7 +1202,7 @@ def benchmark(
 
     print("\n--- Sample (Classic) ---")
     print(classic_res["final_text"][-600:] if len(classic_res["final_text"]) > 600 else classic_res["final_text"])
-    print("\n--- Sample (million-brains-dflash) ---")
+    print("\n--- Sample (one-million-brains-dflash) ---")
     print(mbr_res["final_text"][-600:] if len(mbr_res["final_text"]) > 600 else mbr_res["final_text"])
 
     # Rich diagnostic
@@ -1228,7 +1228,7 @@ def benchmark(
 # MAIN ENTRY POINT (Kaggle script style - just run the file)
 # =============================================================================
 if __name__ == "__main__":
-    print("\n[million_brains_dflash.py] Starting full million-brains-dflash (Fast Million Brains) Kaggle run")
+    print("\n[million_brains_dflash.py] Starting full one-million-brains-dflash (Fast Million Brains) Kaggle run")
     print(f"    K={K}, BLOCK_SIZE={BLOCK_SIZE}, ENABLE_FEATURE_REALLOCATION={ENABLE_FEATURE_REALLOCATION}")
     print(f"    SEED={SEED}, TARGET_MAX_TOKENS={TARGET_MAX_TOKENS}")
 
@@ -1239,7 +1239,7 @@ if __name__ == "__main__":
     vllm_llm, tokenizer, hf_model = load_models(model_name)
 
     # 3) Sanity: force the banner again so it is unmistakable in the log
-    print_million_brains_banner(_LIVE_PATCH_SUCCESS)
+    print_one_million_brains_banner(_LIVE_PATCH_SUCCESS)
 
     # 4) Run the benchmark (the thing the user actually cares about)
     results = benchmark(vllm_llm, tokenizer, BENCHMARK_PROMPT, max_new=TARGET_MAX_TOKENS)
