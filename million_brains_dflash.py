@@ -70,6 +70,12 @@ Token-Level Cross-Stream Integration & Native Parallelism:
 - Stream-specific positional offsets keep the K parallel streams distinguishable even when
   sharing the same underlying weights.
 
+Circuit Transition Smoothing Block (CTSB, inter-super-block):
+- Discourse State Buffer (DSB): slow EMA of verification pooled state + step structure.
+- Geodesic slot step: at most CTSB_MAX_SLOT_SWAPS feature changes per super-block.
+- SPI/CBF: interpolate sampling params and feature embeddings toward the new circuit.
+- TAFK: stream-level commit selection with discourse coherence + style-jump penalties.
+
 Adaptive Feature Reallocation (Inter-Block):
 - After target verification we record per-slot acceptance rate (accepted_tokens / block_size)
   for the K currently allocated features.
@@ -175,6 +181,15 @@ BENCHMARK_PROMPT = (  # a single hard prompt that benefits from combinatorial di
 SEED = (
     42  # for reproducibility of permutation hashing + sampling inside active features
 )
+ENABLE_CIRCUIT_SMOOTHING = True  # CTSB: smooth transitions between permutation circuits
+CTSB_BLEND_TAU = 0.35  # acceptance-gated blend time constant (higher = slower circuit morph)
+CTSB_MAX_SLOT_SWAPS = 2  # max feature-slot changes per super-block (geodesic step)
+CTSB_DSB_EMA = 0.82  # discourse state buffer EMA decay
+CTSB_COHERENCE_ALPHA = 0.55  # TAFK weight on cumprod acceptance rate
+CTSB_COHERENCE_GAMMA = 0.25  # TAFK weight on discourse coherence
+CTSB_COHERENCE_ETA = 0.15  # TAFK penalty for stylistic jump vs committed prefix
+CTSB_COHERENCE_KAPPA = 0.12  # TAFK bonus for features continuing from previous circuit
+ANCHOR_SLOT = 0  # slot 0 receives extra smoothing inertia (stable chain scribe)
 
 # =============================================================================
 # STANDARD LIBRARY + ML IMPORTS
@@ -187,6 +202,7 @@ import random
 import json
 import hashlib
 import traceback
+import re
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional, Any
@@ -467,6 +483,344 @@ def make_pooled_state(
 
 
 # =============================================================================
+# CIRCUIT TRANSITION SMOOTHING BLOCK (CTSB)
+# Smooths super-block handoffs between permutation circuits while preserving
+# semantic coherence of the committed thinking chain.
+# =============================================================================
+@dataclass
+class CTSBState:
+    """Persistent cross-circuit memory carried across super-blocks."""
+
+    discourse: Optional[torch.Tensor] = None
+    prev_feature_indices: Optional[List[int]] = None
+    prev_params: Optional[List[Dict[str, float]]] = None
+    prev_committed_ids: List[int] = field(default_factory=list)
+    lambda_history: List[float] = field(default_factory=list)
+    effective_feature_history: List[List[str]] = field(default_factory=list)
+
+
+class CircuitTransitionSmoother:
+    """
+    Inter-super-block smoothing layer between the permutation allocator and draft phase.
+
+    Subsystems (v1 Python-side):
+      - DSB: discourse state buffer (slow semantic memory)
+      - CBF/SPI: blend feature vectors and sampling params toward new circuit
+      - Geodesic slot step: limit abrupt feature identity jumps
+      - TAFK: transition-aware fusion kernel (stream-level coherent selection)
+    """
+
+    def __init__(
+        self,
+        k: int = K,
+        num_features: int = NUM_PERSONALITY_FEATURES,
+        internal_dim: int = 256,
+        allocator: Optional[PermutationFeatureSlotAllocator] = None,
+    ):
+        self.k = k
+        self.num_features = num_features
+        self.internal_dim = internal_dim
+        self.allocator = allocator
+        self.state = CTSBState()
+
+    def _default_params(self) -> Dict[str, float]:
+        return {
+            "temperature": BASE_TEMPERATURE,
+            "top_p": BASE_TOP_P,
+            "repetition_penalty": 1.03,
+        }
+
+    def _params_to_vec(self, params: Dict[str, float]) -> torch.Tensor:
+        return torch.tensor(
+            [
+                params.get("temperature", BASE_TEMPERATURE),
+                params.get("top_p", BASE_TOP_P),
+                params.get("repetition_penalty", 1.03),
+            ],
+            dtype=torch.float32,
+        )
+
+    def _vec_to_params(self, vec: torch.Tensor, template: Dict[str, float]) -> Dict[str, float]:
+        out = dict(template)
+        out["temperature"] = float(max(0.05, vec[0].item()))
+        out["top_p"] = float(min(1.0, max(0.05, vec[1].item())))
+        out["repetition_penalty"] = float(max(1.0, vec[2].item()))
+        return out
+
+    def circuit_distance(self, prev: List[int], curr: List[int]) -> int:
+        return sum(1 for a, b in zip(prev, curr) if a != b)
+
+    def geodesic_feature_indices(
+        self, prev: List[int], target: List[int], max_swaps: int
+    ) -> List[int]:
+        """Move at most max_swaps slot assignments toward the allocator target."""
+        if not prev or len(prev) != len(target):
+            return list(target)
+        result = list(prev)
+        swaps = 0
+        for slot in range(self.k):
+            if swaps >= max_swaps:
+                break
+            if result[slot] != target[slot]:
+                result[slot] = target[slot]
+                swaps += 1
+        return result
+
+    def _extract_step_meta(self, text: str) -> Dict[str, float]:
+        steps = [int(m.group(1)) for m in re.finditer(r"(?:Step|step)\s*(\d+)", text)]
+        last_step = float(steps[-1]) if steps else 0.0
+        has_numbered = 1.0 if steps else 0.0
+        return {"last_step": last_step, "has_numbered": has_numbered}
+
+    def update_discourse(
+        self,
+        pooled: torch.Tensor,
+        generated_ids: List[int],
+        accepted_ids: List[int],
+        committed_text: str,
+    ) -> torch.Tensor:
+        """DSB: EMA of pooled verification state + lexical step structure."""
+        dim = self.internal_dim
+        h_verify = pooled.detach().float().flatten()
+        if h_verify.numel() < dim:
+            h_verify = F.pad(h_verify, (0, dim - h_verify.numel()))
+        else:
+            h_verify = h_verify[:dim]
+
+        tail = accepted_ids[-12:] if accepted_ids else generated_ids[-12:]
+        h_lex = torch.zeros(dim, dtype=torch.float32)
+        for i, tid in enumerate(tail):
+            h_lex[(tid + i * 13) % dim] += 0.11
+
+        meta = self._extract_step_meta(committed_text)
+        h_meta = torch.zeros(dim, dtype=torch.float32)
+        h_meta[0] = meta["has_numbered"]
+        h_meta[1] = meta["last_step"] * 0.05
+
+        instant = 0.55 * h_verify + 0.30 * h_lex + 0.15 * h_meta
+        if self.state.discourse is None:
+            self.state.discourse = instant.clone()
+        else:
+            self.state.discourse = (
+                CTSB_DSB_EMA * self.state.discourse + (1.0 - CTSB_DSB_EMA) * instant
+            )
+        return self.state.discourse
+
+    def compute_blend_lambda(
+        self,
+        acceptance_rate: float,
+        accepted_len: int,
+        circuit_dist: int,
+        full_rejection: bool,
+    ) -> float:
+        """How far into the new circuit the upcoming block should lean (0=prev, 1=target)."""
+        if full_rejection:
+            return 1.0
+        accept_gate = 1.0 - math.exp(-max(accepted_len, 0) / max(CTSB_BLEND_TAU, 1e-6))
+        proximity = 1.0 - min(1.0, circuit_dist / max(1, self.k))
+        lam = accept_gate * (0.35 + 0.65 * proximity)
+        if acceptance_rate > 0.5:
+            lam *= 0.60
+        elif acceptance_rate > 0.35:
+            lam *= 0.78
+        return float(max(0.12, min(1.0, lam)))
+
+    def smooth_sampling_params(
+        self,
+        prev_params: List[Dict[str, float]],
+        target_params: List[Dict[str, float]],
+        blend_lambda: float,
+    ) -> List[Dict[str, float]]:
+        """SPI: interpolate per-slot temperature / top_p / repetition_penalty."""
+        smoothed: List[Dict[str, float]] = []
+        for slot in range(self.k):
+            prev = prev_params[slot] if slot < len(prev_params) else self._default_params()
+            target = target_params[slot]
+            anchor_boost = 0.55 if slot == ANCHOR_SLOT else 1.0
+            lam = min(1.0, blend_lambda * anchor_boost)
+            pv = self._params_to_vec(prev)
+            tv = self._params_to_vec(target)
+            blended = (1.0 - lam) * pv + lam * tv
+            smoothed.append(self._vec_to_params(blended, target))
+        return smoothed
+
+    def smooth_feature_vectors(
+        self,
+        prev_indices: List[int],
+        effective_indices: List[int],
+        blend_lambda: float,
+        allocator: PermutationFeatureSlotAllocator,
+    ) -> torch.Tensor:
+        """CBF: blend previous and target feature embeddings (+ residual-free v1)."""
+        device = allocator.feature_emb.weight.device
+        target_vecs = allocator.feature_emb(
+            torch.tensor(effective_indices, dtype=torch.long, device=device)
+        )
+        if not prev_indices or len(prev_indices) != self.k:
+            return target_vecs
+
+        prev_vecs = allocator.feature_emb(
+            torch.tensor(prev_indices, dtype=torch.long, device=device)
+        )
+        gates = allocator.feature_gates[
+            torch.tensor(effective_indices, dtype=torch.long, device=device)
+        ]
+        target_injection = target_vecs * gates
+
+        prev_gates = allocator.feature_gates[
+            torch.tensor(prev_indices, dtype=torch.long, device=device)
+        ]
+        prev_injection = prev_vecs * prev_gates
+
+        lam = torch.tensor(
+            [
+                min(1.0, blend_lambda * (0.55 if s == ANCHOR_SLOT else 1.0))
+                for s in range(self.k)
+            ],
+            device=device,
+            dtype=torch.float32,
+        ).unsqueeze(1)
+        return (1.0 - lam) * prev_injection + lam * target_injection
+
+    def _bigram_profile(self, token_ids: List[int]) -> Dict[Tuple[int, int], float]:
+        if len(token_ids) < 2:
+            return {}
+        counts: Dict[Tuple[int, int], int] = defaultdict(int)
+        for i in range(len(token_ids) - 1):
+            counts[(token_ids[i], token_ids[i + 1])] += 1
+        total = float(sum(counts.values()))
+        return {k: v / total for k, v in counts.items()}
+
+    def style_jump_penalty(
+        self, prefix_ids: List[int], candidate_ids: List[int]
+    ) -> float:
+        """KL-like divergence between prefix bigrams and candidate bigrams."""
+        p_prof = self._bigram_profile(prefix_ids[-24:])
+        c_prof = self._bigram_profile(candidate_ids)
+        if not p_prof or not c_prof:
+            return 0.0
+        keys = set(p_prof) | set(c_prof)
+        kl = 0.0
+        for key in keys:
+            p = p_prof.get(key, 1e-6)
+            c = c_prof.get(key, 1e-6)
+            kl += p * math.log(p / c)
+        return max(0.0, kl)
+
+    def discourse_coherence(
+        self, discourse: torch.Tensor, candidate_ids: List[int]
+    ) -> float:
+        if discourse is None or not candidate_ids:
+            return 0.0
+        dim = discourse.numel()
+        cand = torch.zeros(dim, dtype=torch.float32)
+        for i, tid in enumerate(candidate_ids):
+            cand[(tid + i * 11) % dim] += 0.09
+        denom = discourse.norm() * cand.norm()
+        if denom < 1e-8:
+            return 0.0
+        return float(torch.dot(discourse, cand) / denom)
+
+    def prepare_block(
+        self,
+        allocator: PermutationFeatureSlotAllocator,
+        pooled: torch.Tensor,
+        target_indices: List[int],
+        prev_acceptance_rate: float,
+        prev_accepted_len: int,
+        full_rejection: bool,
+    ) -> Tuple[List[int], List[Dict[str, float]], float, torch.Tensor]:
+        """
+        Apply geodesic slot step + SPI/CBF smoothing before drafting.
+        Returns (effective_indices, smoothed_params, blend_lambda, smoothed_vectors).
+        """
+        prev_idx = self.state.prev_feature_indices
+        if prev_idx is None:
+            effective = list(target_indices)
+            target_params = allocator.get_feature_params(target_indices)
+            self.state.prev_params = [dict(p) for p in target_params]
+            blend_lam = 1.0
+        else:
+            effective = self.geodesic_feature_indices(
+                prev_idx, target_indices, CTSB_MAX_SLOT_SWAPS
+            )
+            target_params = allocator.get_feature_params(effective)
+            dist = self.circuit_distance(prev_idx, effective)
+            blend_lam = self.compute_blend_lambda(
+                prev_acceptance_rate, prev_accepted_len, dist, full_rejection
+            )
+            prev_params = self.state.prev_params or [
+                self._default_params() for _ in range(self.k)
+            ]
+            target_params = self.smooth_sampling_params(
+                prev_params, target_params, blend_lam
+            )
+
+        smoothed_vecs = self.smooth_feature_vectors(
+            prev_idx or [], effective, blend_lam, allocator
+        )
+        self.state.lambda_history.append(blend_lam)
+        self.state.effective_feature_history.append(
+            [PERSONALITY_FEATURES[i] for i in effective]
+        )
+        return effective, target_params, blend_lam, smoothed_vecs
+
+    def select_commit_path(
+        self,
+        proposals: List[List[int]],
+        path_rates: List[float],
+        feature_indices: List[int],
+        fused_proposal: List[int],
+        fused_rate: float,
+        ema_accept: List[float],
+    ) -> Tuple[int, List[int], float, str]:
+        """
+        TAFK: pick a single stream (or fused) by composite coherence score.
+        Returns (path_index, tokens, rate, path_kind).
+        """
+        candidates: List[Tuple[int, List[int], float, str]] = []
+        for j in range(len(proposals)):
+            candidates.append((j, proposals[j], path_rates[j], "stream"))
+        candidates.append((len(proposals), fused_proposal, fused_rate, "fused"))
+
+        best_idx = 0
+        best_score = -1e9
+        prev_idx = self.state.prev_feature_indices or []
+        prefix_ids = self.state.prev_committed_ids
+        discourse = self.state.discourse
+
+        for path_j, tokens, rate, kind in candidates:
+            score = CTSB_COHERENCE_ALPHA * rate
+            score += CTSB_COHERENCE_GAMMA * self.discourse_coherence(discourse, tokens)
+            score -= CTSB_COHERENCE_ETA * self.style_jump_penalty(prefix_ids, tokens)
+            if kind == "stream" and path_j < len(feature_indices):
+                if feature_indices[path_j] in prev_idx:
+                    slot = prev_idx.index(feature_indices[path_j])
+                    if slot < len(ema_accept):
+                        score += CTSB_COHERENCE_KAPPA * ema_accept[slot]
+            if kind == "stream" and path_j == ANCHOR_SLOT:
+                score += 0.04
+            if score > best_score:
+                best_score = score
+                best_idx = path_j
+
+        _, tokens, rate, kind = candidates[best_idx]
+        return best_idx, tokens, rate, kind
+
+    def post_block_update(
+        self,
+        effective_indices: List[int],
+        smoothed_params: List[Dict[str, float]],
+        accepted_ids: List[int],
+        generated_ids: List[int],
+    ) -> None:
+        self.state.prev_feature_indices = list(effective_indices)
+        self.state.prev_params = [dict(p) for p in smoothed_params]
+        if accepted_ids:
+            self.state.prev_committed_ids = list(generated_ids)
+
+
+# =============================================================================
 # TWO-PHASE GROUP THINK MASK BUILDER (educational / documented)
 # =============================================================================
 @dataclass
@@ -587,6 +941,7 @@ def million_brains_dflash_generate(
     block_size: int = 6,
     allocator: Optional[PermutationFeatureSlotAllocator] = None,
     enable_reallocation: bool = True,
+    enable_smoothing: bool = ENABLE_CIRCUIT_SMOOTHING,
     seed: int = 42,
 ) -> Dict[str, Any]:
     """
@@ -597,6 +952,7 @@ def million_brains_dflash_generate(
     - Uses vLLM prompt_logprobs for the target verification forward on the K candidate sequences.
     - The PermutationFeatureSlotAllocator selects a fresh K-permutation of personality features
       for every super-block based on the pooled state of the previous verification.
+    - CircuitTransitionSmoother (CTSB) interpolates circuit handoffs for semantic coherence.
     - Adaptive reallocation: under-performing feature-slots have their personality feature
       replaced from the unused pool on subsequent blocks.
     - This realizes the Fast Million Brains approach at inference time.
@@ -611,6 +967,12 @@ def million_brains_dflash_generate(
             internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=k
         )
 
+    smoother = (
+        CircuitTransitionSmoother(k=k, allocator=allocator)
+        if enable_smoothing
+        else None
+    )
+
     # State
     current_text = prompt
     generated_ids: List[int] = []
@@ -620,6 +982,8 @@ def million_brains_dflash_generate(
     acceptance_history: List[float] = []
     feature_history: List[List[str]] = []
     reframe_events = 0
+    prev_acceptance_rate = 0.5
+    prev_accepted_len = 0
 
     # Per-slot EMA acceptance (used to decide when to re-allocate a different personality feature)
     ema_accept = [0.5] * k
@@ -634,12 +998,36 @@ def million_brains_dflash_generate(
         total_blocks += 1
 
         # 1) Allocator decision (permutation of personality features into feature-slots)
-        pooled = make_pooled_state(generated_ids, sb)
+        pooled = make_pooled_state(generated_ids, sb, tokenizer=tokenizer)
         alloc_out = allocator(pooled, sb)
-        active_feature_indices = alloc_out["feature_indices"]
-        active_feature_names = alloc_out["feature_names"]
-        feature_params = allocator.get_feature_params(active_feature_indices)
-        feature_history.append(active_feature_names)
+        target_feature_indices = alloc_out["feature_indices"]
+        target_feature_names = alloc_out["feature_names"]
+        feature_history.append(target_feature_names)
+
+        # 1b) CTSB: geodesic slot step + SPI/CBF smoothing before drafting
+        blend_lambda = 1.0
+        if smoother is not None:
+            full_rejection = prev_accepted_len == 0 and sb > 0
+            (
+                active_feature_indices,
+                feature_params,
+                blend_lambda,
+                _smoothed_vecs,
+            ) = smoother.prepare_block(
+                allocator,
+                pooled,
+                target_feature_indices,
+                prev_acceptance_rate,
+                prev_accepted_len,
+                full_rejection,
+            )
+            active_feature_names = [
+                PERSONALITY_FEATURES[i] for i in active_feature_indices
+            ]
+        else:
+            active_feature_indices = target_feature_indices
+            active_feature_names = target_feature_names
+            feature_params = allocator.get_feature_params(active_feature_indices)
 
         # 2) Independent Draft phase (K parallel proposals via vLLM batch)
         #    One batched "drafter forward" for the whole super-block horizon, each stream
@@ -680,25 +1068,29 @@ def million_brains_dflash_generate(
             draft_lps.append(lps)
 
         # 3) Cross-stream integration / fusion phase (the high-level "Group Think")
-        #    If the "Synthesizer" personality feature is active in any slot, it gets priority
-        #    when forming the fused candidate. Otherwise we take a simple majority per position.
+        #    CTSB enabled: anchor-stream fused candidate (coherent, no per-token splicing).
+        #    Legacy: Synthesizer priority or position-wise majority vote.
         fused_proposal: List[int] = []
-        synth_idx = None
-        for idx, name in enumerate(active_feature_names):
-            if name == "Synthesizer":
-                synth_idx = idx
-                break
-        for pos in range(block_size):
-            cands = [pr[pos] for pr in proposals if len(pr) > pos]
-            if not cands:
-                break
-            if synth_idx is not None and len(proposals[synth_idx]) > pos:
-                fused_proposal.append(proposals[synth_idx][pos])
-            else:
-                cnt = Counter(cands)
-                fused_proposal.append(cnt.most_common(1)[0][0])
-        if len(fused_proposal) < block_size:
-            fused_proposal += proposals[0][len(fused_proposal) : block_size]
+        if smoother is not None:
+            anchor = min(ANCHOR_SLOT, len(proposals) - 1)
+            fused_proposal = list(proposals[anchor][:block_size])
+        else:
+            synth_idx = None
+            for idx, name in enumerate(active_feature_names):
+                if name == "Synthesizer":
+                    synth_idx = idx
+                    break
+            for pos in range(block_size):
+                cands = [pr[pos] for pr in proposals if len(pr) > pos]
+                if not cands:
+                    break
+                if synth_idx is not None and len(proposals[synth_idx]) > pos:
+                    fused_proposal.append(proposals[synth_idx][pos])
+                else:
+                    cnt = Counter(cands)
+                    fused_proposal.append(cnt.most_common(1)[0][0])
+            if len(fused_proposal) < block_size:
+                fused_proposal += proposals[0][len(fused_proposal) : block_size]
 
         # 4) Target verification forward on the K candidate sequences (+ fused)
         #    Single batched call giving us the target's view of every drafted token.
@@ -731,6 +1123,7 @@ def million_brains_dflash_generate(
         best_accepted: List[int] = []
         best_rate = -1.0
         path_rates: List[float] = []
+        accepted_per_path: List[List[int]] = []
 
         for j in range(k):
             acc, rate = compute_accepted_tokens(
@@ -739,7 +1132,8 @@ def million_brains_dflash_generate(
                 draft_lps[j],
             )
             path_rates.append(rate)
-            if rate > best_rate:
+            accepted_per_path.append(acc)
+            if smoother is None and rate > best_rate:
                 best_rate = rate
                 best_accepted = acc
 
@@ -749,7 +1143,23 @@ def million_brains_dflash_generate(
             target_lps_per_path[-1],
             draft_lps[0],
         )
-        if rate_f > best_rate:
+
+        if smoother is not None:
+            path_idx, _, _, path_kind = smoother.select_commit_path(
+                proposals,
+                path_rates,
+                active_feature_indices,
+                fused_proposal,
+                rate_f,
+                ema_accept,
+            )
+            if path_kind == "fused":
+                best_accepted = acc_f
+                best_rate = rate_f
+            else:
+                best_accepted = accepted_per_path[path_idx]
+                best_rate = path_rates[path_idx]
+        elif rate_f > best_rate:
             best_accepted = acc_f
             best_rate = rate_f
 
@@ -762,6 +1172,19 @@ def million_brains_dflash_generate(
             current_text = current_text + append_text
             total_accepted += accepted_len
         acceptance_history.append(best_rate)
+        prev_acceptance_rate = best_rate
+        prev_accepted_len = accepted_len
+
+        if smoother is not None:
+            smoother.update_discourse(
+                pooled, generated_ids, best_accepted, current_text
+            )
+            smoother.post_block_update(
+                active_feature_indices,
+                feature_params,
+                best_accepted,
+                generated_ids,
+            )
 
         # 7) Adaptive feature reallocation (the "Mirror" mechanism, stripped of astrology)
         if enable_reallocation:
@@ -800,8 +1223,13 @@ def million_brains_dflash_generate(
             phase="integration" if accepted_len > 0 else "draft",
         )
         if sb < 2 or accepted_len == 0:
+            smooth_note = (
+                f" | λ={blend_lambda:.2f}"
+                if smoother is not None
+                else ""
+            )
             print(
-                f"    Super-block {sb:02d} | features={active_feature_names} | accepted={accepted_len}/{block_size} | mask={gmask.describe()}"
+                f"    Super-block {sb:02d} | features={active_feature_names} | accepted={accepted_len}/{block_size}{smooth_note} | mask={gmask.describe()}"
             )
 
         if len(generated_ids) >= max_new_tokens:
@@ -821,6 +1249,15 @@ def million_brains_dflash_generate(
         "acceptance_history": acceptance_history,
         "feature_history": feature_history,
         "reframe_events": reframe_events,
+        "circuit_smoothing_enabled": enable_smoothing,
+        "avg_blend_lambda": (
+            float(np.mean(smoother.state.lambda_history))
+            if smoother and smoother.state.lambda_history
+            else 1.0
+        ),
+        "effective_feature_history": (
+            smoother.state.effective_feature_history if smoother else feature_history
+        ),
     }
 
 
@@ -1339,7 +1776,7 @@ def benchmark(
 
     # --- MILLION-BRAINS ---
     print(
-        "\n[MILLION-BRAINS] Running full one-million-brains-dflash (permutation feature-slot allocator + cross-stream integration + adaptive reallocation) ..."
+        "\n[MILLION-BRAINS] Running full one-million-brains-dflash (permutation allocator + CTSB smoothing + cross-stream integration + adaptive reallocation) ..."
     )
     t0 = time.perf_counter()
     allocator = PermutationFeatureSlotAllocator(
@@ -1385,6 +1822,10 @@ def benchmark(
     print(
         f"{'Divergence events':<30} {classic_res['reframe_events']:>18} {mbr_res['reframe_events']:>22}"
     )
+    if mbr_res.get("circuit_smoothing_enabled"):
+        print(
+            f"{'Avg circuit blend λ':<30} {'n/a':>18} {mbr_res.get('avg_blend_lambda', 1.0):>22.3f}"
+        )
 
     print("\n--- Sample (Classic) ---")
     print(
