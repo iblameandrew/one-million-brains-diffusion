@@ -97,7 +97,7 @@ Permutation Hashing (rigorous core):
 Kaggle rules followed strictly:
 - Starts with !pip install -q vllm transformers accelerate flash-attn --upgrade
 - Immediate robust LIVE EDIT section (file overwrite fallback + runtime sys.modules + subclass)
-- Prints the exact " ONE-MILLION-BRAINS-DFLASH INITIALIZED " banner.
+- Prints the exact " ONE-MILLION-BRAINS-FLASH INITIALIZED " banner.
 - Easy toggles at the very top after shebang/imports.
 - Ends with full head-to-head benchmark: tokens/sec, avg accepted tokens, feature-slot reallocation
   count, allocator decisions, and side-by-side generated samples.
@@ -115,6 +115,7 @@ GPU: T4 / L4 / A10 / A100 all work (uses 1.5B-3B class models by default for hea
 # !pip install -q vllm transformers accelerate flash-attn --upgrade
 try:
     import IPython
+
     _in_notebook = IPython.get_ipython() is not None
 except Exception:
     _in_notebook = False
@@ -122,16 +123,30 @@ except Exception:
 if not _in_notebook:
     # Direct execution path (plain .py or Kaggle "Script" kernel): do real install
     import subprocess, sys
+
     try:
         print("[INSTALL] Running pip via subprocess (plain-Python execution path)...")
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "-q",
-             "vllm", "transformers", "accelerate", "flash-attn", "--upgrade"],
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-q",
+                "vllm",
+                "transformers",
+                "accelerate",
+                "flash-attn",
+                "--upgrade",
+            ],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
         )
     except Exception as _inst_e:
-        print("[INSTALL] Subprocess pip skipped/failed (packages may already exist):", _inst_e)
+        print(
+            "[INSTALL] Subprocess pip skipped/failed (packages may already exist):",
+            _inst_e,
+        )
 else:
     # In notebook the magic line above (when the user pastes it as its own cell or at top)
     # will have executed the install. We leave the comment here exactly as the spec demands.
@@ -140,24 +155,26 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-K = 4                           # number of parallel drafter streams / feature-slots per super-block
-NUM_PERSONALITY_FEATURES = 12   # size of the fixed personality feature bank; do not change unless you extend the list below
-BLOCK_SIZE = 6                  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
-MAX_SUPERBLOCKS = 32            # safety cap on super-blocks
+K = 4  # number of parallel drafter streams / feature-slots per super-block
+NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
+BLOCK_SIZE = 6  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
+MAX_SUPERBLOCKS = 32  # safety cap on super-blocks
 ENABLE_FEATURE_REALLOCATION = True  # master switch for adaptive reallocation of features into slots based on acceptance
-ACCEPTANCE_THRESHOLD = 0.28     # below this a feature-slot is considered underperforming and eligible for reallocation
-REFRAME_TEMP_BOOST = 0.35       # additive temperature boost on total super-block rejection
+ACCEPTANCE_THRESHOLD = 0.28  # below this a feature-slot is considered underperforming and eligible for reallocation
+REFRAME_TEMP_BOOST = 0.35  # additive temperature boost on total super-block rejection
 BASE_TEMPERATURE = 0.7
 BASE_TOP_P = 0.92
-TARGET_MAX_TOKENS = 160         # benchmark generation length
-BENCHMARK_PROMPT = (            # a single hard prompt that benefits from combinatorial diversity of personality features
+TARGET_MAX_TOKENS = 160  # benchmark generation length
+BENCHMARK_PROMPT = (  # a single hard prompt that benefits from combinatorial diversity of personality features
     "You are a world-class puzzle solver. Think step-by-step with extreme rigor. "
     "A farmer has 7 chickens, 4 pigs, and 3 cows. Each chicken has 2 legs, pigs have 4, cows have 4. "
     "At exactly noon every animal casts a perfect shadow that an observer might mistakenly count as extra legs. "
     "The observer counts 61 'legs' total (real + shadow). How many legs are actually real? "
     "Explain your reasoning in numbered steps and give the final integer answer."
 )
-SEED = 42                       # for reproducibility of permutation hashing + sampling inside active features
+SEED = (
+    42  # for reproducibility of permutation hashing + sampling inside active features
+)
 
 # =============================================================================
 # STANDARD LIBRARY + ML IMPORTS
@@ -183,7 +200,9 @@ import torch.nn.functional as F
 # Heavy libraries (installed above)
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from vllm import LLM, SamplingParams
-from vllm.spec_decode import draft_model as vllm_draft_module  # for live patching target
+from vllm.spec_decode import (
+    draft_model as vllm_draft_module,
+)  # for live patching target
 
 # =============================================================================
 # FIXED BANK OF 12 PERSONALITY FEATURES
@@ -192,39 +211,49 @@ from vllm.spec_decode import draft_model as vllm_draft_module  # for live patchi
 # permutation and assigns them to the K parallel streams for the current super-block.
 # =============================================================================
 PERSONALITY_FEATURES: List[str] = [
-    "PreciseAnchor",      # low temperature, anchors strongly to given facts and constraints
-    "CreativeExplorer",   # higher temperature / broad top_p, favors novelty and less-trodden paths
-    "LogicalReasoner",    # medium temperature with bias toward explicit step-by-step chains
-    "SelfCritic",         # tends to surface contradictions and reduce over-commitment
-    "Reframer",           # biases toward re-interpreting the problem statement or constraints
-    "Synthesizer",        # prefers combinations; receives priority during cross-stream fusion
-    "DevilAdvocate",      # stress-tests the currently favored line of reasoning
-    "PatternMatcher",     # strongly attends to numerical, structural, and repetition patterns
-    "EdgeCaseHunter",     # deliberately explores boundary conditions and low-probability inputs
-    "ContextGrounding",   # pulls in broader real-world constraints and background knowledge
-    "Abstractor",         # lifts specifics into higher-level rules or invariants
-    "MirrorReflector",    # meta-feature that conditions on the behavior of the other active features
+    "PreciseAnchor",  # low temperature, anchors strongly to given facts and constraints
+    "CreativeExplorer",  # higher temperature / broad top_p, favors novelty and less-trodden paths
+    "LogicalReasoner",  # medium temperature with bias toward explicit step-by-step chains
+    "SelfCritic",  # tends to surface contradictions and reduce over-commitment
+    "Reframer",  # biases toward re-interpreting the problem statement or constraints
+    "Synthesizer",  # prefers combinations; receives priority during cross-stream fusion
+    "DevilAdvocate",  # stress-tests the currently favored line of reasoning
+    "PatternMatcher",  # strongly attends to numerical, structural, and repetition patterns
+    "EdgeCaseHunter",  # deliberately explores boundary conditions and low-probability inputs
+    "ContextGrounding",  # pulls in broader real-world constraints and background knowledge
+    "Abstractor",  # lifts specifics into higher-level rules or invariants
+    "MirrorReflector",  # meta-feature that conditions on the behavior of the other active features
 ]
 
 # Feature-specific generation hyper-parameters used during the proposal phase for the
 # stream that has been allocated that personality feature. This is the high-level
 # equivalent of "feature-specific temperature/top_p + post-attention gating".
 FEATURE_PARAMS: Dict[str, Dict[str, float]] = {
-    "PreciseAnchor":      {"temperature": 0.35, "top_p": 0.82, "repetition_penalty": 1.08},
-    "CreativeExplorer":   {"temperature": 1.15, "top_p": 0.98, "repetition_penalty": 1.00},
-    "LogicalReasoner":    {"temperature": 0.55, "top_p": 0.90, "repetition_penalty": 1.05},
-    "SelfCritic":         {"temperature": 0.65, "top_p": 0.88, "repetition_penalty": 1.12},
-    "Reframer":           {"temperature": 0.90, "top_p": 0.95, "repetition_penalty": 1.02},
-    "Synthesizer":        {"temperature": 0.60, "top_p": 0.93, "repetition_penalty": 1.03},
-    "DevilAdvocate":      {"temperature": 0.80, "top_p": 0.91, "repetition_penalty": 1.06},
-    "PatternMatcher":     {"temperature": 0.45, "top_p": 0.85, "repetition_penalty": 1.04},
-    "EdgeCaseHunter":     {"temperature": 0.75, "top_p": 0.94, "repetition_penalty": 1.07},
-    "ContextGrounding":   {"temperature": 0.50, "top_p": 0.89, "repetition_penalty": 1.01},
-    "Abstractor":         {"temperature": 0.70, "top_p": 0.96, "repetition_penalty": 1.05},
-    "MirrorReflector":    {"temperature": 0.85, "top_p": 0.87, "repetition_penalty": 1.09},
+    "PreciseAnchor": {"temperature": 0.35, "top_p": 0.82, "repetition_penalty": 1.08},
+    "CreativeExplorer": {
+        "temperature": 1.15,
+        "top_p": 0.98,
+        "repetition_penalty": 1.00,
+    },
+    "LogicalReasoner": {"temperature": 0.55, "top_p": 0.90, "repetition_penalty": 1.05},
+    "SelfCritic": {"temperature": 0.65, "top_p": 0.88, "repetition_penalty": 1.12},
+    "Reframer": {"temperature": 0.90, "top_p": 0.95, "repetition_penalty": 1.02},
+    "Synthesizer": {"temperature": 0.60, "top_p": 0.93, "repetition_penalty": 1.03},
+    "DevilAdvocate": {"temperature": 0.80, "top_p": 0.91, "repetition_penalty": 1.06},
+    "PatternMatcher": {"temperature": 0.45, "top_p": 0.85, "repetition_penalty": 1.04},
+    "EdgeCaseHunter": {"temperature": 0.75, "top_p": 0.94, "repetition_penalty": 1.07},
+    "ContextGrounding": {
+        "temperature": 0.50,
+        "top_p": 0.89,
+        "repetition_penalty": 1.01,
+    },
+    "Abstractor": {"temperature": 0.70, "top_p": 0.96, "repetition_penalty": 1.05},
+    "MirrorReflector": {"temperature": 0.85, "top_p": 0.87, "repetition_penalty": 1.09},
 }
 
-assert len(PERSONALITY_FEATURES) == NUM_PERSONALITY_FEATURES, "PERSONALITY_FEATURES list length must equal NUM_PERSONALITY_FEATURES"
+assert len(PERSONALITY_FEATURES) == NUM_PERSONALITY_FEATURES, (
+    "PERSONALITY_FEATURES list length must equal NUM_PERSONALITY_FEATURES"
+)
 
 
 # =============================================================================
@@ -234,7 +263,7 @@ def calc_permutation_count(n: int, k: int) -> int:
     """P(n, k) = n! / (n-k)!   (number of injective functions from k to n)"""
     p = 1
     for i in range(k):
-        p *= (n - i)
+        p *= n - i
     return p
 
 
@@ -268,7 +297,9 @@ def unrank_permutation(rank: int, n: int, k: int) -> List[int]:
     return result
 
 
-def hash_to_feature_permutation(pooled_vec: torch.Tensor, step: int, n: int, k: int) -> List[int]:
+def hash_to_feature_permutation(
+    pooled_vec: torch.Tensor, step: int, n: int, k: int
+) -> List[int]:
     """
     Core of the permutation-focused allocator.
 
@@ -285,12 +316,15 @@ def hash_to_feature_permutation(pooled_vec: torch.Tensor, step: int, n: int, k: 
     0..k-1 for the upcoming super-block.
     """
     if pooled_vec is None or pooled_vec.numel() == 0:
-        seed = step * 0x9e3779b97f4a7c15
+        seed = step * 0x9E3779B97F4A7C15
     else:
         v = pooled_vec.detach().float().flatten()
         mean_v = v.mean().item()
         var_v = (v - mean_v).pow(2).mean().item() + 1e-12
-        h = int((mean_v * 1_000_003 + var_v * 1_000_037 + step * 37) * 1_000_000_007) & 0xFFFFFFFFFFFFFFFF
+        h = (
+            int((mean_v * 1_000_003 + var_v * 1_000_037 + step * 37) * 1_000_000_007)
+            & 0xFFFFFFFFFFFFFFFF
+        )
         seed = h
 
     p = calc_permutation_count(n, k)
@@ -348,8 +382,10 @@ class PermutationFeatureSlotAllocator(nn.Module):
         self.feature_gates = nn.Parameter(torch.ones(num_features, internal_dim) * 0.9)
 
         # Positional components used to differentiate the K feature-slotted streams.
-        self.segment_emb = nn.Embedding(64, internal_dim)          # super-block / horizon index
-        self.stream_pos_emb = nn.Embedding(k, internal_dim)        # which feature-slot / stream lane
+        self.segment_emb = nn.Embedding(64, internal_dim)  # super-block / horizon index
+        self.stream_pos_emb = nn.Embedding(
+            k, internal_dim
+        )  # which feature-slot / stream lane
 
         self._p = calc_permutation_count(num_features, k)
 
@@ -362,7 +398,9 @@ class PermutationFeatureSlotAllocator(nn.Module):
             stream_pos: [K, D]                    -- lane offsets for the K streams
             feature_names: List[str]              -- human-readable labels of the active features
         """
-        feature_indices = hash_to_feature_permutation(pooled, step, self.num_features, self.k)
+        feature_indices = hash_to_feature_permutation(
+            pooled, step, self.num_features, self.k
+        )
 
         # Optional neural adjustment of the seed (still fully deterministic given pooled + step).
         if pooled is not None and pooled.numel() > 0:
@@ -375,7 +413,9 @@ class PermutationFeatureSlotAllocator(nn.Module):
             v = v.unsqueeze(0)
             _ = self.seed_refiner(v)
 
-        feature_vectors = self.feature_emb(torch.tensor(feature_indices, dtype=torch.long))
+        feature_vectors = self.feature_emb(
+            torch.tensor(feature_indices, dtype=torch.long)
+        )
         gates = self.feature_gates[torch.tensor(feature_indices, dtype=torch.long)]
         stream_pos = self.stream_pos_emb(torch.arange(self.k))
 
@@ -442,6 +482,7 @@ class GroupThinkMask:
           verification step.
     Here we only materialize a symbolic description + a tiny tensor for logging.
     """
+
     k: int
     block_size: int
     phase: str = "draft"  # "draft" or "integration"
@@ -491,7 +532,11 @@ def compute_accepted_tokens(
 
     eps = 1e-12
     for t_idx, (tid, lp_t, lp_d) in enumerate(
-        zip(draft_token_ids, target_logprobs_for_exact_tokens, draft_logprobs_for_exact_tokens)
+        zip(
+            draft_token_ids,
+            target_logprobs_for_exact_tokens,
+            draft_logprobs_for_exact_tokens,
+        )
     ):
         p_t = math.exp(lp_t) if lp_t is not None else 0.0
         p_d = math.exp(lp_d) if lp_d is not None else 0.15  # neutral if unknown
@@ -531,7 +576,7 @@ def extract_logprob_for_token(logprob_dict_or_list: Any, token_id: int) -> float
 
 
 # =============================================================================
-# ONE-MILLION-BRAINS-DFLASH GENERATE (the full algorithm)
+# ONE-MILLION-BRAINS-FLASH GENERATE (the full algorithm)
 # =============================================================================
 def million_brains_dflash_generate(
     vllm_llm: LLM,
@@ -562,7 +607,9 @@ def million_brains_dflash_generate(
     torch.manual_seed(seed)
 
     if allocator is None:
-        allocator = PermutationFeatureSlotAllocator(internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=k)
+        allocator = PermutationFeatureSlotAllocator(
+            internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=k
+        )
 
     # State
     current_text = prompt
@@ -601,7 +648,12 @@ def million_brains_dflash_generate(
         for i in range(k):
             p = feature_params[i]
             sp = SamplingParams(
-                temperature=p["temperature"] + (REFRAME_TEMP_BOOST if reframe_events > 0 and sb == total_blocks-1 else 0.0),
+                temperature=p["temperature"]
+                + (
+                    REFRAME_TEMP_BOOST
+                    if reframe_events > 0 and sb == total_blocks - 1
+                    else 0.0
+                ),
                 top_p=p["top_p"],
                 max_tokens=block_size,
                 logprobs=1,
@@ -618,7 +670,9 @@ def million_brains_dflash_generate(
             lps = []
             if out.outputs[0].logprobs:
                 for tid in tok_ids:
-                    lp = extract_logprob_for_token(out.outputs[0].logprobs[-len(tok_ids):], tid)
+                    lp = extract_logprob_for_token(
+                        out.outputs[0].logprobs[-len(tok_ids) :], tid
+                    )
                     lps.append(lp)
             else:
                 lps = [-0.7] * len(tok_ids)
@@ -644,7 +698,7 @@ def million_brains_dflash_generate(
                 cnt = Counter(cands)
                 fused_proposal.append(cnt.most_common(1)[0][0])
         if len(fused_proposal) < block_size:
-            fused_proposal += proposals[0][len(fused_proposal):block_size]
+            fused_proposal += proposals[0][len(fused_proposal) : block_size]
 
         # 4) Target verification forward on the K candidate sequences (+ fused)
         #    Single batched call giving us the target's view of every drafted token.
@@ -717,24 +771,38 @@ def million_brains_dflash_generate(
             for i in range(k):
                 if ema_accept[i] < ACCEPTANCE_THRESHOLD:
                     # Draw a replacement from the currently unused personality features.
-                    unused = [r for r in range(NUM_PERSONALITY_FEATURES) if r not in active_feature_indices]
+                    unused = [
+                        r
+                        for r in range(NUM_PERSONALITY_FEATURES)
+                        if r not in active_feature_indices
+                    ]
                     if unused:
                         new_feat = unused[(sb * 31 + i) % len(unused)]
                         old_name = PERSONALITY_FEATURES[active_feature_indices[i]]
                         active_feature_indices[i] = new_feat
                         feature_reallocations += 1
                         ema_accept[i] = 0.55
-                        print(f"  [REALLOC] Slot {i} feature {old_name} -> {PERSONALITY_FEATURES[new_feat]} (EMA accept {ema_accept[i]:.3f})")
+                        print(
+                            f"  [REALLOC] Slot {i} feature {old_name} -> {PERSONALITY_FEATURES[new_feat]} (EMA accept {ema_accept[i]:.3f})"
+                        )
 
         # 8) Full rejection handling (equivalent to "Reframe")
         if accepted_len == 0 and enable_reallocation:
             reframe_events += 1
-            print(f"  [DIVERGENCE] Super-block {sb} produced zero accepted tokens. Boosting proposal diversity for next block.")
+            print(
+                f"  [DIVERGENCE] Super-block {sb} produced zero accepted tokens. Boosting proposal diversity for next block."
+            )
 
         # 9) Diagnostic logging (feature-slot view)
-        gmask = GroupThinkMask(k=k, block_size=block_size, phase="integration" if accepted_len > 0 else "draft")
+        gmask = GroupThinkMask(
+            k=k,
+            block_size=block_size,
+            phase="integration" if accepted_len > 0 else "draft",
+        )
         if sb < 2 or accepted_len == 0:
-            print(f"    Super-block {sb:02d} | features={active_feature_names} | accepted={accepted_len}/{block_size} | mask={gmask.describe()}")
+            print(
+                f"    Super-block {sb:02d} | features={active_feature_names} | accepted={accepted_len}/{block_size} | mask={gmask.describe()}"
+            )
 
         if len(generated_ids) >= max_new_tokens:
             break
@@ -797,7 +865,9 @@ def classic_dflash_generate(
         draft_lps = []
         if out.outputs[0].logprobs:
             for tid in draft_ids:
-                draft_lps.append(extract_logprob_for_token(out.outputs[0].logprobs, tid))
+                draft_lps.append(
+                    extract_logprob_for_token(out.outputs[0].logprobs, tid)
+                )
         else:
             draft_lps = [-0.75] * len(draft_ids)
 
@@ -813,7 +883,9 @@ def classic_dflash_generate(
 
         if acc:
             generated_ids.extend(acc)
-            current_text = current_text + tokenizer.decode(acc, skip_special_tokens=True)
+            current_text = current_text + tokenizer.decode(
+                acc, skip_special_tokens=True
+            )
             total_accepted += len(acc)
 
         if len(generated_ids) >= max_new_tokens:
@@ -846,12 +918,15 @@ class MillionBrainsDFlashDraftModel:
     PermutationFeatureSlotAllocator hook on every super-block boundary.
     The high-level implementation lives in million_brains_dflash_generate().
     """
+
     def __init__(self, *args, **kwargs):
         self.k = K
         self.block_size = BLOCK_SIZE
         self.enable_reallocation = ENABLE_FEATURE_REALLOCATION
         self.feature_allocator = None  # filled by _live_edit_dflash
-        print("[MillionBrainsDFlashDraftModel] Stand-in initialized (full feature-slot allocator injected at runtime)")
+        print(
+            "[MillionBrainsDFlashDraftModel] Stand-in initialized (full feature-slot allocator injected at runtime)"
+        )
 
     def propose_with_allocator(self, pooled_state, step):
         if self.feature_allocator is not None:
@@ -867,7 +942,7 @@ class MillionBrainsDFlashDraftModel:
 #      overwrite key classes / methods with one-million-brains-dflash versions (file fallback).
 #   2. Always perform runtime monkey-patching via subclass + module replacement.
 #   3. Inject a global "MILLION_BRAINS_DFLASH" symbol so user code can detect the patch.
-#   4. Emit the exact "ONE-MILLION-BRAINS-DFLASH INITIALIZED" banner on success.
+#   4. Emit the exact "ONE-MILLION-BRAINS-FLASH INITIALIZED" banner on success.
 # =============================================================================
 def _live_edit_dflash() -> bool:
     """
@@ -875,11 +950,14 @@ def _live_edit_dflash() -> bool:
     Performs the one-million-brains-dflash injection into vLLM's draft mechanisms.
     """
     patched = False
-    print("\n[PREEMPTIVE DFLASH LIVE-EDIT] Scanning for DFlashDraftModel / vLLM draft components (one-million-brains-dflash injection)...")
+    print(
+        "\n[PREEMPTIVE DFLASH LIVE-EDIT] Scanning for DFlashDraftModel / vLLM draft components (one-million-brains-dflash injection)..."
+    )
 
     # --- Step 1: File-level overwrite (fallback when source is writable) ---
     try:
         import vllm
+
         vllm_dir = os.path.dirname(vllm.__file__)
         candidate_files = []
         for root, _, files in os.walk(vllm_dir):
@@ -914,7 +992,7 @@ def _live_edit_dflash() -> bool:
             # "MillionBrainsDFlashDraftModel" subclass at the bottom, then try to swap at runtime.
             injection = f"""
 # =============================================================================
-# MILLION-BRAINS-DFLASH INJECTION (auto-inserted by million_brains_dflash.py at {time.strftime('%Y-%m-%d %H:%M:%S')})
+# MILLION-BRAINS-DFLASH INJECTION (auto-inserted by million_brains_dflash.py at {time.strftime("%Y-%m-%d %H:%M:%S")})
 # This file was live-edited to support the full PermutationFeatureSlotAllocator,
 # 12 personality features, cross-stream integration, and adaptive feature reallocation.
 # (Fast Million Brains approach)
@@ -964,10 +1042,14 @@ class MillionBrainsDFlashDraftModel:  # type: ignore
                 try:
                     with open(target_file, "a", encoding="utf-8") as fh:
                         fh.write("\n" + injection)
-                    print(f"    [FILE PATCH] Appended one-million-brains-dflash injection to {target_file}")
+                    print(
+                        f"    [FILE PATCH] Appended one-million-brains-dflash injection to {target_file}"
+                    )
                     patched = True
                 except Exception as e:
-                    print(f"    [FILE PATCH] Could not append (likely read-only FS): {e}")
+                    print(
+                        f"    [FILE PATCH] Could not append (likely read-only FS): {e}"
+                    )
             else:
                 patched = True
     except Exception as e:
@@ -980,14 +1062,19 @@ class MillionBrainsDFlashDraftModel:  # type: ignore
         vllm_draft_module.MILLION_BRAINS_PERSONALITY_FEATURES = PERSONALITY_FEATURES
         vllm_draft_module.MILLION_BRAINS_K = K
         vllm_draft_module.MILLION_BRAINS_BLOCK_SIZE = BLOCK_SIZE
-        vllm_draft_module.PermutationFeatureSlotAllocator = PermutationFeatureSlotAllocator
-        vllm_draft_module.million_brains_dflash_generate = million_brains_dflash_generate
+        vllm_draft_module.PermutationFeatureSlotAllocator = (
+            PermutationFeatureSlotAllocator
+        )
+        vllm_draft_module.million_brains_dflash_generate = (
+            million_brains_dflash_generate
+        )
         vllm_draft_module.classic_dflash_generate = classic_dflash_generate
 
         # Subclass replacement (what user code importing DraftModel will see)
         try:
             OriginalDraft = getattr(vllm_draft_module, "DraftModel", None)
             if OriginalDraft is not None:
+
                 class PatchedDraftModel(OriginalDraft):  # type: ignore
                     def __init__(self, *a, **kw):
                         super().__init__(*a, **kw)
@@ -996,13 +1083,17 @@ class MillionBrainsDFlashDraftModel:  # type: ignore
                         )
                         self.k = K
                         self.block_size = BLOCK_SIZE
-                        print("[PatchedDraftModel] Runtime subclass active - one-million-brains-dflash ready")
+                        print(
+                            "[PatchedDraftModel] Runtime subclass active - one-million-brains-dflash ready"
+                        )
 
                 vllm_draft_module.DraftModel = PatchedDraftModel
                 sys.modules.setdefault("dflash", type(sys)("dflash"))
                 sys.modules["dflash"].DraftModel = PatchedDraftModel
                 sys.modules["dflash"].MILLION_BRAINS_DFLASH_PATCHED = True
-                print("    [RUNTIME PATCH] vllm.spec_decode.draft_model.DraftModel replaced with one-million-brains-dflash feature-slot aware subclass")
+                print(
+                    "    [RUNTIME PATCH] vllm.spec_decode.draft_model.DraftModel replaced with one-million-brains-dflash feature-slot aware subclass"
+                )
             else:
                 # No original DraftModel - still expose our allocator
                 sys.modules.setdefault("dflash", type(sys)("dflash"))
@@ -1012,7 +1103,9 @@ class MillionBrainsDFlashDraftModel:  # type: ignore
                 )
                 sys.modules["dflash"].DraftModel = type(ndm)
                 sys.modules["dflash"].MillionBrainsDFlashDraftModel = type(ndm)
-                print("    [RUNTIME PATCH] No original DraftModel found - pure MillionBrainsDFlashDraftModel exposed under 'dflash'")
+                print(
+                    "    [RUNTIME PATCH] No original DraftModel found - pure MillionBrainsDFlashDraftModel exposed under 'dflash'"
+                )
             patched = True
         except Exception as sub_e:
             print(f"    [RUNTIME SUBCLASS] {sub_e}")
@@ -1033,22 +1126,31 @@ _LIVE_PATCH_SUCCESS = _live_edit_dflash()
 def print_one_million_brains_banner(success: bool = True):
     banner = r"""
 ================================================================================
-  ███████╗███╗   ███╗██████╗       ██████╗ ███████╗██╗      █████╗ ███████╗██╗  ██╗
-  ██╔════╝████╗ ████║██╔══██╗     ██╔═══██╗██╔════╝██║     ██╔══██╗██╔════╝██║  ██║
-  █████╗  ██╔████╔██║██████╔╝     ██║   ██║█████╗  ██║     ███████║███████╗███████║
-  ██╔══╝  ██║╚██╔╝██║██╔══██╗     ██║   ██║██╔══╝  ██║     ██╔══██║╚════██║██╔══██║
-  ██║     ██║ ╚═╝ ██║██████╔╝     ╚██████╔╝██║     ███████╗██║  ██║███████║██║  ██║
-  ╚═╝     ╚═╝     ╚═╝╚═════╝       ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝
+  ███████╗███╗   ███╗██████╗     ███████╗██╗      █████╗ ███████╗██╗  ██╗
+  ██╔════╝████╗ ████║██╔══██╗    ██╔════╝██║     ██╔══██╗██╔════╝██║  ██║
+  █████╗  ██╔████╔██║██████╔╝    █████╗  ██║     ███████║███████╗███████║
+  ██╔══╝  ██║╚██╔╝██║██╔══██╗    ██╔══╝  ██║     ██╔══██║╚════██║██╔══██║
+  ██║     ██║ ╚═╝ ██║██████╔╝    ██║     ███████╗██║  ██║███████║██║  ██║
+  ╚═╝     ╚═╝     ╚═╝╚═════╝     ╚═╝     ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝
 ================================================================================
 """
     print(banner)
     if success:
-        print(" ONE-MILLION-BRAINS-DFLASH INITIALIZED  |  K=%d  |  FEATURES=%d  |  REALLOCATION=%s" % (
-            K, NUM_PERSONALITY_FEATURES, str(ENABLE_FEATURE_REALLOCATION).upper()))
-        print(" Patch status: %s" % ("SUCCESS (file+runtime)" if _LIVE_PATCH_SUCCESS else "RUNTIME ONLY"))
+        print(
+            " ONE-MILLION-BRAINS-FLASH INITIALIZED  |  K=%d  |  FEATURES=%d  |  REALLOCATION=%s"
+            % (K, NUM_PERSONALITY_FEATURES, str(ENABLE_FEATURE_REALLOCATION).upper())
+        )
+        print(
+            " Patch status: %s"
+            % ("SUCCESS (file+runtime)" if _LIVE_PATCH_SUCCESS else "RUNTIME ONLY")
+        )
     else:
-        print(" ONE-MILLION-BRAINS-DFLASH INITIALIZED (DEGRADED - patch encountered errors, pure-Python fallback active)")
-    print("================================================================================\n")
+        print(
+            " ONE-MILLION-BRAINS-FLASH INITIALIZED (DEGRADED - patch encountered errors, pure-Python fallback active)"
+        )
+    print(
+        "================================================================================\n"
+    )
 
 
 print_one_million_brains_banner(_LIVE_PATCH_SUCCESS)
@@ -1068,11 +1170,11 @@ def pick_model_name() -> Tuple[str, str]:
     gpu_mem_gb = 0.0
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(0)
-        gpu_mem_gb = props.total_memory / (1024 ** 3)
+        gpu_mem_gb = props.total_memory / (1024**3)
         print(f"[GPU] Detected {props.name} with {gpu_mem_gb:.1f} GB VRAM")
 
     candidates = [
-        "z-lab/Qwen3.5-4B-DFlash",           # the requested fictional/special model
+        "z-lab/Qwen3.5-4B-DFlash",  # the requested fictional/special model
         "Qwen/Qwen2.5-3B-Instruct",
         "Qwen/Qwen2.5-1.5B-Instruct",
     ]
@@ -1089,7 +1191,9 @@ def pick_model_name() -> Tuple[str, str]:
             print(f"[MODEL] Tokenizer OK for {name}")
             return name, "vllm"
         except Exception as e:
-            print(f"    ... {name} not available or tokenizer failed ({type(e).__name__}). Trying next...")
+            print(
+                f"    ... {name} not available or tokenizer failed ({type(e).__name__}). Trying next..."
+            )
     # Absolute last resort (should never happen)
     return "Qwen/Qwen2.5-1.5B-Instruct", "vllm"
 
@@ -1100,7 +1204,9 @@ def load_models(model_name: str):
     Also load a lightweight HF tokenizer copy for decode/encode consistency.
     We keep everything in FP16/BF16; no quantization to stay mainstream & simple.
     """
-    print(f"\n[LOAD] Initializing vLLM engine for {model_name} (this can take 30-120s on first download)...")
+    print(
+        f"\n[LOAD] Initializing vLLM engine for {model_name} (this can take 30-120s on first download)..."
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -1112,7 +1218,7 @@ def load_models(model_name: str):
         dtype="auto",
         max_model_len=4096,
         gpu_memory_utilization=0.88,
-        enforce_eager=False,   # graph capture for speed where possible
+        enforce_eager=False,  # graph capture for speed where possible
     )
     print("[LOAD] vLLM engine ready.")
 
@@ -1120,15 +1226,19 @@ def load_models(model_name: str):
     hf_model = None
     try:
         # Only load if we have headroom; otherwise we synthesize pooled states.
-        if torch.cuda.get_device_properties(0).total_memory > 14 * (1024 ** 3):
+        if torch.cuda.get_device_properties(0).total_memory > 14 * (1024**3):
             hf_model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                torch_dtype=torch.bfloat16
+                if torch.cuda.is_bf16_supported()
+                else torch.float16,
                 device_map="auto",
                 trust_remote_code=True,
                 low_cpu_mem_usage=True,
             ).eval()
-            print("[LOAD] Optional HF reference model also resident for hidden-state introspection.")
+            print(
+                "[LOAD] Optional HF reference model also resident for hidden-state introspection."
+            )
     except Exception:
         pass
 
@@ -1152,25 +1262,38 @@ def benchmark(
     and sample text from both modes.
     """
     print("\n" + "=" * 80)
-    print("BENCHMARK: CLASSIC PARA-DFLASH vs MILLION-BRAINS-DFLASH (K=4, Fast Million Brains)")
+    print(
+        "BENCHMARK: CLASSIC PARA-DFLASH vs MILLION-BRAINS-DFLASH (K=4, Fast Million Brains)"
+    )
     print("=" * 80)
     print(f"Prompt (first 180 chars): {prompt[:180]}...")
-    print(f"Target generation length: {max_new} tokens | Block size: {BLOCK_SIZE} | K: {K}")
+    print(
+        f"Target generation length: {max_new} tokens | Block size: {BLOCK_SIZE} | K: {K}"
+    )
     print("-" * 80)
 
     # --- CLASSIC ---
     print("\n[CLASSIC] Running single-path Para-DFlash baseline ...")
     t0 = time.perf_counter()
     classic_res = classic_dflash_generate(
-        vllm_llm, tokenizer, prompt, max_new_tokens=max_new, block_size=max(6, BLOCK_SIZE), seed=SEED
+        vllm_llm,
+        tokenizer,
+        prompt,
+        max_new_tokens=max_new,
+        block_size=max(6, BLOCK_SIZE),
+        seed=SEED,
     )
     t_classic = time.perf_counter() - t0
     classic_tps = classic_res["num_tokens"] / max(1e-6, t_classic)
 
     # --- MILLION-BRAINS ---
-    print("\n[MILLION-BRAINS] Running full one-million-brains-dflash (permutation feature-slot allocator + cross-stream integration + adaptive reallocation) ...")
+    print(
+        "\n[MILLION-BRAINS] Running full one-million-brains-dflash (permutation feature-slot allocator + cross-stream integration + adaptive reallocation) ..."
+    )
     t0 = time.perf_counter()
-    allocator = PermutationFeatureSlotAllocator(internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=K)
+    allocator = PermutationFeatureSlotAllocator(
+        internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=K
+    )
     mbr_res = million_brains_dflash_generate(
         vllm_llm,
         tokenizer,
@@ -1190,25 +1313,45 @@ def benchmark(
     print("RESULTS")
     print("=" * 80)
 
-    print(f"\n{'Metric':<30} {'Classic (K=1)':>18} {'one-million-brains-dflash (K=4)':>22}")
+    print(
+        f"\n{'Metric':<30} {'Classic (K=1)':>18} {'one-million-brains-dflash (K=4)':>22}"
+    )
     print("-" * 72)
-    print(f"{'Generated tokens':<30} {classic_res['num_tokens']:>18} {mbr_res['num_tokens']:>22}")
+    print(
+        f"{'Generated tokens':<30} {classic_res['num_tokens']:>18} {mbr_res['num_tokens']:>22}"
+    )
     print(f"{'Wall time (s)':<30} {t_classic:>18.2f} {t_mbr:>22.2f}")
     print(f"{'Tokens / sec':<30} {classic_tps:>18.2f} {mbr_tps:>22.2f}")
-    print(f"{'Super-blocks executed':<30} {classic_res['num_superblocks']:>18} {mbr_res['num_superblocks']:>22}")
-    print(f"{'Avg accepted tokens / block':<30} {classic_res['avg_accepted_per_block']:>18.2f} {mbr_res['avg_accepted_per_block']:>22.2f}")
-    print(f"{'Feature reallocations':<30} {classic_res.get('feature_reallocations', 0):>18} {mbr_res.get('feature_reallocations', 0):>22}")
-    print(f"{'Divergence events':<30} {classic_res['reframe_events']:>18} {mbr_res['reframe_events']:>22}")
+    print(
+        f"{'Super-blocks executed':<30} {classic_res['num_superblocks']:>18} {mbr_res['num_superblocks']:>22}"
+    )
+    print(
+        f"{'Avg accepted tokens / block':<30} {classic_res['avg_accepted_per_block']:>18.2f} {mbr_res['avg_accepted_per_block']:>22.2f}"
+    )
+    print(
+        f"{'Feature reallocations':<30} {classic_res.get('feature_reallocations', 0):>18} {mbr_res.get('feature_reallocations', 0):>22}"
+    )
+    print(
+        f"{'Divergence events':<30} {classic_res['reframe_events']:>18} {mbr_res['reframe_events']:>22}"
+    )
 
     print("\n--- Sample (Classic) ---")
-    print(classic_res["final_text"][-600:] if len(classic_res["final_text"]) > 600 else classic_res["final_text"])
+    print(
+        classic_res["final_text"][-600:]
+        if len(classic_res["final_text"]) > 600
+        else classic_res["final_text"]
+    )
     print("\n--- Sample (one-million-brains-dflash) ---")
-    print(mbr_res["final_text"][-600:] if len(mbr_res["final_text"]) > 600 else mbr_res["final_text"])
+    print(
+        mbr_res["final_text"][-600:]
+        if len(mbr_res["final_text"]) > 600
+        else mbr_res["final_text"]
+    )
 
     # Rich diagnostic
     print("\n[MILLION-BRAINS] Feature allocation history (last 6 super-blocks):")
     for i, feats in enumerate(mbr_res["feature_history"][-6:]):
-        print(f"    SB {len(mbr_res['feature_history'])-6+i:02d}: {feats}")
+        print(f"    SB {len(mbr_res['feature_history']) - 6 + i:02d}: {feats}")
 
     print("\n[MILLION-BRAINS] Acceptance trajectory (per super-block):")
     print("   ", [round(a, 3) for a in mbr_res["acceptance_history"][-12:]])
@@ -1228,8 +1371,12 @@ def benchmark(
 # MAIN ENTRY POINT (Kaggle script style - just run the file)
 # =============================================================================
 if __name__ == "__main__":
-    print("\n[million_brains_dflash.py] Starting full one-million-brains-dflash (Fast Million Brains) Kaggle run")
-    print(f"    K={K}, BLOCK_SIZE={BLOCK_SIZE}, ENABLE_FEATURE_REALLOCATION={ENABLE_FEATURE_REALLOCATION}")
+    print(
+        "\n[million_brains_dflash.py] Starting full one-million-brains-dflash (Fast Million Brains) Kaggle run"
+    )
+    print(
+        f"    K={K}, BLOCK_SIZE={BLOCK_SIZE}, ENABLE_FEATURE_REALLOCATION={ENABLE_FEATURE_REALLOCATION}"
+    )
     print(f"    SEED={SEED}, TARGET_MAX_TOKENS={TARGET_MAX_TOKENS}")
 
     # 1) Live-edit banner was already printed right after the patcher ran.
@@ -1242,29 +1389,43 @@ if __name__ == "__main__":
     print_one_million_brains_banner(_LIVE_PATCH_SUCCESS)
 
     # 4) Run the benchmark (the thing the user actually cares about)
-    results = benchmark(vllm_llm, tokenizer, BENCHMARK_PROMPT, max_new=TARGET_MAX_TOKENS)
+    results = benchmark(
+        vllm_llm, tokenizer, BENCHMARK_PROMPT, max_new=TARGET_MAX_TOKENS
+    )
 
     # 5) Final summary line (useful when scanning Kaggle logs)
-    print("[FINAL] Classic TPS: %.2f | MILLION-BRAINS TPS: %.2f | reallocs: %d | Avg accept: %.2f" % (
-        results["classic"]["tps"],
-        results["mbr"]["tps"],
-        results["mbr"].get("feature_reallocations", 0),
-        results["mbr"]["avg_accepted_per_block"],
-    ))
+    print(
+        "[FINAL] Classic TPS: %.2f | MILLION-BRAINS TPS: %.2f | reallocs: %d | Avg accept: %.2f"
+        % (
+            results["classic"]["tps"],
+            results["mbr"]["tps"],
+            results["mbr"].get("feature_reallocations", 0),
+            results["mbr"]["avg_accepted_per_block"],
+        )
+    )
 
     # Optional: write a small artifact so the Kaggle "Output" pane has something
     try:
         with open("/kaggle/working/million_brains_dflash_results.json", "w") as f:
-            json.dump({
-                "classic": {k: v for k, v in results["classic"].items() if k != "final_text"},
-                "mbr": {k: v for k, v in results["mbr"].items() if k != "final_text"},
-                "model": model_name,
-                "k": K,
-                "block_size": BLOCK_SIZE,
-            }, f, indent=2)
+            json.dump(
+                {
+                    "classic": {
+                        k: v for k, v in results["classic"].items() if k != "final_text"
+                    },
+                    "mbr": {
+                        k: v for k, v in results["mbr"].items() if k != "final_text"
+                    },
+                    "model": model_name,
+                    "k": K,
+                    "block_size": BLOCK_SIZE,
+                },
+                f,
+                indent=2,
+            )
         print("[ARTIFACT] Wrote /kaggle/working/million_brains_dflash_results.json")
     except Exception:
         pass
 
-    print("\n[million_brains_dflash.py] All done. You can now inspect the generated samples and the metrics above.")
-
+    print(
+        "\n[million_brains_dflash.py] All done. You can now inspect the generated samples and the metrics above."
+    )
