@@ -6,9 +6,9 @@
 
 **Permutation-Gated Feature-Slot Speculative Decoding** — the Fast Million Brains approach.
 
-I'm very much of the idea that intelligence means: reasembling perspectives; sometimes models get stuck at spurious minima. This repo combines two meaningful work streams of mine: iblameandrew/patterns and iblameandrew/open-deepthink . Esentially here i wire together super-diffusion blocks in a speculative decoder using grammars of function-calls. All done in real time, without prompting. Last ARC-AGI-2  edition i got stuck with my QNN algorithm because it relied on a multi agent system that took 30 min per problem. Now its live-wired.
+I'm very much of the idea that intelligence means: reasembling perspectives; sometimes models get stuck at spurious minima. This repo combines two meaningful work streams of mine: iblameandrew/patterns and iblameandrew/open-deepthink . Esentially here i wire together super-diffusion blocks in a speculative decoder using grammars of function-calls. All done in real time, without prompting. Last ARC-AGI-2  edition i got stuck with my QNN algorithm because it relied on a multi agent system that took 30 min per problem.
 
-A complete, self-contained, runnable Kaggle script (`million_brains_dflash.py`) that implements an advanced, diversity-driven speculative decoding architecture on top of vLLM.
+A complete, self-contained, runnable Kaggle script (`million_brains_dflash.py`) that implements an advanced, live-wired QNN speculative decoding architecture on top of vLLM.
 
 ## What it is
 
