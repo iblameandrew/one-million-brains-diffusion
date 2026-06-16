@@ -2,8 +2,9 @@
 
 <img width="1920" height="2400" alt="image" src="https://github.com/user-attachments/assets/3d47988b-261a-479e-bb1f-f074dfadefc2" />
 
-
 **Permutation-Gated Feature-Slot Speculative Decoding** — the Fast Million Brains approach.
+
+I'm very much of the idea that intelligence means: reasembling perspectives; sometimes models get stuck at spurious minima. This repo combines two meaningful work streams of mine: iblameandrew/patterns and iblameandrew/open-deepthink . Esentially we wire together super-diffusion blocks in a speculative decoder into grammars of function-calls. All done in real time, without prompting.
 
 A complete, self-contained, runnable Kaggle script (`million_brains_dflash.py`) that implements an advanced, diversity-driven speculative decoding architecture on top of vLLM.
 
