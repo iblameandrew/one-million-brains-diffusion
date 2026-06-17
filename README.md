@@ -13,12 +13,11 @@ This repo wires a deterministic circuit grammar (12 spatial primitives, K parall
 - **Engine:** DiffusionGemma (vLLM `diffusion_config` + entropy-bound denoising)
 - **Controller:** `PermutationFeatureSlotAllocator` + CTSB circuit smoothing + adaptive reallocation
 - **Per step:** K conditioned trajectories → cross-stream fusion → cumprod verification → commit into canvas
-- **ARC eval:** spatial grid ensemble (Phase-1 hypotheses + pixel majority vote) with optional multi-agent voter pool
+- **ARC eval:** spatial grid ensemble (Phase-1 hypotheses + pixel majority vote) on a single DiffusionGemma engine
 
 ## Key files
 
 - `million_brains_dflash.py` — full Kaggle script (installs vLLM, loads DiffusionGemma, runs benchmark + ARC eval)
-- `mbr_voter_worker.py` — thin voter-pool worker entry
 
 ## Quick start (Kaggle)
 

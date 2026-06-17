@@ -16,17 +16,14 @@ SOURCE = SCRIPT.read_text(encoding="utf-8")
 
 
 class TestSourceStructure(unittest.TestCase):
-    def test_version_is_17r(self):
-        self.assertIn('SCRIPT_VERSION = "2026-06-17r"', SOURCE)
+    def test_version_is_diffusion_d(self):
+        self.assertIn('SCRIPT_VERSION = "2026-06-19-diffusion-d"', SOURCE)
 
-    def test_voter_pool_required_by_default(self):
-        self.assertIn("ARC_MULTI_AGENT_REQUIRED = True", SOURCE)
-        self.assertIn("def _materialize_worker_script_path()", SOURCE)
-        self.assertIn("def _resolve_voter_pool_gen_path()", SOURCE)
-        self.assertNotIn(
-            "voter pool spawn failed — using single engine",
-            SOURCE,
-        )
+    def test_single_engine_arc_no_voter_pool(self):
+        self.assertNotIn("ARC_MULTI_AGENT_REQUIRED", SOURCE)
+        self.assertNotIn("MultiAgentEnginePool", SOURCE)
+        self.assertNotIn("def _resolve_voter_pool_gen_path()", SOURCE)
+        self.assertNotIn("MBR_AGENT_WORKER", SOURCE)
 
     def test_hypothesis_thinking_disabled(self):
         self.assertIn("ARC_HYPOTHESIS_ENABLE_THINKING = False", SOURCE)
