@@ -180,10 +180,15 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-17r"  # bump when re-uploading to Kaggle to confirm latest script
+SCRIPT_VERSION = "2026-06-18a"  # recovery plan: stock vLLM + spatial grid ensemble
 K = 4  # benchmark / token-speculative super-block width (not ARC hypothesis count)
 ARC_HYPOTHESIS_SLOTS = 8  # ARC eval: batched hypothesis proposals per engine (vLLM shows N/N)
-NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
+NUM_PERSONALITY_FEATURES = 12  # spatial primitive bank size (legacy name for allocator)
+# --- Recovery plan toggles (leaderboard path) ---
+ENABLE_DFLASH_LIVE_PATCH = False  # Step 1: stock vLLM only — no DFlash monkey-patches
+ARC_FORCE_ENABLE_THINKING = False  # Step 2: never emit Qwen3.5 </think> chains in ARC
+ARC_GUIDED_JSON_DECODING = True  # Step 3: vLLM guided JSON for grid outputs
+ARC_SPATIAL_GRID_ENSEMBLE = True  # Step 4: Phase1=8 grid hypotheses, Phase2=pixel majority vote
 BLOCK_SIZE = 6  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
 MAX_SUPERBLOCKS = 32  # safety cap on super-blocks
 ENABLE_FEATURE_REALLOCATION = True  # master switch for adaptive reallocation of features into slots based on acceptance
@@ -269,12 +274,12 @@ ARC_PRINT_ALL_ANSWERS = True  # print every prediction vs ground-truth JSON for 
 # Real-time streaming — prints every token and all model/MBR activity as it happens
 STREAM_GENERATION = True  # stream decoded tokens to stdout live (flush per token)
 STREAM_ALL_OUTPUT = True  # print all MBR drafts, commits, realloc, verify steps
-STREAM_PRINT_THINKING = True  # Qwen3.5: enable + stream <think>...</think> reasoning
+STREAM_PRINT_THINKING = False  # Step 2: ARC uses enable_thinking=False (no internal monologue)
 STREAM_VERIFY_PASSES = False  # verify=logprob-only; never stream those tokens
 HF_FAST_VERIFY = True  # tail-only logprobs on draft suffix (not full 4k prompt)
 ARC_EVAL_VERBOSE = True  # MBR super-block internals (auto-on when STREAM_ALL_OUTPUT)
 ARC_USE_CHAT_TEMPLATE = True  # Qwen3.5 expects chat_template.jinja wrapping
-ARC_DISABLE_THINKING = not STREAM_PRINT_THINKING  # False = model may emit <think> blocks
+ARC_DISABLE_THINKING = True  # Step 2: hard-off thinking for ARC (overrides STREAM_PRINT_THINKING)
 ARC_STRUCTURED_THINKING = True  # require incremental HYPOTHESIS_GRID inside <think>
 ARC_PRINT_STEP_MATRICES = False  # debug: ASCII grids at every MBR draft slot + commit
 ARC_PRINT_FINAL_MATRICES = True  # one final ASCII summary per test (gold + preds + verdict + timing)
@@ -287,7 +292,7 @@ ARC_TRY_VLLM = True  # ARC eval requires vLLM for speed; HF fallback if load fai
 # KV cache grows with max_model_len — 4k was only to fit L4 OOM; ARC 30x30 tasks need ~8k+.
 VLLM_MAX_MODEL_LEN = 0  # 0 = auto (ARC prompt + output budget); set e.g. 16384 if VRAM allows
 ARC_MAX_PROMPT_TOKENS = 6144  # tighter input budget; resolver shrinks further; lowers KV bandwidth on decode
-ARC_SLOT_HYPOTHESIS_MODE = True  # MBR: slots propose transformation text; one final pass emits grid
+ARC_SLOT_HYPOTHESIS_MODE = True  # ARC eval uses slot pipeline (spatial grids when ARC_SPATIAL_GRID_ENSEMBLE)
 ARC_MBR_OUTPUT_TOKEN_BUDGET = 14000  # total OUTPUT tokens per test (hyp slots + final grid combined)
 ARC_FINAL_GRID_MIN_TOKENS = 512  # floor for final JSON grid pass
 ARC_FINAL_GRID_MAX_FRACTION = 0.85  # final may use up to 85% of output budget for large grids
@@ -407,102 +412,51 @@ vllm_draft_module = _resolve_vllm_draft_module()  # for live patching target
 
 # =============================================================================
 # FIXED BANK OF 12 PERSONALITY FEATURES
-# Each feature is a distinct direction that can be injected into a feature-slot.
-# The PermutationFeatureSlotAllocator selects K distinct features via a deterministic
-# permutation and assigns them to the K parallel streams for the current super-block.
+# Step 4: 12 spatial transformation primitives (replaces personality personas for ARC).
+# Allocator still permutes K primitives into parallel slots for the demo/benchmark path.
 # =============================================================================
-PERSONALITY_FEATURES: List[str] = [
-    "PreciseAnchor",  # low temperature, anchors strongly to given facts and constraints
-    "CreativeExplorer",  # higher temperature / broad top_p, favors novelty and less-trodden paths
-    "LogicalReasoner",  # medium temperature with bias toward explicit step-by-step chains
-    "SelfCritic",  # tends to surface contradictions and reduce over-commitment
-    "Reframer",  # biases toward re-interpreting the problem statement or constraints
-    "Synthesizer",  # prefers combinations; receives priority during cross-stream fusion
-    "DevilAdvocate",  # stress-tests the currently favored line of reasoning
-    "PatternMatcher",  # strongly attends to numerical, structural, and repetition patterns
-    "EdgeCaseHunter",  # deliberately explores boundary conditions and low-probability inputs
-    "ContextGrounding",  # pulls in broader real-world constraints and background knowledge
-    "Abstractor",  # lifts specifics into higher-level rules or invariants
-    "MirrorReflector",  # meta-feature that conditions on the behavior of the other active features
+SPATIAL_PRIMITIVES: List[str] = [
+    "Rotate90",
+    "Rotate180",
+    "ReflectH",
+    "ReflectV",
+    "Transpose",
+    "CropBBox",
+    "TileRepeat",
+    "ColorMap",
+    "SymmetryComplete",
+    "FloodFill",
+    "ComponentExtract",
+    "GravityShift",
 ]
 
-# Feature-specific generation hyper-parameters used during the proposal phase for the
-# stream that has been allocated that personality feature. This is the high-level
-# equivalent of "feature-specific temperature/top_p + post-attention gating".
+# Legacy alias — PermutationFeatureSlotAllocator and benchmark code use this name.
+PERSONALITY_FEATURES: List[str] = SPATIAL_PRIMITIVES
+
+# Greedy grid decoding for spatial ensemble; benchmark may still vary temperature.
 FEATURE_PARAMS: Dict[str, Dict[str, float]] = {
-    "PreciseAnchor": {"temperature": 0.35, "top_p": 0.82, "repetition_penalty": 1.08},
-    "CreativeExplorer": {
-        "temperature": 1.15,
-        "top_p": 0.98,
-        "repetition_penalty": 1.00,
-    },
-    "LogicalReasoner": {"temperature": 0.55, "top_p": 0.90, "repetition_penalty": 1.05},
-    "SelfCritic": {"temperature": 0.65, "top_p": 0.88, "repetition_penalty": 1.12},
-    "Reframer": {"temperature": 0.90, "top_p": 0.95, "repetition_penalty": 1.02},
-    "Synthesizer": {"temperature": 0.60, "top_p": 0.93, "repetition_penalty": 1.03},
-    "DevilAdvocate": {"temperature": 0.80, "top_p": 0.91, "repetition_penalty": 1.06},
-    "PatternMatcher": {"temperature": 0.45, "top_p": 0.85, "repetition_penalty": 1.04},
-    "EdgeCaseHunter": {"temperature": 0.75, "top_p": 0.94, "repetition_penalty": 1.07},
-    "ContextGrounding": {
-        "temperature": 0.50,
-        "top_p": 0.89,
-        "repetition_penalty": 1.01,
-    },
-    "Abstractor": {"temperature": 0.70, "top_p": 0.96, "repetition_penalty": 1.05},
-    "MirrorReflector": {"temperature": 0.85, "top_p": 0.87, "repetition_penalty": 1.09},
+    name: {"temperature": 0.0, "top_p": 1.0, "repetition_penalty": 1.02}
+    for name in SPATIAL_PRIMITIVES
 }
 
-# Per-slot lens for hypothesis phase (textual rules only — never emit a grid here).
-SLOT_HYPOTHESIS_LENSES: Dict[str, str] = {
-    "PreciseAnchor": (
-        "Describe the exact transformation: input/output shapes, which colors/regions map "
-        "where, and positional rules. Be concrete but do not print any grid array."
-    ),
-    "CreativeExplorer": (
-        "Propose 2-3 non-obvious pattern hypotheses that could explain all train pairs. "
-        "Favor structural surprises; no grid digits."
-    ),
-    "LogicalReasoner": (
-        "Give a numbered algorithm (step 1, step 2, ...) that transforms input to output. "
-        "Pseudocode style; no JSON grid."
-    ),
-    "SelfCritic": (
-        "List constraints the rule must satisfy across all train pairs; note ambiguities "
-        "and what would falsify each candidate rule. No grid."
-    ),
-    "Reframer": (
-        "Reframe the puzzle: what is the latent object being extracted, compressed, or tiled? "
-        "Describe the rule in plain language without arrays."
-    ),
-    "Synthesizer": (
-        "Synthesize a single unified rule that fits every train pair; reconcile shape changes. "
-        "Text only."
-    ),
-    "DevilAdvocate": (
-        "Attack the obvious rule families; explain which simple hypotheses fail on which train "
-        "pair and why. No grid."
-    ),
-    "PatternMatcher": (
-        "Focus on repetition, symmetry, component counts, color frequencies, and bounding "
-        "boxes. State the pattern rule textually."
-    ),
-    "EdgeCaseHunter": (
-        "Identify boundary cells, rare colors, and exceptions across train pairs; how should "
-        "the test case differ? Text only."
-    ),
-    "ContextGrounding": (
-        "Describe the transformation as operations (crop, mirror, fill, overlay, count, "
-        "filter-by-color) applied in order."
-    ),
-    "Abstractor": (
-        "Lift the puzzle to an invariant (e.g. 'each output row encodes one connected "
-        "component'). State the abstract rule without digit matrices."
-    ),
-    "MirrorReflector": (
-        "Meta-view: how would other analysts disagree? Merge the strongest shared insight "
-        "into one transformation story. No grid."
-    ),
+# Per-slot spatial lens: Phase 1 emits a JSON grid hypothesis (not prose).
+SPATIAL_PRIMITIVE_LENSES: Dict[str, str] = {
+    "Rotate90": "Apply a 90-degree clockwise rotation rule inferred from train pairs.",
+    "Rotate180": "Apply a 180-degree rotation rule inferred from train pairs.",
+    "ReflectH": "Apply horizontal reflection (mirror left-right) across train examples.",
+    "ReflectV": "Apply vertical reflection (mirror top-bottom) across train examples.",
+    "Transpose": "Apply matrix transpose / axis-swap patterns seen in train outputs.",
+    "CropBBox": "Crop to the minimal bounding box of non-background objects, then resize.",
+    "TileRepeat": "Detect tiling/repetition: repeat or scale a motif to output size.",
+    "ColorMap": "Infer a deterministic color permutation (0-9) mapping input cells to output.",
+    "SymmetryComplete": "Complete partial symmetries (mirror/rotate) to form the output grid.",
+    "FloodFill": "Flood-fill enclosed regions or propagate a dominant color from seeds.",
+    "ComponentExtract": "Extract connected components, relabel, and place into output layout.",
+    "GravityShift": "Shift non-zero cells down/left as if gravity acts on colored pixels.",
 }
+
+# Back-compat alias for text-hypothesis path (unused when ARC_SPATIAL_GRID_ENSEMBLE=True).
+SLOT_HYPOTHESIS_LENSES: Dict[str, str] = SPATIAL_PRIMITIVE_LENSES
 
 assert len(PERSONALITY_FEATURES) == NUM_PERSONALITY_FEATURES, (
     "PERSONALITY_FEATURES list length must equal NUM_PERSONALITY_FEATURES"
@@ -1850,8 +1804,16 @@ class MillionBrainsDFlashDraftModel:  # type: ignore
     return patched
 
 
-# Execute the live edit immediately (this is the moment the "DFlash library" is hijacked with one-million-brains-dflash)
-_LIVE_PATCH_SUCCESS = _live_edit_dflash()
+# Step 1: live-edit is opt-in — stock vLLM by default (avoids seq_len/head tensor mismatches)
+if ENABLE_DFLASH_LIVE_PATCH:
+    _LIVE_PATCH_SUCCESS = _live_edit_dflash()
+else:
+    _LIVE_PATCH_SUCCESS = False
+    print(
+        "[CONFIG] ENABLE_DFLASH_LIVE_PATCH=False — stock vLLM generation "
+        "(no DFlash draft monkey-patches)",
+        flush=True,
+    )
 
 
 # =============================================================================
@@ -1880,10 +1842,13 @@ def print_one_million_brains_banner(success: bool = True):
                 str(ENABLE_FEATURE_REALLOCATION).upper(),
             )
         )
-        print(
-            " Patch status: %s"
-            % ("SUCCESS (file+runtime)" if _LIVE_PATCH_SUCCESS else "RUNTIME ONLY")
-        )
+        if ENABLE_DFLASH_LIVE_PATCH:
+            print(
+                " Patch status: %s"
+                % ("SUCCESS (file+runtime)" if _LIVE_PATCH_SUCCESS else "RUNTIME ONLY")
+            )
+        else:
+            print(" Patch status: DISABLED (stock vLLM — recovery plan Step 1)")
         print(f" Script version: {SCRIPT_VERSION}")
     else:
         print(
@@ -4626,6 +4591,83 @@ def format_arc_prompt(task_id: str, task: Dict[str, Any], test_index: int = 0) -
     return "\n".join(lines)
 
 
+def arc_resolve_enable_thinking() -> Optional[bool]:
+    """Step 2: explicit control of Qwen3.5 thinking via chat_template enable_thinking."""
+    if ARC_DISABLE_THINKING or not ARC_FORCE_ENABLE_THINKING:
+        return False
+    if STREAM_PRINT_THINKING:
+        return True
+    return False
+
+
+def _arc_json_grid_schema() -> Dict[str, Any]:
+    """JSON schema for guided decoding: 2D int grid (0-9), up to 30x30."""
+    return {
+        "type": "array",
+        "items": {
+            "type": "array",
+            "items": {"type": "integer", "minimum": 0, "maximum": 9},
+            "minItems": 1,
+            "maxItems": 30,
+        },
+        "minItems": 1,
+        "maxItems": 30,
+    }
+
+
+def _apply_arc_guided_decoding(sp: Any) -> Any:
+    """Step 3: attach vLLM guided JSON decoding when available (Outlines/xgrammar)."""
+    if not ARC_GUIDED_JSON_DECODING:
+        return sp
+    try:
+        from vllm.sampling_params import GuidedDecodingParams
+
+        schema = _arc_json_grid_schema()
+        guided = None
+        for factory in (
+            lambda: GuidedDecodingParams(json=schema),
+            lambda: GuidedDecodingParams(json_object=schema),
+            lambda: GuidedDecodingParams(json_schema=schema),
+        ):
+            try:
+                guided = factory()
+                break
+            except TypeError:
+                continue
+        if guided is not None:
+            sp.guided_decoding = guided
+            setattr(sp, "arc_guided_json", True)
+    except Exception as exc:
+        if ARC_EVAL_VERBOSE:
+            stream_log(f"[ARC-GUIDED] guided decoding unavailable ({exc}); greedy parse fallback")
+    return sp
+
+
+def _vllm_generate_arc(
+    vllm_llm: Any,
+    prompts: List[str],
+    sp_list: List[Any],
+) -> List[Any]:
+    """Stock vLLM generate with thinking disabled and optional guided JSON."""
+    gen_kwargs: Dict[str, Any] = {}
+    if arc_resolve_enable_thinking() is False:
+        gen_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+    try:
+        return vllm_llm.generate(
+            prompts, sp_list, use_tqdm=False, **gen_kwargs
+        )
+    except TypeError:
+        try:
+            return vllm_llm.generate(
+                prompts,
+                sp_list,
+                use_tqdm=False,
+                tokenization_kwargs=gen_kwargs.get("chat_template_kwargs"),
+            )
+        except TypeError:
+            return vllm_llm.generate(prompts, sp_list, use_tqdm=False)
+
+
 def apply_arc_chat_prompt_custom(
     tokenizer: Any,
     user_content: str,
@@ -4692,12 +4734,8 @@ def apply_arc_chat_prompt(tokenizer: Any, user_content: str) -> str:
             "You solve ARC-AGI grid puzzles. Reply with exactly one JSON 2D array "
             "of integers (values 0-9). No markdown, no explanation."
         )
-    enable_thinking: Optional[bool] = None
-    if ARC_DISABLE_THINKING:
-        enable_thinking = False
-    elif STREAM_PRINT_THINKING:
-        enable_thinking = True
-    prefill = ARC_ASSISTANT_PREFILL if not STREAM_PRINT_THINKING else ""
+    enable_thinking: Optional[bool] = arc_resolve_enable_thinking()
+    prefill = ARC_ASSISTANT_PREFILL if enable_thinking is not True else ""
     return apply_arc_chat_prompt_custom(
         tokenizer,
         user_content,
@@ -5109,6 +5147,45 @@ def _extract_transformation_hypothesis(text: str) -> str:
     return _strip_model_artifacts(text).strip()
 
 
+def build_spatial_grid_user_content(
+    task_id: str,
+    task: Dict[str, Any],
+    test_index: int,
+    primitive_name: str,
+    *,
+    task_body: Optional[str] = None,
+    compact: bool = False,
+) -> str:
+    """User message for one spatial primitive slot: emit a JSON grid hypothesis."""
+    lens = SPATIAL_PRIMITIVE_LENSES.get(
+        primitive_name,
+        "Infer the spatial transformation from train pairs and apply it to the test input.",
+    )
+    body = task_body or format_arc_task_body(task_id, task, test_index=test_index)
+    if compact:
+        return "\n".join(
+            [
+                body,
+                f"Primitive:{primitive_name}",
+                f"Lens:{lens}",
+                "Output one JSON 2D int array (0-9) for the test output grid.",
+            ]
+        )
+    return "\n".join(
+        [
+            body,
+            "",
+            f"Spatial primitive: {primitive_name}",
+            f"Lens: {lens}",
+            "",
+            "Using ONLY this geometric lens, predict the test output grid.",
+            "Reply with exactly one JSON 2D array of integers (colors 0-9).",
+            "No markdown, no explanation, no thinking tags — JSON array only.",
+            "Test output JSON array:",
+        ]
+    )
+
+
 def build_slot_hypothesis_user_content(
     task_id: str,
     task: Dict[str, Any],
@@ -5208,7 +5285,10 @@ def collect_feature_slot_hypotheses(
     feature_names = alloc_out["feature_names"]
     feature_params = allocator.get_feature_params(feature_indices)
 
-    hyp_thinking = ARC_HYPOTHESIS_ENABLE_THINKING and not ARC_DISABLE_THINKING
+    hyp_thinking = (
+        ARC_HYPOTHESIS_ENABLE_THINKING
+        and arc_resolve_enable_thinking() is True
+    )
     if hyp_thinking:
         system_content = (
             "You are an ARC-AGI pattern analyst. Study grid transformations from train pairs. "
@@ -5255,7 +5335,11 @@ def collect_feature_slot_hypotheses(
 
     for slot_i in range(k):
         feat_name = feature_names[slot_i] if slot_i < len(feature_names) else f"slot{slot_i}"
-        params = feature_params[slot_i] if slot_i < len(feature_params) else FEATURE_PARAMS["LogicalReasoner"]
+        params = (
+            feature_params[slot_i]
+            if slot_i < len(feature_params)
+            else FEATURE_PARAMS[SPATIAL_PRIMITIVES[0]]
+        )
         user_content = build_slot_hypothesis_user_content(
             task_id,
             task,
@@ -5282,6 +5366,7 @@ def collect_feature_slot_hypotheses(
             max_tokens=int(hyp_max_tokens),
             repetition_penalty=float(params.get("repetition_penalty", 1.03)),
         )
+        sp = _apply_arc_guided_decoding(sp)
         setattr(sp, "stream_label", f"MBR-hypothesis/slot{slot_i}/{feat_name}")
         prompts.append(prompt)
         sp_list.append(sp)
@@ -5312,7 +5397,7 @@ def collect_feature_slot_hypotheses(
         f"first slot may take 30-120s on L4; vLLM tqdm stays 0/{k} until one slot finishes"
     )
     t_gen = time.perf_counter()
-    outs = vllm_llm.generate(prompts, sp_list, use_tqdm=False)
+    outs = _vllm_generate_arc(vllm_llm, prompts, sp_list)
     arc_eval_log(
         f"[ARC-PHASE-1] Generate done: {k}/{k} slots in {time.perf_counter() - t_gen:.1f}s"
     )
@@ -5345,6 +5430,279 @@ def collect_feature_slot_hypotheses(
     return hypotheses
 
 
+def pixel_wise_majority_vote_grids(
+    grid_hypotheses: List[Dict[str, Any]],
+    *,
+    task: Optional[Dict[str, Any]] = None,
+    test_index: int = 0,
+) -> Tuple[Optional[List[List[int]]], Dict[str, Any]]:
+    """
+    Step 4 Phase 2: per-cell plurality over parsed grid hypotheses (no LLM synthesis).
+    """
+    parsed: List[List[List[int]]] = []
+    slot_ids: List[int] = []
+    for rec in grid_hypotheses:
+        grid = rec.get("parsed_grid")
+        if grid is not None and _is_valid_arc_grid(grid):
+            parsed.append(grid)
+            slot_ids.append(int(rec.get("slot", len(slot_ids))))
+
+    if not parsed:
+        return None, {
+            "method": "pixel_majority",
+            "n_slots": len(grid_hypotheses),
+            "n_parsed": 0,
+            "target_shape": None,
+            "vote_counts": {},
+            "tie": True,
+        }
+
+    shape_counts = Counter((len(g), len(g[0]) if g and g[0] else 0) for g in parsed)
+    target_h, target_w = shape_counts.most_common(1)[0][0]
+    eligible = [
+        g for g in parsed if len(g) == target_h and (len(g[0]) if g else 0) == target_w
+    ]
+    if not eligible:
+        eligible = parsed
+        target_h = max(len(g) for g in eligible)
+        target_w = max(len(g[0]) if g else 0 for g in eligible)
+
+    result: List[List[int]] = []
+    cell_votes: Dict[str, int] = {}
+    for r in range(target_h):
+        row: List[int] = []
+        for c in range(target_w):
+            votes: List[int] = []
+            for g in eligible:
+                if r < len(g) and c < len(g[r]):
+                    votes.append(int(g[r][c]))
+            if votes:
+                winner = Counter(votes).most_common(1)[0][0]
+                row.append(winner)
+                cell_votes[f"{r},{c}"] = len(votes)
+            else:
+                row.append(0)
+        result.append(row)
+
+    return result, {
+        "method": "pixel_majority",
+        "n_slots": len(grid_hypotheses),
+        "n_parsed": len(parsed),
+        "n_eligible": len(eligible),
+        "target_shape": [target_h, target_w],
+        "shape_histogram": dict(shape_counts),
+        "tie": False,
+    }
+
+
+def collect_spatial_grid_hypotheses(
+    vllm_llm: Any,
+    tokenizer: Any,
+    task_id: str,
+    task: Dict[str, Any],
+    test_index: int = 0,
+    *,
+    k: Optional[int] = None,
+    allocator: Optional[PermutationFeatureSlotAllocator] = None,
+    seed: int = 42,
+    verbose: bool = False,
+) -> List[Dict[str, Any]]:
+    """Step 4 Phase 1: K spatial-primitive prompts each emit one JSON grid hypothesis."""
+    k = arc_hypothesis_k() if k is None else int(k)
+    random.seed(seed)
+    if allocator is None:
+        allocator = PermutationFeatureSlotAllocator(
+            internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=k
+        )
+    pooled = make_pooled_state([], 0, tokenizer=tokenizer)
+    alloc_out = allocator(pooled, 0)
+    feature_indices = alloc_out["feature_indices"]
+    feature_names = alloc_out["feature_names"]
+    feature_params = allocator.get_feature_params(feature_indices)
+
+    grid_thinking = arc_resolve_enable_thinking() is True
+    system_content = (
+        "You solve ARC-AGI grid puzzles using spatial transformations. "
+        "Output exactly one JSON 2D array of integers (0-9). "
+        "No markdown, no prose, no thinking tags."
+    )
+
+    hypotheses: List[Dict[str, Any]] = []
+    engine_ctx = get_inference_max_context(vllm_llm)
+    slot_max_tokens = arc_final_grid_max_tokens(task)
+    probe_primitive = feature_names[0] if feature_names else SPATIAL_PRIMITIVES[0]
+    task_body, system_used, probe_tok, body_fmt = resolve_arc_hypothesis_bundle(
+        tokenizer,
+        task_id,
+        task,
+        test_index,
+        probe_primitive,
+        system_content=system_content,
+        engine_ctx=engine_ctx,
+        max_output_tokens=int(slot_max_tokens),
+        enable_thinking=grid_thinking,
+    )
+
+    prompts: List[str] = []
+    sp_list: List[Any] = []
+    slot_meta: List[Tuple[int, str, Dict[str, Any]]] = []
+    max_needed = 0
+
+    for slot_i in range(k):
+        prim = feature_names[slot_i] if slot_i < len(feature_names) else f"slot{slot_i}"
+        params = (
+            feature_params[slot_i]
+            if slot_i < len(feature_params)
+            else FEATURE_PARAMS[SPATIAL_PRIMITIVES[0]]
+        )
+        user_content = build_spatial_grid_user_content(
+            task_id,
+            task,
+            test_index,
+            prim,
+            task_body=task_body,
+            compact=ARC_FAST_INFERENCE,
+        )
+        prompt = _wrap_arc_chat_prompt(
+            tokenizer,
+            user_content,
+            system_content=system_used,
+            enable_thinking=grid_thinking,
+            assistant_prefill=ARC_ASSISTANT_PREFILL,
+        )
+        sp = SamplingParams(
+            temperature=float(ARC_GENERATION_TEMPERATURE),
+            top_p=float(params.get("top_p", 1.0)),
+            max_tokens=int(slot_max_tokens),
+            repetition_penalty=float(params.get("repetition_penalty", 1.02)),
+        )
+        sp = _apply_arc_guided_decoding(sp)
+        setattr(sp, "stream_label", f"ARC-spatial/slot{slot_i}/{prim}")
+        prompts.append(prompt)
+        sp_list.append(sp)
+        slot_meta.append((slot_i, prim, params))
+        n_in = count_prompt_tokens(tokenizer, prompt)
+        max_needed = max(max_needed, n_in + int(slot_max_tokens))
+
+    if max_needed > engine_ctx:
+        need_ctx = int(math.ceil(max_needed / 256.0) * 256)
+        raise ValueError(
+            f"ARC spatial grid batch needs {max_needed} tokens but vLLM "
+            f"max_model_len={engine_ctx}. Set VLLM_MAX_MODEL_LEN={need_ctx}."
+        )
+
+    total_prompt_tok = sum(count_prompt_tokens(tokenizer, p) for p in prompts)
+    arc_eval_log(
+        f"[ARC-PHASE-1] Spatial grid pool: {k} JSON grid hypotheses "
+        f"(primitives, guided={ARC_GUIDED_JSON_DECODING}, thinking=False)"
+    )
+    arc_eval_log(
+        f"[ARC-PHASE-1] Generate start: max_out={slot_max_tokens}/slot | "
+        f"prompt~{total_prompt_tok // max(1, k)}tok/slot"
+    )
+    t_gen = time.perf_counter()
+    outs = _vllm_generate_arc(vllm_llm, prompts, sp_list)
+    arc_eval_log(
+        f"[ARC-PHASE-1] Generate done: {k}/{k} spatial slots in "
+        f"{time.perf_counter() - t_gen:.1f}s"
+    )
+
+    for out, (slot_i, prim, _params), prompt in zip(outs, slot_meta, prompts):
+        gen_ids: List[int] = list(out.outputs[0].token_ids) if out.outputs else []
+        raw_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+        parsed = parse_arc_answer_grid(raw_text)
+
+        rec = {
+            "slot": slot_i,
+            "feature": prim,
+            "primitive": prim,
+            "feature_index": feature_indices[slot_i] if slot_i < len(feature_indices) else slot_i,
+            "text": format_grid_json(parsed) if parsed else raw_text.strip(),
+            "raw_text": raw_text,
+            "parsed_grid": parsed,
+            "num_tokens": len(gen_ids),
+            "prompt": prompt,
+        }
+        hypotheses.append(rec)
+        if verbose or (STREAM_ALL_OUTPUT and not ARC_FAST_INFERENCE):
+            stream_log(
+                f"  [SPATIAL slot {slot_i}] {prim} ({len(gen_ids)} tok) -> "
+                f"{_grid_shape_label(parsed) if parsed else 'UNPARSED'}"
+            )
+
+    hyp_tok = sum(int(h.get("num_tokens", 0)) for h in hypotheses)
+    n_parsed = sum(1 for h in hypotheses if h.get("parsed_grid") is not None)
+    arc_eval_log(
+        f"[ARC-PHASE-1] Spatial pool done: {n_parsed}/{len(hypotheses)} parsed grids, "
+        f"{hyp_tok} output tokens"
+    )
+    return hypotheses
+
+
+def arc_spatial_grid_ensemble_pipeline(
+    vllm_llm: Any,
+    tokenizer: Any,
+    task_id: str,
+    task: Dict[str, Any],
+    test_index: int = 0,
+    *,
+    k: Optional[int] = None,
+    allocator: Optional[PermutationFeatureSlotAllocator] = None,
+    seed: int = 42,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    """
+    Recovery plan ARC path:
+      Phase 1 — 8 spatial-primitive prompts -> 8 JSON grid hypotheses.
+      Phase 2 — pixel-wise majority vote (no LLM text synthesis).
+    """
+    k = arc_hypothesis_k() if k is None else int(k)
+    grid_hypotheses = collect_spatial_grid_hypotheses(
+        vllm_llm,
+        tokenizer,
+        task_id,
+        task,
+        test_index,
+        k=k,
+        allocator=allocator,
+        seed=seed,
+        verbose=verbose,
+    )
+    hyp_token_total = sum(int(h.get("num_tokens", 0)) for h in grid_hypotheses)
+    pooled_grid, vote_meta = pixel_wise_majority_vote_grids(
+        grid_hypotheses, task=task, test_index=test_index
+    )
+
+    arc_eval_log(
+        f"[ARC-PHASE-2] Pixel majority vote: {vote_meta.get('n_parsed', 0)}/"
+        f"{vote_meta.get('n_slots', k)} grids -> shape {vote_meta.get('target_shape')}"
+    )
+
+    return {
+        "generation_mode": "spatial_grid_ensemble+pixel_majority",
+        "hypotheses": grid_hypotheses,
+        "final_prompt": "",
+        "final_text": format_grid_json(pooled_grid),
+        "generated_text": format_grid_json(pooled_grid),
+        "generated_ids": [],
+        "parsed_grid": pooled_grid,
+        "num_tokens": hyp_token_total,
+        "hypothesis_tokens": hyp_token_total,
+        "grid_tokens": 0,
+        "final_output_budget": 0,
+        "output_budget_cap": int(ARC_MBR_OUTPUT_TOKEN_BUDGET),
+        "prompt_tokens": 0,
+        "num_superblocks": 1 + k,
+        "total_accepted": hyp_token_total,
+        "avg_accepted_per_block": float(hyp_token_total),
+        "feature_reallocations": 0,
+        "acceptance_history": [1.0] if pooled_grid else [0.0],
+        "feature_history": [[h.get("primitive", h.get("feature", "?")) for h in grid_hypotheses]],
+        "reframe_events": 0,
+        "vote_meta": vote_meta,
+    }
+
+
 def arc_mbr_hypothesis_pipeline(
     vllm_llm: Any,
     tokenizer: Any,
@@ -5359,9 +5717,21 @@ def arc_mbr_hypothesis_pipeline(
 ) -> Dict[str, Any]:
     """
     Two-phase ARC MBR:
-      1) K feature-slots each propose textual transformation/pattern hypotheses.
-      2) One final pass synthesizes hypotheses into a single output grid.
+      spatial ensemble (default): K grid hypotheses + pixel majority vote.
+      legacy text mode: K text hypotheses + one LLM final grid pass.
     """
+    if ARC_SPATIAL_GRID_ENSEMBLE:
+        return arc_spatial_grid_ensemble_pipeline(
+            vllm_llm,
+            tokenizer,
+            task_id,
+            task,
+            test_index=test_index,
+            k=k,
+            allocator=allocator,
+            seed=seed,
+            verbose=verbose,
+        )
     k = arc_hypothesis_k() if k is None else int(k)
     hypotheses = collect_feature_slot_hypotheses(
         vllm_llm,
@@ -5500,15 +5870,17 @@ def arc_direct_generate(
         top_p=1.0,
         max_tokens=int(max_new_tokens),
     )
+    sp = _apply_arc_guided_decoding(sp)
     setattr(sp, "stream_label", "MBR-FINAL-GRID")
     prompt_tokens = count_prompt_tokens(tokenizer, prompt)
     if STREAM_ALL_OUTPUT and not ARC_FAST_INFERENCE:
         stream_log(
             f"[ARC] direct generate begin (max_new_tokens={max_new_tokens}, "
-            f"temp={temperature}, thinking={STREAM_PRINT_THINKING}, "
+            f"temp={temperature}, thinking={arc_resolve_enable_thinking()}, "
+            f"guided={getattr(sp, 'arc_guided_json', False)}, "
             f"prompt_tokens={prompt_tokens})"
         )
-    out = vllm_llm.generate([prompt], sp, use_tqdm=False)[0]
+    out = _vllm_generate_arc(vllm_llm, [prompt], [sp])[0]
     gen_ids: List[int] = []
     if out.outputs:
         gen_ids = list(out.outputs[0].token_ids)
@@ -6441,8 +6813,12 @@ def _multi_agent_worker_execute_mbr(
         prompt_for_extract = prompt
 
     elapsed = time.perf_counter() - t0
-    answer_text = extract_arc_generated_suffix(mbr_res, prompt_for_extract)
-    prediction = parse_arc_answer_grid(answer_text)
+    prediction = mbr_res.get("parsed_grid")
+    if prediction is None:
+        answer_text = extract_arc_generated_suffix(mbr_res, prompt_for_extract)
+        prediction = parse_arc_answer_grid(answer_text)
+    else:
+        answer_text = format_grid_json(prediction)
     return {
         "status": "ok",
         "agent_id": agent_id,
@@ -6756,13 +7132,27 @@ def print_arc_pipeline_architecture(
     print("\n" + "=" * 80)
     print("ARC PIPELINE — HOW TO READ THE LOGS")
     print("=" * 80)
+    if ARC_SPATIAL_GRID_ENSEMBLE:
+        phase1_line = (
+            f"    [ARC-PHASE-1]  Spatial pool     -> {hyp_n} JSON grid hypotheses "
+            f"(guided={ARC_GUIDED_JSON_DECODING}, thinking=False)\n"
+        )
+        phase2_line = (
+            "    [ARC-PHASE-2]  Pixel majority   -> per-cell vote across parsed grids\n"
+        )
+    else:
+        phase1_line = (
+            f"    [ARC-PHASE-1]  Hypothesis pool  -> {hyp_n} parallel TEXT proposals\n"
+        )
+        phase2_line = (
+            "    [ARC-PHASE-2]  Final grid       -> 1 JSON grid synthesis\n"
+            "                   vLLM shows: Rendering prompts: 1/1\n"
+        )
     print(
         "  Each Qwen engine runs TWO phases per test case:\n"
-        f"    [ARC-PHASE-1]  Hypothesis pool  -> {hyp_n} parallel TEXT proposals\n"
-        "                   vLLM shows: Rendering prompts: "
-        f"{hyp_n}/{hyp_n}  (= proposal count, NOT voters)\n"
-        "    [ARC-PHASE-2]  Final grid       -> 1 JSON grid synthesis\n"
-        "                   vLLM shows: Rendering prompts: 1/1\n"
+        f"{phase1_line}"
+        f"                   vLLM shows: Rendering prompts: {hyp_n}/{hyp_n}  (= slot count, NOT voters)\n"
+        f"{phase2_line}"
         "  Note: Phase-1 can look idle at 'Processed 0/N' until the first slot fully completes."
     )
     print("")
@@ -6983,9 +7373,15 @@ def evaluate_arc_dataset(
                     f"(Phase1:{hyp_n} props + Phase2:1 grid) -> plurality vote"
                 )
             else:
+                phase2 = (
+                    "pixel majority vote"
+                    if ARC_SPATIAL_GRID_ENSEMBLE
+                    else "Phase2:1 grid"
+                )
                 arc_eval_log(
                     f"\n[ARC] >>> task {task_idx + 1}/{len(task_ids)} {task_id} "
-                    f"test#{test_index} — single engine: Phase1:{hyp_n} props -> Phase2:1 grid"
+                    f"test#{test_index} — single engine: Phase1:{hyp_n} "
+                    f"{'spatial grids' if ARC_SPATIAL_GRID_ENSEMBLE else 'props'} -> {phase2}"
                 )
             t0 = time.perf_counter()
             agent_results: List[Dict[str, Any]] = []
@@ -7436,6 +7832,11 @@ if __name__ == "__main__":
     print(
         f"    ARC_HYPOTHESIS_SLOTS={ARC_HYPOTHESIS_SLOTS} (Phase-1 proposal pool) | "
         f"BENCHMARK_K={K} (demo only) | BLOCK_SIZE={BLOCK_SIZE}"
+    )
+    print(
+        f"    RECOVERY: live_patch={ENABLE_DFLASH_LIVE_PATCH} "
+        f"thinking=False guided={ARC_GUIDED_JSON_DECODING} "
+        f"spatial_ensemble={ARC_SPATIAL_GRID_ENSEMBLE}"
     )
     print(
         f"    ARC_MULTI_AGENT_ENABLED={ARC_MULTI_AGENT_ENABLED} "
