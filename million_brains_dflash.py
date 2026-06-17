@@ -119,6 +119,24 @@ GPU: T4 / L4 / A10 / A100 all work (uses 1.5B-3B class models by default for hea
 # the guard below performs the equivalent install so the file stays self-contained.
 # =============================================================================
 # !pip install -q "transformers>=4.57" safetensors accelerate vllm kagglehub huggingface_hub --upgrade
+import os
+import sys
+
+
+def _is_mbr_worker_subprocess() -> bool:
+    """True when spawned as a voter-pool worker (must keep stdout JSON-only)."""
+    return (
+        os.environ.get("MBR_AGENT_WORKER") == "1"
+        or "--mbr-agent-worker" in sys.argv
+    )
+
+
+_MBR_WORKER_SUBPROCESS = _is_mbr_worker_subprocess()
+if _MBR_WORKER_SUBPROCESS:
+    os.environ.setdefault("PYDEVD_DISABLE_FILE_VALIDATION", "1")
+    os.environ.setdefault("PYTHONWARNINGS", "ignore")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
 try:
     import IPython
 
@@ -126,7 +144,7 @@ try:
 except Exception:
     _in_notebook = False
 
-if not _in_notebook:
+if not _in_notebook and not _MBR_WORKER_SUBPROCESS:
     # Direct execution path (plain .py or Kaggle "Script" kernel): do real install
     import subprocess, sys
 
@@ -153,10 +171,10 @@ if not _in_notebook:
             "[INSTALL] Subprocess pip skipped/failed (packages may already exist):",
             _inst_e,
         )
-else:
+elif not _MBR_WORKER_SUBPROCESS:
     # Notebook path: pip is usually run via the !pip magic line, but also try subprocess so
     # kagglehub is available for Kaggle-native model download when huggingface.co DNS fails.
-    import subprocess, sys
+    import subprocess
 
     try:
         subprocess.check_call(
@@ -180,7 +198,7 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-18a"  # recovery plan: stock vLLM + spatial grid ensemble
+SCRIPT_VERSION = "2026-06-18b"  # voter worker stdout protocol fix (Kaggle debugpy noise)
 K = 4  # benchmark / token-speculative super-block width (not ARC hypothesis count)
 ARC_HYPOTHESIS_SLOTS = 8  # ARC eval: batched hypothesis proposals per engine (vLLM shows N/N)
 NUM_PERSONALITY_FEATURES = 12  # spatial primitive bank size (legacy name for allocator)
@@ -398,17 +416,23 @@ def _resolve_vllm_draft_module():
         except ModuleNotFoundError:
             continue
 
-    print(
-        "[IMPORT] vLLM draft module not found (tried "
-        + ", ".join(candidates)
-        + "); using in-process stub for live-edit fallback."
-    )
+    if not _MBR_WORKER_SUBPROCESS:
+        print(
+            "[IMPORT] vLLM draft module not found (tried "
+            + ", ".join(candidates)
+            + "); using in-process stub for live-edit fallback."
+        )
     stub = types.ModuleType("vllm_draft_stub")
     sys.modules.setdefault("vllm.spec_decode.draft_model", stub)
     return stub
 
 
-vllm_draft_module = _resolve_vllm_draft_module()  # for live patching target
+if ENABLE_DFLASH_LIVE_PATCH:
+    vllm_draft_module = _resolve_vllm_draft_module()  # for live patching target
+else:
+    import types as _types
+
+    vllm_draft_module = _types.ModuleType("vllm_draft_stub_disabled")
 
 # =============================================================================
 # FIXED BANK OF 12 PERSONALITY FEATURES
@@ -1805,15 +1829,16 @@ class MillionBrainsDFlashDraftModel:  # type: ignore
 
 
 # Step 1: live-edit is opt-in — stock vLLM by default (avoids seq_len/head tensor mismatches)
-if ENABLE_DFLASH_LIVE_PATCH:
+if ENABLE_DFLASH_LIVE_PATCH and not _MBR_WORKER_SUBPROCESS:
     _LIVE_PATCH_SUCCESS = _live_edit_dflash()
 else:
     _LIVE_PATCH_SUCCESS = False
-    print(
-        "[CONFIG] ENABLE_DFLASH_LIVE_PATCH=False — stock vLLM generation "
-        "(no DFlash draft monkey-patches)",
-        flush=True,
-    )
+    if not _MBR_WORKER_SUBPROCESS:
+        print(
+            "[CONFIG] ENABLE_DFLASH_LIVE_PATCH=False — stock vLLM generation "
+            "(no DFlash draft monkey-patches)",
+            flush=True,
+        )
 
 
 # =============================================================================
@@ -1859,7 +1884,8 @@ def print_one_million_brains_banner(success: bool = True):
     )
 
 
-print_one_million_brains_banner(_LIVE_PATCH_SUCCESS)
+if not _MBR_WORKER_SUBPROCESS:
+    print_one_million_brains_banner(_LIVE_PATCH_SUCCESS)
 
 
 # =============================================================================
@@ -6708,6 +6734,66 @@ def _resolve_voter_pool_gen_path() -> str:
     )
 
 
+def _read_worker_json_message(
+    stream: Any,
+    *,
+    agent_id: int,
+    expect_status: Optional[Any] = None,
+    timeout_s: float = 7200.0,
+    label: str = "message",
+) -> Dict[str, Any]:
+    """
+    Read one JSON protocol line from a voter worker, skipping Kaggle/debug noise
+    (debugpy warnings, banners, pip logs) that may precede the payload.
+    """
+    accepted = (
+        (expect_status,)
+        if isinstance(expect_status, str)
+        else tuple(expect_status)
+        if expect_status is not None
+        else ("ready", "ok", "error")
+    )
+    deadline = time.perf_counter() + max(30.0, float(timeout_s))
+    junk_preview: List[str] = []
+    while time.perf_counter() < deadline:
+        line = stream.readline()
+        if not line:
+            proc = getattr(stream, "proc", None)
+            rc = proc.poll() if proc is not None else None
+            raise RuntimeError(
+                f"Voter-pool worker {agent_id} EOF before {label} "
+                f"(exit={rc}, junk={junk_preview[:5]!r})"
+            )
+        line = line.strip()
+        if not line:
+            continue
+        if not (line.startswith("{") and line.endswith("}")):
+            if len(junk_preview) < 5:
+                junk_preview.append(line[:160])
+            if len(junk_preview) == 1:
+                print(
+                    f"[VOTER-POOL] worker {agent_id} startup noise (skipped): "
+                    f"{line[:100]}",
+                    flush=True,
+                )
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            if len(junk_preview) < 5:
+                junk_preview.append(line[:160])
+            continue
+        status = rec.get("status")
+        if status in accepted:
+            return rec
+        if status == "error":
+            return rec
+    raise RuntimeError(
+        f"Voter-pool worker {agent_id} timed out waiting for {label} "
+        f"(>{timeout_s:.0f}s, junk={junk_preview[:5]!r})"
+    )
+
+
 def _multi_agent_gpu_util_per_engine(n_agents: int, n_gpus: int) -> float:
     """VRAM fraction of *total* GPU memory vLLM may use per engine when sharing GPUs."""
     n_gpus = max(1, int(n_gpus))
@@ -6834,9 +6920,25 @@ def _multi_agent_worker_execute_mbr(
     }
 
 
+class _WorkerStdoutToStderr:
+    """Route worker load logs to stderr so stdout stays JSON-protocol clean."""
+
+    def write(self, data: str) -> int:
+        if data:
+            sys.stderr.write(data)
+        return len(data) if data else 0
+
+    def flush(self) -> None:
+        sys.stderr.flush()
+
+
 def _multi_agent_worker_main(agent_id: int, gen_path: str) -> None:
     """Subprocess entry: one Qwen engine pinned to CUDA_VISIBLE_DEVICES from parent env."""
     gpu_id = int(os.environ.get("MBR_WORKER_GPU", "0"))
+    saved_stdout = sys.stdout
+    sys.stdout = _WorkerStdoutToStderr()
+    llm: Any = None
+    tokenizer: Any = None
     try:
         local_only = os.path.isdir(gen_path) and local_dir_exists(gen_path)
         tokenizer = AutoTokenizer.from_pretrained(
@@ -6870,8 +6972,8 @@ def _multi_agent_worker_main(agent_id: int, gen_path: str) -> None:
             "max_ctx": get_inference_max_context(llm),
             "gpu_util": gpu_util,
         }
-        print(json.dumps(ready), flush=True)
     except Exception as exc:
+        sys.stdout = saved_stdout
         print(
             json.dumps(
                 {
@@ -6884,6 +6986,11 @@ def _multi_agent_worker_main(agent_id: int, gen_path: str) -> None:
             flush=True,
         )
         return
+    finally:
+        if sys.stdout is not saved_stdout:
+            sys.stdout = saved_stdout
+
+    print(json.dumps(ready), flush=True)
 
     for line in sys.stdin:
         line = line.strip()
@@ -6922,18 +7029,20 @@ def _multi_agent_worker_main(agent_id: int, gen_path: str) -> None:
                     "error": str(exc),
                     "traceback": traceback.format_exc(),
                 }
-            print(json.dumps(result, default=str), flush=True)
+            sys.stdout.write(json.dumps(result, default=str) + "\n")
+            sys.stdout.flush()
             continue
-        print(
+        sys.stdout.write(
             json.dumps(
                 {
                     "status": "error",
                     "agent_id": agent_id,
                     "error": f"unknown cmd {cmd!r}",
                 }
-            ),
-            flush=True,
+            )
+            + "\n"
         )
+        sys.stdout.flush()
 
 
 class MultiAgentEnginePool:
@@ -6972,19 +7081,20 @@ class MultiAgentEnginePool:
                 env=env,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.DEVNULL,
                 text=True,
                 bufsize=1,
             )
             assert proc.stdout is not None
             assert proc.stdin is not None
-            ready_line = proc.stdout.readline().strip()
-            try:
-                ready = json.loads(ready_line)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(
-                    f"Voter-pool worker {agent_id} failed during startup: {ready_line!r}"
-                ) from exc
+            proc.stdout.proc = proc  # type: ignore[attr-defined]
+            ready = _read_worker_json_message(
+                proc.stdout,
+                agent_id=agent_id,
+                expect_status="ready",
+                timeout_s=1800.0,
+                label="ready",
+            )
             if ready.get("status") != "ready":
                 raise RuntimeError(
                     f"Voter-pool worker {agent_id} failed: {ready}"
@@ -7049,14 +7159,19 @@ class MultiAgentEnginePool:
 
         results: List[Dict[str, Any]] = []
         for w in self._workers:
-            line = w["stdout"].readline().strip()
             try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
+                rec = _read_worker_json_message(
+                    w["stdout"],
+                    agent_id=int(w["agent_id"]),
+                    expect_status=("ok", "error"),
+                    timeout_s=7200.0,
+                    label="mbr result",
+                )
+            except RuntimeError as exc:
                 rec = {
                     "status": "error",
                     "agent_id": w["agent_id"],
-                    "error": f"bad worker JSON: {line!r}",
+                    "error": str(exc),
                 }
             if rec.get("status") == "ok" and "prediction" in rec:
                 pred = rec.get("prediction")
