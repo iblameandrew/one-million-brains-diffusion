@@ -180,7 +180,7 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-17k"  # bump when re-uploading to Kaggle to confirm latest script
+SCRIPT_VERSION = "2026-06-17l"  # bump when re-uploading to Kaggle to confirm latest script
 K = 4  # number of parallel drafter streams / feature-slots per super-block
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
 BLOCK_SIZE = 6  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
@@ -227,14 +227,15 @@ VLLM_GPU_MEMORY_UTILIZATION = 0.88  # base-only fallback; spec uses VLLM_SPEC_GP
 VLLM_TENSOR_PARALLEL_SIZE = 0  # 0=auto (retry with tp=2 when 2+ GPUs visible)
 # vLLM native speculative decoding (DFlash draft + target base in one engine)
 ENABLE_VLLM_SPECULATIVE_DECODING = True
-VLLM_REQUIRE_SPECULATIVE = True  # refuse silent base-only fallback when DFlash draft is available
+VLLM_REQUIRE_SPECULATIVE = False  # True loops 96× worker crashes when spec cannot load; False allows base-only fallback
 VLLM_SINGLE_ENGINE_SPECULATIVE = True  # one spec engine on 4×L4; skips multi-agent pool (8 workers cannot fit draft)
+VLLM_LANGUAGE_MODEL_ONLY = True  # Qwen3.5 text-only: skip vision encoder; required for draft_model spec on stock vLLM
 VLLM_SPECULATIVE_METHOD = "auto"  # auto: dflash if vLLM supports it, else draft_model (stock Kaggle vLLM)
 VLLM_NUM_SPECULATIVE_TOKENS = BLOCK_SIZE  # DFlash block width per speculation step
 VLLM_SPEC_GPU_MEMORY_UTILIZATION = 0.90  # draft+target needs ~90% of 22GB L4 (0.70 left no room for draft)
 VLLM_SPEC_DRAFT_GPU_UTIL_SCALE = 1.0  # do not shrink util for target+draft
 VLLM_SPEC_MAX_MODEL_LEN = 16384  # cap KV for spec load (prompt resolver shrinks; 22272 OOMs with draft on L4)
-VLLM_SPEC_PREFER_TENSOR_PARALLEL = 2  # try tp=2 first on Kaggle 4×L4 — spreads base weights across 2 GPUs
+VLLM_SPEC_PREFER_TENSOR_PARALLEL = 1  # tp=1 first (tp=2 spawns NCCL workers that spam logs on Kaggle)
 VLLM_SPEC_TRY_SMALLEST_CONTEXT_FIRST = True  # 8192→16384 ascending; fits draft+target before huge KV reserve
 PREFER_HF_INFERENCE = False  # L4/A10+: prefer vLLM fast kernels; HF only on load failure
 SKIP_VLLM_FOR_QWEN35 = False  # attempt vLLM for Qwen3.5-4B (set True on broken vLLM hosts)
@@ -328,10 +329,34 @@ from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional, Any
 from collections import Counter
 
+import warnings
+import logging
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _suppress_noisy_third_party_logs() -> None:
+    """Kaggle notebooks spam transformers/vLLM deprecation lines every worker spawn."""
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Qwen2VLImageProcessorFast.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Fast.* suffix for image processors.*",
+    )
+    warnings.filterwarnings("ignore", category=FutureWarning, module=r"cuda.*")
+    for logger_name in (
+        "transformers",
+        "transformers.image_processing_utils",
+        "transformers.processing_utils",
+    ):
+        logging.getLogger(logger_name).setLevel(logging.ERROR)
+
+
+_suppress_noisy_third_party_logs()
 
 # Heavy libraries (installed above)
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
@@ -2805,14 +2830,65 @@ def _release_cuda_cache() -> None:
             pass
 
 
+def _vllm_engine_extra_kwargs(model_path: str) -> Dict[str, Any]:
+    """Extra vLLM LLM() kwargs — text-only Qwen3.5 unlocks draft_model speculative decoding."""
+    extras: Dict[str, Any] = {}
+    if not VLLM_LANGUAGE_MODEL_ONLY:
+        return extras
+    try:
+        info = _checkpoint_model_info(model_path)
+        if info["is_qwen35"] or info["is_multimodal"]:
+            extras["language_model_only"] = True
+    except Exception:
+        pass
+    return extras
+
+
+def _vllm_native_speculative_viable(model_path: str) -> Tuple[bool, str]:
+    """
+    Stock vLLM rejects draft_model speculative decoding for multimodal targets.
+    ARC is text-only — language_model_only=True fixes this on Qwen3.5-4B.
+    """
+    try:
+        info = _checkpoint_model_info(model_path)
+    except Exception:
+        return True, ""
+    if not (info["is_qwen35"] or info["is_multimodal"]):
+        return True, ""
+    if VLLM_LANGUAGE_MODEL_ONLY:
+        return True, "Qwen3.5 text-only via language_model_only=True"
+    return (
+        False,
+        "Qwen3.5 multimodal + draft_model spec unsupported on stock vLLM. "
+        "Set VLLM_LANGUAGE_MODEL_ONLY=True (ARC is text-only).",
+    )
+
+
+_VLLM_SPEC_ABORT_MARKERS = (
+    "does not support multimodal",
+    "Speculative Decoding with draft models",
+)
+
+
+def _vllm_spec_attempt_should_abort(exc: BaseException) -> bool:
+    blob = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+    if any(marker in blob for marker in _VLLM_SPEC_ABORT_MARKERS):
+        return True
+    if "WorkerProc initialization failed" in blob:
+        return True
+    return False
+
+
 def _vllm_tensor_parallel_candidates(*, speculative: bool = False) -> List[int]:
     if int(VLLM_TENSOR_PARALLEL_SIZE) > 0:
         return [int(VLLM_TENSOR_PARALLEL_SIZE)]
     n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
     if speculative and n_gpu >= 2:
-        pref = max(2, int(VLLM_SPEC_PREFER_TENSOR_PARALLEL))
+        pref = max(1, int(VLLM_SPEC_PREFER_TENSOR_PARALLEL))
+        if pref <= 1:
+            return [1, 2]
         if n_gpu >= pref:
-            return [pref, 1, 2] if pref != 2 else [2, 1]
+            return [pref, 1]
         return [1, 2]
     if n_gpu >= 2:
         return [1, 2]
@@ -3016,12 +3092,20 @@ def _build_vllm_attempts(
             print(f"[LOAD] Could not inspect config.json: {exc}")
 
     hf_extra = {"hf_overrides": hf_overrides} if hf_overrides else {}
+    engine_extras = _vllm_engine_extra_kwargs(model_path)
+    if engine_extras:
+        print(f"[LOAD] vLLM engine extras: {engine_extras}")
 
-    spec_root = (
-        _build_vllm_speculative_config(dflash_draft_path)
-        if dflash_draft_path
-        else None
-    )
+    spec_viable, spec_reason = _vllm_native_speculative_viable(model_path)
+    spec_root = None
+    if dflash_draft_path and ENABLE_VLLM_SPECULATIVE_DECODING:
+        if spec_viable:
+            spec_root = _build_vllm_speculative_config(dflash_draft_path)
+            if spec_reason:
+                print(f"[LOAD] Native speculative: {spec_reason}")
+        else:
+            print(f"[LOAD] Skipping vLLM native speculative — {spec_reason}")
+
     if spec_root:
         print(
             f"[LOAD] vLLM speculative methods available: "
@@ -3067,6 +3151,7 @@ def _build_vllm_attempts(
                         "gpu_memory_utilization": spec_load_util,
                         "tensor_parallel_size": tp,
                         "speculative_config": spec_cfg,
+                        **engine_extras,
                     }
                     _append_vllm_attempt_variants(
                         spec_attempts,
@@ -3098,6 +3183,7 @@ def _build_vllm_attempts(
                         "max_model_len": max_len,
                         "gpu_memory_utilization": u,
                         "tensor_parallel_size": tp,
+                        **engine_extras,
                     }
                     _append_vllm_attempt_variants(
                         fallback_attempts,
@@ -3530,6 +3616,7 @@ def create_inference_engine(
     total_attempts = sum(len(batch) for _, batch in phases)
 
     last_err: Optional[BaseException] = None
+    spec_phase_aborted = False
     _release_cuda_cache()
     attempt_idx = 0
     for phase_name, batch in phases:
@@ -3537,9 +3624,11 @@ def create_inference_engine(
             print(
                 "[LOAD] All speculative attempts failed — falling back to base-only "
                 "(decode will be slower; raise VLLM_GPU_MEMORY_UTILIZATION or lower "
-                "VLLM_SPEC_FIRST_MAX_MODEL_LEN if this persists)."
+                "VLLM_SPEC_MAX_MODEL_LEN if this persists)."
             )
         for kwargs in batch:
+            if phase_name == "speculative" and spec_phase_aborted:
+                break
             attempt_idx += 1
             try:
                 spec_cfg = kwargs.get("speculative_config")
@@ -3594,6 +3683,14 @@ def create_inference_engine(
                 return llm
             except Exception as exc:
                 last_err = exc
+                if phase_name == "speculative" and _vllm_spec_attempt_should_abort(exc):
+                    print(
+                        "[LOAD] Aborting speculative load attempts — "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    spec_phase_aborted = True
+                    _release_cuda_cache()
+                    break
                 print(
                     f"[LOAD] vLLM attempt {attempt_idx} failed: "
                     f"{type(exc).__name__}: {exc}"
