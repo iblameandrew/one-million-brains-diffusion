@@ -180,7 +180,7 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-16q"  # bump when re-uploading to Kaggle to confirm latest script
+SCRIPT_VERSION = "2026-06-16t"  # bump when re-uploading to Kaggle to confirm latest script
 K = 4  # number of parallel drafter streams / feature-slots per super-block
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
 BLOCK_SIZE = 6  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
@@ -249,14 +249,23 @@ EVAL_MAX_TASKS = None  # cap tasks for smoke tests; None = all tasks in challeng
 EVAL_MAX_NEW_TOKENS = 512  # per-task generation budget for ARC prompts
 ARC_VISUAL_GRADING = True  # print + display a grade card for every test case
 ARC_PRINT_ALL_ANSWERS = True  # print every prediction vs ground-truth JSON for every test case
-ARC_EVAL_VERBOSE = False  # False = hide MBR realloc/super-block spam during ARC eval
+# Real-time streaming — prints every token and all model/MBR activity as it happens
+STREAM_GENERATION = True  # stream decoded tokens to stdout live (flush per token)
+STREAM_ALL_OUTPUT = True  # print all MBR drafts, commits, realloc, verify steps
+STREAM_PRINT_THINKING = True  # Qwen3.5: enable + stream <think>...</think> reasoning
+STREAM_VERIFY_PASSES = False  # verify=logprob-only; never stream those tokens
+HF_FAST_VERIFY = True  # tail-only logprobs on draft suffix (not full 4k prompt)
+ARC_EVAL_VERBOSE = True  # MBR super-block internals (auto-on when STREAM_ALL_OUTPUT)
 # ARC generation: "direct" = one greedy/sampled generate (works on HF). "speculative" = classic dflash loop.
 # Speculative with the SAME model as draft+target + draft temp 0.7 vs greedy verify → mass rejection + garbage.
 ARC_EVAL_GENERATION_MODE = "direct"
 ARC_USE_CHAT_TEMPLATE = True  # Qwen3.5 expects chat_template.jinja wrapping
-ARC_DISABLE_THINKING = True  # Qwen3.5: skip <think> blocks that eat token budget
-ARC_ASSISTANT_PREFILL = "[["  # chat prefill anchors generation as a JSON grid
+ARC_DISABLE_THINKING = not STREAM_PRINT_THINKING  # False = model may emit <think> blocks
+ARC_STRUCTURED_THINKING = True  # require incremental HYPOTHESIS_GRID inside <think>
+ARC_PRINT_STEP_MATRICES = True  # full ASCII grids at every MBR draft slot + commit
+ARC_ASSISTANT_PREFILL = "[["  # chat prefill anchors JSON grid (skipped when thinking is on)
 ARC_GENERATION_TEMPERATURE = 0.0  # greedy JSON for grid tasks
+EVAL_SMOKE_TASK_ID = None  # e.g. "0934a4d8" — run only this task (overrides max_tasks slice)
 ARC_RUN_MBR_EVAL = True  # False = skip slow million-brains pass (classic-only smoke tests)
 ARC_SAVE_GRADE_IMAGES = True  # save PNG grade cards (arc_grades/ or /kaggle/working/arc_grades/)
 ARC_SHOW_TRAIN_EXAMPLES = True  # include train pair thumbnails on each grade card
@@ -1093,7 +1102,8 @@ def million_brains_dflash_generate(
     enable_reallocation: bool = True,
     enable_smoothing: bool = ENABLE_CIRCUIT_SMOOTHING,
     seed: int = 42,
-    verbose: bool = True,
+    verbose: bool = STREAM_ALL_OUTPUT,
+    arc_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Full one-million-brains-dflash loop (permutation-driven feature-slot allocation).
@@ -1142,6 +1152,21 @@ def million_brains_dflash_generate(
     active_feature_indices: List[int] = list(range(k))
 
     max_blocks = (max_new_tokens // max(1, block_size)) + 4
+    arc_test_input = (arc_context or {}).get("test_input")
+    arc_gold = (arc_context or {}).get("gold")
+    arc_task_id = str((arc_context or {}).get("task_id") or "")
+
+    if verbose or STREAM_ALL_OUTPUT:
+        stream_log(
+            f"[MBR] start k={k} block_size={block_size} max_new_tokens={max_new_tokens} "
+            f"smoothing={enable_smoothing}"
+        )
+        if isinstance(vllm_llm, HFGenerateEngine):
+            stream_log(
+                "[MBR] HF-fallback: ~"
+                f"{(max_new_tokens // max(1, block_size) + 4) * (k + 1)} "
+                "verify forwards/task — set ARC_RUN_MBR_EVAL=False for classic-only"
+            )
 
     for sb in range(max_blocks):
         if len(generated_ids) >= max_new_tokens:
@@ -1198,13 +1223,14 @@ def million_brains_dflash_generate(
                 logprobs=1,
                 stop_token_ids=None,
             )
+            setattr(sp, "stream_label", f"MBR-draft/slot{i}/{active_feature_names[i]}")
             draft_sampling.append(sp)
 
         # vLLM handles the heterogeneous batched drafting efficiently.
         outs = vllm_llm.generate([current_text] * k, draft_sampling)
         proposals: List[List[int]] = []
         draft_lps: List[List[float]] = []
-        for out in outs:
+        for slot_i, out in enumerate(outs):
             if not out.outputs:
                 proposals.append([])
                 draft_lps.append([])
@@ -1222,6 +1248,28 @@ def million_brains_dflash_generate(
                 lps = [-0.7] * len(tok_ids)
             proposals.append(tok_ids)
             draft_lps.append(lps)
+            if verbose or STREAM_ALL_OUTPUT:
+                draft_txt = tokenizer.decode(tok_ids, skip_special_tokens=True)
+                feat_name = (
+                    active_feature_names[slot_i]
+                    if slot_i < len(active_feature_names)
+                    else f"slot{slot_i}"
+                )
+                stream_log(
+                    f"  [DRAFT slot {slot_i}] {feat_name}: {draft_txt!r}"
+                )
+                if arc_context and ARC_PRINT_STEP_MATRICES:
+                    draft_full = current_text + draft_txt
+                    print_mbr_slot_inference_state(
+                        sb=sb,
+                        phase="draft",
+                        slot_i=slot_i,
+                        feature_name=feat_name,
+                        test_input=arc_test_input,
+                        gold=arc_gold,
+                        assistant_suffix=_assistant_suffix(draft_full, prompt),
+                        task_id=arc_task_id,
+                    )
 
         # 3) Cross-stream integration / fusion phase (the high-level "Group Think")
         #    CTSB enabled: anchor-stream fused candidate (coherent, no per-token splicing).
@@ -1259,6 +1307,9 @@ def million_brains_dflash_generate(
         candidates_for_verify.append(base + fused_text)
 
         verify_params = make_target_verify_sampling_params()
+        setattr(verify_params, "stream_label", f"MBR-verify/sb{sb}")
+        setattr(verify_params, "verify_only", True)
+        setattr(verify_params, "verify_tail_tokens", block_size + 4)
         verify_outs = vllm_llm.generate(candidates_for_verify, verify_params)
 
         # Extract target logprobs for the drafted region of each candidate
@@ -1318,10 +1369,37 @@ def million_brains_dflash_generate(
         accepted_len = len(best_accepted)
         if accepted_len > 0:
             new_ids = best_accepted
-            generated_ids.extend(new_ids)
             append_text = tokenizer.decode(new_ids, skip_special_tokens=True)
-            current_text = current_text + append_text
-            total_accepted += accepted_len
+            if is_degenerate_arc_token_run(append_text):
+                if verbose or STREAM_ALL_OUTPUT:
+                    stream_log(
+                        f"  [MBR-SKIP] sb={sb:02d} degenerate commit: {append_text!r}"
+                    )
+                accepted_len = 0
+            else:
+                generated_ids.extend(new_ids)
+                current_text = current_text + append_text
+                total_accepted += accepted_len
+                if verbose or STREAM_ALL_OUTPUT:
+                    stream_log(
+                        f"  [COMMIT sb={sb:02d} +{accepted_len} tok] {append_text!r}"
+                    )
+                    for tid in new_ids:
+                        stream_emit(
+                            tokenizer.decode([tid], skip_special_tokens=False)
+                        )
+                    print(flush=True)
+                if arc_context and ARC_PRINT_STEP_MATRICES:
+                    print_mbr_slot_inference_state(
+                        sb=sb,
+                        phase="commit",
+                        slot_i=None,
+                        feature_name="committed",
+                        test_input=arc_test_input,
+                        gold=arc_gold,
+                        assistant_suffix=_assistant_suffix(current_text, prompt),
+                        task_id=arc_task_id,
+                    )
         acceptance_history.append(best_rate)
         prev_acceptance_rate = best_rate
         prev_accepted_len = accepted_len
@@ -1372,22 +1450,41 @@ def million_brains_dflash_generate(
                 )
 
         # 9) Diagnostic logging (feature-slot view)
-        if verbose:
+        if verbose or STREAM_ALL_OUTPUT:
             gmask = GroupThinkMask(
                 k=k,
                 block_size=block_size,
                 phase="integration" if accepted_len > 0 else "draft",
             )
-            if sb < 2 or accepted_len == 0:
-                smooth_note = (
-                    f" | λ={blend_lambda:.2f}"
-                    if smoother is not None
-                    else ""
-                )
-                print(
-                    f"    Super-block {sb:02d} | features={active_feature_names} | "
-                    f"accepted={accepted_len}/{block_size}{smooth_note} | mask={gmask.describe()}"
-                )
+            smooth_note = (
+                f" | λ={blend_lambda:.2f}"
+                if smoother is not None
+                else ""
+            )
+            stream_log(
+                f"    Super-block {sb:02d} | features={active_feature_names} | "
+                f"accepted={accepted_len}/{block_size} | rates={[f'{r:.2f}' for r in path_rates]}"
+                f"{smooth_note} | fused_rate={rate_f:.2f} | mask={gmask.describe()}"
+            )
+
+        if arc_gold and ARC_STRUCTURED_THINKING:
+            hyp, _, _ = parse_hypothesis_grid_from_thinking(
+                _assistant_suffix(current_text, prompt)
+            )
+            if hyp is not None:
+                gh, gw = len(arc_gold), len(arc_gold[0]) if arc_gold else 0
+                if len(hyp) == gh and (hyp[0] if hyp else []) and len(hyp[0]) == gw:
+                    if all(
+                        isinstance(cell, int)
+                        for row in hyp
+                        for cell in row
+                    ):
+                        if verbose or STREAM_ALL_OUTPUT:
+                            stream_log(
+                                f"  [MBR-DONE] sb={sb:02d} complete hypothesis "
+                                f"{_grid_shape_label(hyp)} — stopping early"
+                            )
+                        break
 
         if len(generated_ids) >= max_new_tokens:
             break
@@ -1442,6 +1539,11 @@ def classic_dflash_generate(
 
     max_blocks = (max_new_tokens // max(1, block_size)) + 4
 
+    if STREAM_ALL_OUTPUT:
+        stream_log(
+            f"[CLASSIC-DFLASH] start block_size={block_size} max_new_tokens={max_new_tokens}"
+        )
+
     for sb in range(max_blocks):
         if len(generated_ids) >= max_new_tokens:
             break
@@ -1454,6 +1556,7 @@ def classic_dflash_generate(
             max_tokens=block_size,
             logprobs=1,
         )
+        setattr(sp, "stream_label", f"CLASSIC-draft/sb{sb}")
         out = vllm_llm.generate([current_text], sp)[0]
         draft_ids = list(out.outputs[0].token_ids)[:block_size]
         draft_lps = []
@@ -1467,9 +1570,15 @@ def classic_dflash_generate(
 
         # Target verification forward on the single extended candidate
         candidate = current_text + tokenizer.decode(draft_ids, skip_special_tokens=True)
-        vout = vllm_llm.generate(
-            [candidate], make_target_verify_sampling_params()
-        )[0]
+        if STREAM_ALL_OUTPUT:
+            stream_log(
+                f"  [CLASSIC draft sb={sb}] {tokenizer.decode(draft_ids, skip_special_tokens=True)!r}"
+            )
+        verify_sp = make_target_verify_sampling_params()
+        setattr(verify_sp, "stream_label", f"CLASSIC-verify/sb{sb}")
+        setattr(verify_sp, "verify_only", True)
+        setattr(verify_sp, "verify_tail_tokens", block_size + 4)
+        vout = vllm_llm.generate([candidate], verify_sp)[0]
         target_lps = extract_target_logprobs_for_draft(
             vout.prompt_logprobs, draft_ids
         )
@@ -1479,10 +1588,13 @@ def classic_dflash_generate(
 
         if acc:
             generated_ids.extend(acc)
-            current_text = current_text + tokenizer.decode(
-                acc, skip_special_tokens=True
-            )
+            commit_txt = tokenizer.decode(acc, skip_special_tokens=True)
+            current_text = current_text + commit_txt
             total_accepted += len(acc)
+            if STREAM_ALL_OUTPUT:
+                stream_log(
+                    f"  [CLASSIC commit sb={sb} +{len(acc)}] rate={rate:.2f} text={commit_txt!r}"
+                )
 
         if len(generated_ids) >= max_new_tokens:
             break
@@ -2714,6 +2826,71 @@ class _HFRequestOutput:
     prompt_logprobs: Optional[List[Optional[Dict[int, float]]]] = None
 
 
+_STREAM_IN_THINKING = False
+
+
+def stream_begin(label: str) -> None:
+    """Open a labeled live-generation block."""
+    if STREAM_GENERATION:
+        print(f"\n[STREAM] ▶ {label}", flush=True)
+
+
+def stream_end(label: str = "") -> None:
+    """Close a live-generation block."""
+    if STREAM_GENERATION:
+        suffix = f" — {label}" if label else ""
+        print(f"\n[STREAM] ■ end{suffix}", flush=True)
+
+
+def stream_emit(text: str, *, end: str = "") -> None:
+    """Print one decoded token chunk immediately (thinking tags included)."""
+    global _STREAM_IN_THINKING
+    if not STREAM_GENERATION or not text:
+        return
+    if STREAM_PRINT_THINKING:
+        lower = text.lower()
+        if "<think>" in lower and not _STREAM_IN_THINKING:
+            _STREAM_IN_THINKING = True
+            print("\n[THINKING] ", end="", flush=True)
+        print(text, end=end, flush=True)
+        if "</think>" in lower:
+            _STREAM_IN_THINKING = False
+            print("\n[ANSWER] ", end="", flush=True)
+        return
+    print(text, end=end, flush=True)
+
+
+def stream_log(message: str) -> None:
+    """Print a non-token diagnostic line during streaming."""
+    if STREAM_GENERATION or STREAM_ALL_OUTPUT:
+        print(message, flush=True)
+
+
+def _sampling_params_label(sp: Any, fallback: str) -> str:
+    return str(getattr(sp, "stream_label", None) or fallback)
+
+
+def _top_p_sample_logits(logits: torch.Tensor, temperature: float, top_p: float) -> Tuple[int, float]:
+    """Sample one token ID + logprob from logits."""
+    temp = max(float(temperature), 1e-5)
+    probs = torch.softmax(logits / temp, dim=-1)
+    if top_p < 1.0:
+        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        mask = cumulative > float(top_p)
+        if mask.any():
+            mask[..., 0] = False
+            sorted_probs = sorted_probs.masked_fill(mask, 0.0)
+            sorted_probs = sorted_probs / sorted_probs.sum()
+        next_local = torch.multinomial(sorted_probs, num_samples=1)
+        next_id = int(sorted_idx[next_local].item())
+        logp = float(torch.log(probs[next_id] + 1e-12).item())
+        return next_id, logp
+    next_id = int(torch.multinomial(probs, num_samples=1).item())
+    logp = float(torch.log(probs[next_id] + 1e-12).item())
+    return next_id, logp
+
+
 class HFGenerateEngine:
     """Fallback engine when vLLM cannot load a custom DFlash / Qwen3.5 checkpoint."""
 
@@ -2773,23 +2950,128 @@ class HFGenerateEngine:
     def _decode_ids(self, ids: List[int]) -> str:
         return self.tokenizer.decode(ids, skip_special_tokens=True)
 
-    def _prompt_logprobs_for_ids(self, input_ids: torch.Tensor) -> List[Optional[Dict[int, float]]]:
-        out: List[Optional[Dict[int, float]]] = [None]
-        if input_ids.shape[1] < 2:
-            return out
+    def _prompt_logprobs_for_ids(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        tail_count: Optional[int] = None,
+    ) -> List[Optional[Dict[int, float]]]:
+        """Target logprobs for prompt tokens. tail_count limits work to draft suffix."""
+        seq_len = int(input_ids.shape[1])
+        if seq_len < 2:
+            return [None]
+
         with torch.inference_mode():
             logits = self.model(input_ids).logits[0]
-        for pos in range(1, input_ids.shape[1]):
-            token_id = int(input_ids[0, pos].item())
-            logp = torch.log_softmax(logits[pos - 1], dim=-1)[token_id].item()
-            out.append({token_id: logp})
+
+        if tail_count is not None and HF_FAST_VERIFY:
+            tail_count = max(1, min(int(tail_count), seq_len - 1))
+            start_pos = seq_len - tail_count
+            log_probs = torch.log_softmax(logits[start_pos - 1 : seq_len - 1], dim=-1)
+            token_ids = input_ids[0, start_pos:seq_len]
+            gathered = log_probs.gather(1, token_ids.unsqueeze(1)).squeeze(1)
+            out: List[Optional[Dict[int, float]]] = [None] * start_pos
+            for i, tid in enumerate(token_ids.tolist()):
+                out.append({tid: float(gathered[i].item())})
+            return out
+
+        token_ids = input_ids[0, 1:seq_len]
+        log_probs = torch.log_softmax(logits[: seq_len - 1], dim=-1)
+        gathered = log_probs.gather(1, token_ids.unsqueeze(1)).squeeze(1)
+        out = [None]
+        for i, tid in enumerate(token_ids.tolist()):
+            out.append({tid: float(gathered[i].item())})
         return out
 
+    def _sample_ids_streaming(
+        self,
+        input_ids: torch.Tensor,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        *,
+        stream_label: str,
+    ) -> Tuple[List[int], List[Dict[int, float]]]:
+        """Token-by-token generation with live stdout streaming."""
+        global _STREAM_IN_THINKING
+        _STREAM_IN_THINKING = False
+        stream_begin(stream_label)
+
+        eos_ids = {
+            int(t)
+            for t in (
+                self.tokenizer.eos_token_id,
+                getattr(self.tokenizer, "eod_id", None),
+            )
+            if t is not None
+        }
+
+        new_ids: List[int] = []
+        step_logprobs: List[Dict[int, float]] = []
+        past: Any = None
+        cur = input_ids
+
+        for _step in range(int(max_tokens)):
+            with torch.inference_mode():
+                if past is None:
+                    outputs = self.model(cur, use_cache=True)
+                else:
+                    outputs = self.model(
+                        cur[:, -1:],
+                        past_key_values=past,
+                        use_cache=True,
+                    )
+            past = outputs.past_key_values
+            logits = outputs.logits[0, -1, :]
+
+            if temperature <= 0:
+                next_id = int(logits.argmax().item())
+                logp = float(
+                    torch.log_softmax(logits, dim=-1)[next_id].item()
+                )
+            else:
+                next_id, logp = _top_p_sample_logits(
+                    logits, temperature=temperature, top_p=top_p
+                )
+
+            new_ids.append(next_id)
+            step_logprobs.append({next_id: logp})
+
+            piece = self.tokenizer.decode([next_id], skip_special_tokens=False)
+            stream_emit(piece)
+
+            if next_id in eos_ids:
+                break
+
+            next_tensor = torch.tensor(
+                [[next_id]], device=cur.device, dtype=cur.dtype
+            )
+            cur = torch.cat([cur, next_tensor], dim=1)
+
+        stream_end(stream_label)
+        return new_ids, step_logprobs
+
     def _sample_ids(
-        self, input_ids: torch.Tensor, max_tokens: int, temperature: float, top_p: float
+        self,
+        input_ids: torch.Tensor,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        *,
+        stream_label: str = "GENERATE",
+        stream: bool = True,
     ) -> Tuple[List[int], List[Dict[int, float]]]:
         if input_ids.shape[1] == 0:
             raise ValueError("Refusing to generate from empty input_ids")
+
+        if STREAM_GENERATION and stream:
+            return self._sample_ids_streaming(
+                input_ids,
+                max_tokens,
+                temperature,
+                top_p,
+                stream_label=stream_label,
+            )
 
         pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0
         gen_kwargs: Dict[str, Any] = {
@@ -2838,21 +3120,56 @@ class HFGenerateEngine:
         else:
             sp_list = [sampling_params] * len(prompts)
 
-        for prompt, sp in zip(prompts, sp_list):
+        for batch_idx, (prompt, sp) in enumerate(zip(prompts, sp_list)):
             max_tokens = int(getattr(sp, "max_tokens", 0) or 0)
             temperature = float(getattr(sp, "temperature", 1.0) or 0.0)
             top_p = float(getattr(sp, "top_p", 1.0) or 1.0)
             want_prompt_logprobs = bool(getattr(sp, "prompt_logprobs", False))
+            verify_only = bool(getattr(sp, "verify_only", False))
+            verify_tail = getattr(sp, "verify_tail_tokens", None)
+            stream_label = _sampling_params_label(
+                sp, f"GENERATE[{batch_idx}]"
+            )
+
+            # HF verify: logprobs only — skip throwaway 1-token decode (vLLM uses max_tokens=1).
+            if want_prompt_logprobs and max_tokens <= 1:
+                max_tokens = 0
 
             input_ids = self._encode(prompt)
-            prompt_logprobs = (
-                self._prompt_logprobs_for_ids(input_ids) if want_prompt_logprobs else None
-            )
+            if (
+                STREAM_ALL_OUTPUT
+                and batch_idx == 0
+                and not verify_only
+            ):
+                preview = prompt[-240:] if len(prompt) > 240 else prompt
+                stream_log(
+                    f"[HF] prompt tail ({len(prompt)} chars): ...{preview}"
+                )
+            elif verify_only and STREAM_ALL_OUTPUT and batch_idx == 0:
+                stream_log(
+                    f"[HF] verify-only pass (tail_logprobs={verify_tail or 'full'}, "
+                    f"n_candidates={len(prompts)})"
+                )
+            prompt_logprobs = None
+            if want_prompt_logprobs:
+                tail_n = int(verify_tail) if verify_tail is not None else None
+                prompt_logprobs = self._prompt_logprobs_for_ids(
+                    input_ids, tail_count=tail_n
+                )
             if max_tokens <= 0:
                 results.append(_HFRequestOutput(outputs=[], prompt_logprobs=prompt_logprobs))
                 continue
+
+            do_stream = STREAM_GENERATION and not (
+                verify_only or (not STREAM_VERIFY_PASSES and want_prompt_logprobs)
+            )
             new_ids, step_logprobs = self._sample_ids(
-                input_ids, max_tokens=max_tokens, temperature=temperature, top_p=top_p
+                input_ids,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stream_label=stream_label,
+                stream=do_stream,
             )
             results.append(
                 _HFRequestOutput(
@@ -2956,6 +3273,7 @@ def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
         )
 
     sp = SamplingParams(temperature=0.0, max_tokens=1)
+    setattr(sp, "stream_label", "VERIFY-smoke")
     try:
         out = llm.generate([probe], sp)[0]
     except Exception as exc:
@@ -3303,37 +3621,85 @@ def load_arc_dataset(challenges_path: str, solutions_path: str) -> Dict[str, Any
     return {"challenges": challenges, "solutions": solutions}
 
 
+def _format_grid_ascii_compact(grid: List[List[int]]) -> str:
+    """Row-per-line digits (0-9) for readable ARC grids in prompts."""
+    if not grid:
+        return "(empty)"
+    return "\n".join(" ".join(str(c) for c in row) for row in grid)
+
+
 def format_arc_prompt(task_id: str, task: Dict[str, Any], test_index: int = 0) -> str:
     """Turn one ARC task into a text prompt with train demos + one test input."""
     lines = [
         f"ARC-AGI task {task_id}. Infer the grid transformation from the training pairs.",
-        "Output format: a single JSON 2D array of integers (cell colors 0-9 only).",
-        "Example: [[0,1,2],[3,4,5]]",
-        "Do not include markdown fences, explanations, or any text before/after the array.",
+        "Cell colors are integers 0-9. Output shape may differ from input shape.",
     ]
+    if ARC_STRUCTURED_THINKING and STREAM_PRINT_THINKING:
+        lines.extend(
+            [
+                "Inside <think>, reason in numbered steps. After each step emit exactly:",
+                "HYPOTHESIS_GRID: [[...]]  (partial or complete output grid; use best guess for unknown cells).",
+                "Update HYPOTHESIS_GRID every step as your rule hypothesis improves.",
+                "After </think>, output exactly one final JSON 2D array (no markdown, no extra text).",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "Output format: a single JSON 2D array of integers (cell colors 0-9 only).",
+                "Example: [[0,1,2],[3,4,5]]",
+                "Do not include markdown fences, explanations, or any text before/after the array.",
+            ]
+        )
     for i, example in enumerate(task.get("train", []), start=1):
-        lines.append(f"Train {i} input: {json.dumps(example['input'])}")
-        lines.append(f"Train {i} output: {json.dumps(example['output'])}")
+        inp, out = example["input"], example["output"]
+        lines.append(f"Train {i} input ({len(inp)}x{len(inp[0]) if inp else 0}):")
+        lines.append(_format_grid_ascii_compact(inp))
+        lines.append(f"Train {i} input JSON: {json.dumps(inp)}")
+        lines.append(f"Train {i} output ({len(out)}x{len(out[0]) if out else 0}):")
+        lines.append(_format_grid_ascii_compact(out))
+        lines.append(f"Train {i} output JSON: {json.dumps(out)}")
     test_inputs = task.get("test", [])
     if test_index >= len(test_inputs):
         raise IndexError(
             f"Task {task_id} has {len(test_inputs)} test inputs; requested index {test_index}."
         )
-    lines.append(f"Test input: {json.dumps(test_inputs[test_index]['input'])}")
+    test_inp = test_inputs[test_index]["input"]
+    lines.append(f"Test input ({len(test_inp)}x{len(test_inp[0]) if test_inp else 0}):")
+    lines.append(_format_grid_ascii_compact(test_inp))
+    lines.append(f"Test input JSON: {json.dumps(test_inp)}")
     lines.append("Test output JSON array:")
     return "\n".join(lines)
 
 
 def apply_arc_chat_prompt(tokenizer: Any, user_content: str) -> str:
     """Wrap ARC content with the model's chat template (required for Qwen3.5)."""
+    if STREAM_PRINT_THINKING:
+        if ARC_STRUCTURED_THINKING:
+            system_content = (
+                "You solve ARC-AGI grid puzzles. Inside <think>, use numbered steps. "
+                "After each step write HYPOTHESIS_GRID: followed by a JSON 2D array of "
+                "integers 0-9 (partial guesses allowed). Refine HYPOTHESIS_GRID each step. "
+                "Example inside think:\n"
+                "Step 1: Rows with color 8 form bands.\n"
+                "HYPOTHESIS_GRID: [[8,8],[8,0]]\n"
+                "Step 2: Fill band interiors with color 4.\n"
+                "HYPOTHESIS_GRID: [[8,8],[4,4]]\n"
+                "After </think> output exactly one final JSON 2D array. No markdown."
+            )
+        else:
+            system_content = (
+                "You solve ARC-AGI grid puzzles. Think step-by-step inside <think>...</think> "
+                "tags, then reply with exactly one JSON 2D array of integers (values 0-9). "
+                "No markdown fences."
+            )
+    else:
+        system_content = (
+            "You solve ARC-AGI grid puzzles. Reply with exactly one JSON 2D array "
+            "of integers (values 0-9). No markdown, no explanation."
+        )
     messages: List[Dict[str, str]] = [
-        {
-            "role": "system",
-            "content": (
-                "You solve ARC-AGI grid puzzles. Reply with exactly one JSON 2D array "
-                "of integers (values 0-9). No markdown, no explanation, no thinking."
-            ),
-        },
+        {"role": "system", "content": system_content},
         {"role": "user", "content": user_content},
     ]
     template_kwargs: Dict[str, Any] = {
@@ -3342,8 +3708,11 @@ def apply_arc_chat_prompt(tokenizer: Any, user_content: str) -> str:
     }
     if ARC_DISABLE_THINKING:
         template_kwargs["enable_thinking"] = False
-    if ARC_ASSISTANT_PREFILL:
-        messages.append({"role": "assistant", "content": ARC_ASSISTANT_PREFILL})
+    elif STREAM_PRINT_THINKING:
+        template_kwargs["enable_thinking"] = True
+    prefill = ARC_ASSISTANT_PREFILL if not STREAM_PRINT_THINKING else ""
+    if prefill:
+        messages.append({"role": "assistant", "content": prefill})
         template_kwargs["add_generation_prompt"] = False
         template_kwargs["continue_final_message"] = True
 
@@ -3504,6 +3873,206 @@ def _parse_grid_from_row_pattern(text: str) -> Optional[List[List[int]]]:
     return rows if rows else None
 
 
+HYPOTHESIS_GRID_MARKER = "HYPOTHESIS_GRID"
+
+
+def _extract_thinking_content(text: str) -> str:
+    """Return content inside the last <think> block (handles unclosed blocks)."""
+    if not text:
+        return ""
+    lower = text.lower()
+    start_tag = "<think>"
+    end_tag = "</think>"
+    start = lower.rfind(start_tag)
+    if start < 0:
+        return ""
+    start += len(start_tag)
+    end = lower.find(end_tag, start)
+    if end < 0:
+        return text[start:]
+    return text[start:end]
+
+
+def _parse_grid_from_fragment(fragment: str) -> Tuple[Optional[List[List[int]]], str]:
+    """Parse the best valid or repaired grid from a text fragment."""
+    if not fragment:
+        return None, ""
+    seen_raw: set = set()
+    best: Optional[Tuple[int, List[List[int]], str]] = None
+    for variant in _grid_attempt_text_variants(fragment):
+        for anchor in re.finditer(r"\[\[", variant):
+            raw = _balanced_bracket_span_at(variant, anchor.start())
+            if not raw or raw in seen_raw:
+                continue
+            seen_raw.add(raw)
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if _is_valid_arc_grid(parsed):
+                best = (anchor.start(), parsed, raw)
+        for raw in _balanced_bracket_spans(variant):
+            if raw in seen_raw:
+                continue
+            seen_raw.add(raw)
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if _is_valid_arc_grid(parsed):
+                pos = variant.rfind(raw)
+                if best is None or pos >= best[0]:
+                    best = (pos, parsed, raw)
+        row_grid = _parse_grid_from_row_pattern(variant)
+        if row_grid is not None:
+            return row_grid, json.dumps(row_grid, separators=(",", ":"))
+    if best is not None:
+        return best[1], best[2]
+    repaired = _repair_truncated_json_array(fragment[fragment.rfind("[[") :] if "[[" in fragment else fragment)
+    if repaired:
+        try:
+            parsed = json.loads(repaired)
+            if _is_valid_arc_grid(parsed):
+                return parsed, repaired
+        except json.JSONDecodeError:
+            pass
+    return None, fragment.strip()[:120]
+
+
+def parse_hypothesis_grid_from_thinking(
+    text: str,
+) -> Tuple[Optional[List[List[int]]], str, int]:
+    """
+    Extract the latest partial output grid from structured thinking.
+    Returns (grid_or_none, raw_fragment, step_count).
+    """
+    thinking = _extract_thinking_content(text)
+    search_space = thinking if thinking else text
+    markers = list(
+        re.finditer(r"HYPOTHESIS_GRID\s*:", search_space, flags=re.IGNORECASE)
+    )
+    step_count = len(markers)
+    if markers:
+        fragment = search_space[markers[-1].end() :]
+        grid, raw = _parse_grid_from_fragment(fragment)
+        if grid is not None:
+            return grid, raw, step_count
+    if thinking:
+        grid, raw = _parse_grid_from_fragment(thinking)
+        if grid is not None:
+            return grid, raw, max(step_count, 1)
+    return None, search_space.strip()[-120:], step_count
+
+
+def is_degenerate_arc_token_run(decoded_text: str) -> bool:
+    """True when a decoded super-block adds no puzzle content (think-tag spam)."""
+    if not decoded_text or not decoded_text.strip():
+        return True
+    cleaned = decoded_text.strip()
+    stripped = re.sub(r"</?think>", "", cleaned, flags=re.IGNORECASE)
+    stripped = stripped.replace("<|im_end|>", "").strip()
+    if not stripped:
+        return True
+    if re.fullmatch(r"[\s,]+", stripped):
+        return True
+    if re.fullmatch(r"</think>", stripped, flags=re.IGNORECASE):
+        return True
+    if ARC_STRUCTURED_THINKING and HYPOTHESIS_GRID_MARKER.lower() not in stripped.lower():
+        if not re.search(r"\d", stripped) and "[" not in stripped:
+            return True
+    return False
+
+
+def _grid_shape_label(grid: Optional[List[List[int]]]) -> str:
+    if not grid:
+        return "—"
+    h = len(grid)
+    w = len(grid[0]) if grid and grid[0] else 0
+    return f"{h}x{w}"
+
+
+def _assistant_suffix(full_text: str, prompt: str) -> str:
+    if full_text.startswith(prompt):
+        return full_text[len(prompt) :]
+    return full_text
+
+
+def print_mbr_slot_inference_state(
+    *,
+    sb: int,
+    phase: str,
+    slot_i: Optional[int],
+    feature_name: str,
+    test_input: Optional[List[List[int]]],
+    gold: Optional[List[List[int]]],
+    assistant_suffix: str,
+    task_id: str = "",
+) -> None:
+    """Print full ASCII matrices for test input, gold, and current hypothesis."""
+    if not ARC_PRINT_STEP_MATRICES:
+        return
+    hyp_grid, hyp_raw, step_n = parse_hypothesis_grid_from_thinking(assistant_suffix)
+    slot_part = f"slot={slot_i} " if slot_i is not None else ""
+    header = (
+        f"[MBR-MATRIX] sb={sb:02d} phase={phase} {slot_part}"
+        f"{feature_name}"
+    )
+    if task_id:
+        header += f" task={task_id}"
+    if step_n:
+        header += f" hypothesis_step={step_n}"
+    stream_log(header)
+
+    blocks: List[List[str]] = []
+    if test_input:
+        blocks.append(
+            _render_grid_ascii(
+                test_input,
+                title=f"TEST INPUT ({_grid_shape_label(test_input)})",
+            )
+        )
+    if gold:
+        blocks.append(
+            _render_grid_ascii(gold, title=f"GOLD ({_grid_shape_label(gold)})")
+        )
+    if hyp_grid is not None:
+        diff_title = f"HYPOTHESIS ({_grid_shape_label(hyp_grid)})"
+        if gold:
+            blocks.append(
+                _render_grid_ascii(
+                    hyp_grid,
+                    title=diff_title,
+                    diff_against=gold,
+                    pred_for_diff=hyp_grid,
+                )
+            )
+        else:
+            blocks.append(_render_grid_ascii(hyp_grid, title=diff_title))
+    else:
+        blocks.append(
+            [
+                "HYPOTHESIS (unparsed)",
+                f"  tail: {hyp_raw!r}",
+            ]
+        )
+    for line in _align_grid_columns(blocks):
+        stream_log("  " + line)
+
+
+def parse_arc_answer_grid(text: str) -> Optional[List[List[int]]]:
+    """Prefer final grid after </think>; else latest HYPOTHESIS_GRID in thinking."""
+    cleaned = _strip_model_artifacts(text or "")
+    post_think = cleaned
+    if "</think>" in (text or "").lower():
+        post_think = re.split(r"</think>", text, flags=re.IGNORECASE)[-1]
+        post_think = _strip_model_artifacts(post_think)
+    final = parse_grid_from_text(post_think, only_after=None)
+    if final is not None:
+        return final
+    hyp, _, _ = parse_hypothesis_grid_from_thinking(text or "")
+    return hyp
+
+
 def extract_arc_generated_suffix(result: Dict[str, Any], prompt: str) -> str:
     """Return only model-new text (exclude the prompt prefix)."""
     if result.get("generated_text"):
@@ -3539,6 +4108,12 @@ def arc_direct_generate(
         top_p=1.0,
         max_tokens=int(max_new_tokens),
     )
+    setattr(sp, "stream_label", "ARC-CLASSIC")
+    if STREAM_ALL_OUTPUT:
+        stream_log(
+            f"[ARC] direct generate begin (max_new_tokens={max_new_tokens}, "
+            f"temp={temperature}, thinking={STREAM_PRINT_THINKING})"
+        )
     out = vllm_llm.generate([prompt], sp)[0]
     gen_ids: List[int] = []
     if out.outputs:
@@ -3559,7 +4134,7 @@ def arc_direct_generate(
         "generation_mode": "direct",
     }
     gen_suffix = extract_arc_generated_suffix(result, prompt)
-    parsed_grid = parse_grid_from_text(gen_suffix, only_after=None)
+    parsed_grid = parse_arc_answer_grid(gen_suffix)
     if parsed_grid is not None:
         result["parsed_grid"] = parsed_grid
         result["generated_text"] = json.dumps(parsed_grid, separators=(",", ":"))
@@ -4311,7 +4886,16 @@ def evaluate_arc_dataset(
     solutions = dataset["solutions"]
 
     task_ids = sorted(challenges.keys())
-    if max_tasks is not None:
+    if EVAL_SMOKE_TASK_ID:
+        if EVAL_SMOKE_TASK_ID in challenges:
+            task_ids = [EVAL_SMOKE_TASK_ID]
+        else:
+            print(
+                f"[ARC] EVAL_SMOKE_TASK_ID={EVAL_SMOKE_TASK_ID!r} not in challenges; "
+                "running zero tasks."
+            )
+            task_ids = []
+    elif max_tasks is not None:
         task_ids = task_ids[: max(0, int(max_tasks))]
 
     print("\n" + "=" * 80)
@@ -4324,6 +4908,11 @@ def evaluate_arc_dataset(
     print(f"Visual grading: {visual_grading} (save images: {ARC_SAVE_GRADE_IMAGES})")
     print(f"Print all answers vs gold: {ARC_PRINT_ALL_ANSWERS}")
     print(f"ARC eval verbose (MBR internals): {ARC_EVAL_VERBOSE}")
+    print(f"Stream generation: {STREAM_GENERATION} | stream all: {STREAM_ALL_OUTPUT}")
+    print(f"Stream thinking: {STREAM_PRINT_THINKING} | disable_thinking={ARC_DISABLE_THINKING}")
+    print(f"Structured thinking: {ARC_STRUCTURED_THINKING} | step matrices: {ARC_PRINT_STEP_MATRICES}")
+    if EVAL_SMOKE_TASK_ID:
+        print(f"Smoke task only: {EVAL_SMOKE_TASK_ID}")
     print(
         f"ARC generation mode: {ARC_EVAL_GENERATION_MODE} "
         f"(chat_template={ARC_USE_CHAT_TEMPLATE}, temp={ARC_GENERATION_TEMPERATURE})"
@@ -4392,8 +4981,19 @@ def evaluate_arc_dataset(
             summary["classic"]["tests"] += 1
 
             classic_answer_text = extract_arc_generated_suffix(classic_res, prompt)
-            classic_pred = parse_grid_from_text(classic_answer_text, only_after=None)
+            classic_pred = parse_arc_answer_grid(classic_answer_text)
             classic_stats_early = grid_cell_stats(classic_pred, gold)
+            if ARC_PRINT_STEP_MATRICES:
+                print_mbr_slot_inference_state(
+                    sb=0,
+                    phase="classic",
+                    slot_i=None,
+                    feature_name="DirectGenerate",
+                    test_input=test_input,
+                    gold=gold,
+                    assistant_suffix=classic_answer_text,
+                    task_id=task_id,
+                )
 
             if ARC_PRINT_ALL_ANSWERS:
                 print_arc_classic_interim(
@@ -4425,14 +5025,19 @@ def evaluate_arc_dataset(
                     allocator=allocator,
                     enable_reallocation=enable_reallocation,
                     seed=seed + test_index,
-                    verbose=ARC_EVAL_VERBOSE,
+                    verbose=ARC_EVAL_VERBOSE or STREAM_ALL_OUTPUT,
+                    arc_context={
+                        "task_id": task_id,
+                        "test_input": test_input,
+                        "gold": gold,
+                    },
                 )
                 mbr_elapsed = time.perf_counter() - t0
                 mbr_timing = generation_timing_stats(mbr_elapsed, mbr_res["num_tokens"])
                 summary["mbr"]["time"] += mbr_elapsed
                 summary["mbr"]["tokens"] += mbr_res["num_tokens"]
                 mbr_answer_text = extract_arc_generated_suffix(mbr_res, prompt)
-                mbr_pred = parse_grid_from_text(mbr_answer_text, only_after=None)
+                mbr_pred = parse_arc_answer_grid(mbr_answer_text)
                 arc_eval_log(
                     f"[ARC] <<< task {task_idx + 1}/{len(task_ids)} {task_id} "
                     f"test#{test_index} — MBR done | {format_timing_line(mbr_timing)}"
