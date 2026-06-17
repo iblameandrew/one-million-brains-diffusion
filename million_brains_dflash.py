@@ -198,7 +198,7 @@ elif not _MBR_WORKER_SUBPROCESS:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-18b"  # voter worker stdout protocol fix (Kaggle debugpy noise)
+SCRIPT_VERSION = "2026-06-18m"  # spatial prompt fit uses full chat wrap (not body-only)
 K = 4  # benchmark / token-speculative super-block width (not ARC hypothesis count)
 ARC_HYPOTHESIS_SLOTS = 8  # ARC eval: batched hypothesis proposals per engine (vLLM shows N/N)
 NUM_PERSONALITY_FEATURES = 12  # spatial primitive bank size (legacy name for allocator)
@@ -324,9 +324,17 @@ ARC_FINAL_ENABLE_THINKING = False  # final grid: [[ prefill + greedy JSON (much 
 # Multi-agent layer: N independent Qwen instances (1 per GPU, round-robin) + plurality vote on final grid.
 ARC_MULTI_AGENT_ENABLED = True  # plurality vote across N independent Qwen workers
 ARC_MULTI_AGENT_REQUIRED = True  # ARC eval: never silently fall back to single engine
-ARC_MULTI_AGENT_N = 8  # 2 per L4 when 4 GPUs visible (round-robin agent_id % n_gpus)
+ARC_MULTI_AGENT_N = 4  # 1/GPU on 4x L4 (5+ shares VRAM → KV OOM); raise only with 18i worker caps
 ARC_MULTI_AGENT_DISABLE_SPECULATIVE = True  # base-only per agent — spec+draft OOMs at 2 engines/GPU
 ARC_MULTI_AGENT_GPU_UTIL = 0.0  # 0 = auto (~0.88 / ceil(N / num_gpus)) per engine
+ARC_WORKER_VLLM_MAX_MODEL_LEN = 10240  # 30x30 terse prompts need ~9600 tok (8192 too small)
+ARC_WORKER_VLLM_GPU_UTIL_CAP = 0.70  # headroom for KV at 8k ctx (0.88 OOMs)
+ARC_WORKER_VLLM_MAX_NUM_SEQS = 2  # vLLM default ~128 seq slots exhaust KV on 22GB L4
+ARC_WORKER_VLLM_SHARED_MAX_MODEL_LEN = 4096  # wave-1+ engines sharing a GPU with wave-0
+ARC_WORKER_VLLM_FAST_LOAD = True  # voter subprocesses: 1-2 vLLM attempts, enforce_eager=True
+ARC_WORKER_LOAD_GPU_WAVES = True  # one vLLM load per GPU at a time (wave 0..N)
+ARC_VOTER_INFER_GPU_WAVES = True  # inference: one active voter per GPU at a time
+ARC_SPATIAL_SEQUENTIAL_SLOTS_WHEN_SHARED_GPU = True  # Phase-1: 1 slot/generate when 2 engines/GPU
 ARC_MULTI_AGENT_VOTE = "plurality"  # plurality = most common parsed grid; ties -> lowest agent id
 MBR_WORKER_SCRIPT_PATH = None  # None = auto; set e.g. /kaggle/working/million_brains_dflash.py in notebooks
 ARC_CHAT_TEMPLATE_SLACK = 2048  # system + chat template overhead beyond raw task body
@@ -1832,7 +1840,7 @@ class MillionBrainsDFlashDraftModel:  # type: ignore
 if ENABLE_DFLASH_LIVE_PATCH and not _MBR_WORKER_SUBPROCESS:
     _LIVE_PATCH_SUCCESS = _live_edit_dflash()
 else:
-    _LIVE_PATCH_SUCCESS = False
+    _LIVE_PATCH_SUCCESS = not ENABLE_DFLASH_LIVE_PATCH
     if not _MBR_WORKER_SUBPROCESS:
         print(
             "[CONFIG] ENABLE_DFLASH_LIVE_PATCH=False — stock vLLM generation "
@@ -3250,6 +3258,57 @@ def _build_vllm_attempts(
     return spec_attempts, fallback_attempts
 
 
+def _build_vllm_worker_fast_attempts(
+    model_path: str,
+    gpu_memory_utilization: float,
+) -> List[Dict[str, Any]]:
+    """
+    Minimal vLLM load grid for voter subprocesses.
+    Avoids the 40+ attempt loop (max_model_len=22272 first) that can stall 30+ minutes.
+    """
+    util = _adaptive_vllm_gpu_util(float(gpu_memory_utilization), speculative=False)
+    env_cap = int(os.environ.get("MBR_WORKER_MAX_MODEL_LEN", "0") or 0)
+    worker_cap = (
+        env_cap
+        if env_cap > 0
+        else (
+            int(ARC_WORKER_VLLM_MAX_MODEL_LEN)
+            if int(ARC_WORKER_VLLM_MAX_MODEL_LEN) > 0
+            else 8192
+        )
+    )
+    max_len = int(worker_cap)
+    cap = float(ARC_WORKER_VLLM_GPU_UTIL_CAP)
+    if cap > 0:
+        util = min(util, cap)
+    engine_extras = _vllm_engine_extra_kwargs(model_path)
+    max_num_seqs = max(1, int(ARC_WORKER_VLLM_MAX_NUM_SEQS))
+    common: Dict[str, Any] = {
+        "model": model_path,
+        "trust_remote_code": True,
+        "dtype": "auto",
+        "tensor_parallel_size": 1,
+        "enforce_eager": True,
+        "runner": VLLM_RUNNER,
+        "max_num_seqs": max_num_seqs,
+        "max_num_batched_tokens": min(max_len, 4096),
+        **engine_extras,
+    }
+    attempts = [
+        {**common, "max_model_len": max_len, "gpu_memory_utilization": util},
+    ]
+    for fallback_len in (9728, 8192):
+        if max_len > fallback_len:
+            attempts.append(
+                {
+                    **common,
+                    "max_model_len": fallback_len,
+                    "gpu_memory_utilization": max(0.32, util - 0.06),
+                }
+            )
+    return attempts
+
+
 @dataclass
 class _HFCompletionOutput:
     token_ids: List[int]
@@ -3657,15 +3716,31 @@ def create_inference_engine(
             local_only=local_only,
         )
 
-    spec_attempts, fallback_attempts = _build_vllm_attempts(
-        gen_path, gpu_mem, dflash_draft_path=draft_path
-    )
-    want_spec = bool(draft_path and ENABLE_VLLM_SPECULATIVE_DECODING and spec_attempts)
-    phases: List[Tuple[str, List[Dict[str, Any]]]] = []
-    if spec_attempts:
-        phases.append(("speculative", spec_attempts))
-    if fallback_attempts:
-        phases.append(("base-only", fallback_attempts))
+    if _MBR_WORKER_SUBPROCESS and ARC_WORKER_VLLM_FAST_LOAD:
+        worker_attempts = _build_vllm_worker_fast_attempts(gen_path, gpu_mem)
+        spec_attempts: List[Dict[str, Any]] = []
+        fallback_attempts = worker_attempts
+        phases = [("worker-fast", worker_attempts)]
+        want_spec = False
+        print(
+            f"[LOAD] Worker fast vLLM load: {len(worker_attempts)} attempt(s), "
+            f"max_model_len<={worker_attempts[0].get('max_model_len')}, "
+            f"max_num_seqs={worker_attempts[0].get('max_num_seqs')}, "
+            f"gpu_util={worker_attempts[0].get('gpu_memory_utilization')}",
+            flush=True,
+        )
+    else:
+        spec_attempts, fallback_attempts = _build_vllm_attempts(
+            gen_path, gpu_mem, dflash_draft_path=draft_path
+        )
+        want_spec = bool(
+            draft_path and ENABLE_VLLM_SPECULATIVE_DECODING and spec_attempts
+        )
+        phases = []
+        if spec_attempts:
+            phases.append(("speculative", spec_attempts))
+        if fallback_attempts:
+            phases.append(("base-only", fallback_attempts))
     total_attempts = sum(len(batch) for _, batch in phases)
 
     last_err: Optional[BaseException] = None
@@ -4286,6 +4361,46 @@ def arc_final_grid_max_tokens(task: Dict[str, Any]) -> int:
     return min(ceiling, max(floor, need))
 
 
+def arc_spatial_slot_max_tokens(task: Dict[str, Any], test_index: int = 0) -> int:
+    """Per-slot output budget for spatial Phase-1 (one JSON grid, not full final-pass budget)."""
+    est = 256
+    for ex in task.get("train", []):
+        out = ex.get("output") or []
+        if out:
+            est = max(est, _estimate_grid_json_tokens(out))
+    tests = task.get("test") or []
+    if test_index < len(tests):
+        inp = (tests[test_index].get("input") or [])
+        if inp and not any(ex.get("output") for ex in task.get("train", [])):
+            est = max(est, _estimate_grid_json_tokens(inp))
+    est = min(est + 128, 2048)
+    return min(est, arc_hypothesis_max_tokens(task))
+
+
+def _arc_task_with_train_limit(task: Dict[str, Any], n_train: int) -> Dict[str, Any]:
+    train = list(task.get("train") or [])
+    n_keep = max(0, min(int(n_train), len(train)))
+    return {**task, "train": train[:n_keep]}
+
+
+def format_arc_task_body_minimal(
+    task_id: str,
+    task: Dict[str, Any],
+    test_index: int = 0,
+) -> str:
+    """Test input only — last resort when full train context exceeds vLLM ctx."""
+    tests = task.get("test") or []
+    if test_index >= len(tests):
+        raise IndexError(f"test_index {test_index} out of range for {task_id}")
+    test_inp = tests[test_index]["input"]
+    n_train = len(task.get("train") or [])
+    sh = f"{len(test_inp)}x{len(test_inp[0]) if test_inp else 0}"
+    return (
+        f"ARC {task_id} ({n_train} train pairs omitted). "
+        f"Test input {sh}: {_format_grid_minified_json(test_inp)}"
+    )
+
+
 def arc_hypothesis_k() -> int:
     """Parallel hypothesis proposals per MBR engine (independent of benchmark K=4)."""
     return max(1, min(int(ARC_HYPOTHESIS_SLOTS), NUM_PERSONALITY_FEATURES))
@@ -4364,7 +4479,28 @@ def format_arc_task_body(
     def _fmt_grid(grid: List[List[int]]) -> str:
         if grid_format in ("minified", "terse"):
             return _format_grid_minified_json(grid)
+        if grid_format == "rows":
+            return ";".join(" ".join(str(c) for c in row) for row in grid)
         return _format_grid_ascii_compact(grid)
+
+    if grid_format == "rows":
+        lines = [f"ARC {task_id} colors0-9 rows=semicolon cols=space"]
+        for i, example in enumerate(task.get("train", []), start=1):
+            inp, out = example["input"], example["output"]
+            in_shape = f"{len(inp)}x{len(inp[0]) if inp else 0}"
+            out_shape = f"{len(out)}x{len(out[0]) if out else 0}"
+            lines.append(f"T{i}i{in_shape}:{_fmt_grid(inp)}")
+            lines.append(f"T{i}o{out_shape}:{_fmt_grid(out)}")
+        test_inputs = task.get("test", [])
+        if test_index >= len(test_inputs):
+            raise IndexError(
+                f"Task {task_id} has {len(test_inputs)} test inputs; "
+                f"requested index {test_index}."
+            )
+        test_inp = test_inputs[test_index]["input"]
+        test_shape = f"{len(test_inp)}x{len(test_inp[0]) if test_inp else 0}"
+        lines.append(f"Xi{test_shape}:{_fmt_grid(test_inp)}")
+        return "\n".join(lines)
 
     if grid_format == "terse":
         lines = [f"ARC {task_id} colors0-9"]
@@ -4432,8 +4568,8 @@ def resolve_arc_task_body(
     Returns (body_text, token_count, format_label).
     """
     formats = (
-        ("minified", "terse", "ascii")
-        if ARC_FAST_INFERENCE
+        ("terse", "minified", "ascii")
+        if ARC_FAST_INFERENCE or _MBR_WORKER_SUBPROCESS
         else ("ascii", "minified", "terse")
     )
     best_body = ""
@@ -4447,7 +4583,94 @@ def resolve_arc_task_body(
         best_body, best_tok, best_fmt = body, n_tok, fmt
         if max_prompt_tokens is None or n_tok <= max_prompt_tokens:
             return body, n_tok, fmt
+    minimal = format_arc_task_body_minimal(task_id, task, test_index)
+    n_min = count_prompt_tokens(tokenizer, minimal)
+    if max_prompt_tokens is None or n_min <= max_prompt_tokens:
+        return minimal, n_min, "minimal"
+    if n_min < best_tok:
+        return minimal, n_min, "minimal"
     return best_body, best_tok, best_fmt
+
+
+def resolve_arc_spatial_task_body(
+    tokenizer: Any,
+    task_id: str,
+    task: Dict[str, Any],
+    test_index: int,
+    primitive_name: str,
+    *,
+    system_content: str,
+    engine_ctx: int,
+    slot_max_tokens: int,
+    enable_thinking: bool,
+) -> Tuple[str, str, int, str]:
+    """
+    Pick task-body encoding so the full spatial-slot chat prompt fits
+    engine_ctx minus slot output budget (body-only caps miss ~1-2k template overhead).
+    """
+    max_input = max(256, int(engine_ctx) - int(slot_max_tokens) - 32)
+    systems = [system_content]
+    if ARC_FAST_INFERENCE:
+        systems.append(
+            "ARC spatial solver. Output one JSON 2D int array (0-9). No prose."
+        )
+    formats = (
+        ("rows", "terse", "minified", "ascii")
+        if ARC_FAST_INFERENCE or _MBR_WORKER_SUBPROCESS
+        else ("ascii", "minified", "terse", "rows")
+    )
+    best: Tuple[str, str, int, str] = ("", system_content, 10**9, "minified")
+
+    for sys_msg in systems:
+        for fmt in formats:
+            body = format_arc_task_body(
+                task_id, task, test_index=test_index, grid_format=fmt
+            )
+            user_content = build_spatial_grid_user_content(
+                task_id,
+                task,
+                test_index,
+                primitive_name,
+                task_body=body,
+                compact=ARC_FAST_INFERENCE,
+            )
+            prompt = _wrap_arc_chat_prompt(
+                tokenizer,
+                user_content,
+                system_content=sys_msg,
+                enable_thinking=enable_thinking,
+                assistant_prefill=ARC_ASSISTANT_PREFILL,
+            )
+            n_tok = count_prompt_tokens(tokenizer, prompt)
+            if n_tok < best[2]:
+                best = (body, sys_msg, n_tok, fmt)
+            if n_tok <= max_input:
+                return body, sys_msg, n_tok, fmt
+
+    for sys_msg in systems:
+        minimal = format_arc_task_body_minimal(task_id, task, test_index)
+        user_content = build_spatial_grid_user_content(
+            task_id,
+            task,
+            test_index,
+            primitive_name,
+            task_body=minimal,
+            compact=ARC_FAST_INFERENCE,
+        )
+        prompt = _wrap_arc_chat_prompt(
+            tokenizer,
+            user_content,
+            system_content=sys_msg,
+            enable_thinking=enable_thinking,
+            assistant_prefill=ARC_ASSISTANT_PREFILL,
+        )
+        n_tok = count_prompt_tokens(tokenizer, prompt)
+        if n_tok < best[2]:
+            best = (minimal, sys_msg, n_tok, "minimal")
+        if n_tok <= max_input:
+            return minimal, sys_msg, n_tok, "minimal"
+
+    return best[0], best[1], best[2], best[3]
 
 
 def _wrap_arc_chat_prompt(
@@ -4487,8 +4710,8 @@ def resolve_arc_hypothesis_bundle(
     """
     max_input = engine_ctx - int(max_output_tokens) - 32
     formats = (
-        ("minified", "terse", "ascii")
-        if ARC_FAST_INFERENCE
+        ("terse", "minified", "ascii")
+        if ARC_FAST_INFERENCE or _MBR_WORKER_SUBPROCESS
         else ("ascii", "minified", "terse")
     )
     systems = [system_content]
@@ -4641,9 +4864,19 @@ def _arc_json_grid_schema() -> Dict[str, Any]:
     }
 
 
+def _arc_guided_json_enabled() -> bool:
+    if os.environ.get("MBR_AGENT_WORKER") == "1":
+        return os.environ.get("ARC_GUIDED_JSON_DECODING", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+    return bool(ARC_GUIDED_JSON_DECODING)
+
+
 def _apply_arc_guided_decoding(sp: Any) -> Any:
     """Step 3: attach vLLM guided JSON decoding when available (Outlines/xgrammar)."""
-    if not ARC_GUIDED_JSON_DECODING:
+    if not _arc_guided_json_enabled():
         return sp
     try:
         from vllm.sampling_params import GuidedDecodingParams
@@ -5555,79 +5788,136 @@ def collect_spatial_grid_hypotheses(
 
     hypotheses: List[Dict[str, Any]] = []
     engine_ctx = get_inference_max_context(vllm_llm)
-    slot_max_tokens = arc_final_grid_max_tokens(task)
+    slot_max_tokens = arc_spatial_slot_max_tokens(task, test_index)
     probe_primitive = feature_names[0] if feature_names else SPATIAL_PRIMITIVES[0]
-    task_body, system_used, probe_tok, body_fmt = resolve_arc_hypothesis_bundle(
-        tokenizer,
-        task_id,
-        task,
-        test_index,
-        probe_primitive,
-        system_content=system_content,
-        engine_ctx=engine_ctx,
-        max_output_tokens=int(slot_max_tokens),
-        enable_thinking=grid_thinking,
-    )
+    task_body = ""
+    system_used = system_content
+    body_fmt = "minified"
 
     prompts: List[str] = []
     sp_list: List[Any] = []
     slot_meta: List[Tuple[int, str, Dict[str, Any]]] = []
-    max_needed = 0
+    max_needed = engine_ctx + 1
+    task_for_prompt = task
+    n_train_full = len(task.get("train") or [])
+    train_limits = [n_train_full] + [
+        n for n in (3, 2, 1, 0) if n < n_train_full
+    ]
+    fitted = False
+    shrink_note = ""
 
-    for slot_i in range(k):
-        prim = feature_names[slot_i] if slot_i < len(feature_names) else f"slot{slot_i}"
-        params = (
-            feature_params[slot_i]
-            if slot_i < len(feature_params)
-            else FEATURE_PARAMS[SPATIAL_PRIMITIVES[0]]
-        )
-        user_content = build_spatial_grid_user_content(
-            task_id,
-            task,
-            test_index,
-            prim,
-            task_body=task_body,
-            compact=ARC_FAST_INFERENCE,
-        )
-        prompt = _wrap_arc_chat_prompt(
-            tokenizer,
-            user_content,
-            system_content=system_used,
-            enable_thinking=grid_thinking,
-            assistant_prefill=ARC_ASSISTANT_PREFILL,
-        )
-        sp = SamplingParams(
-            temperature=float(ARC_GENERATION_TEMPERATURE),
-            top_p=float(params.get("top_p", 1.0)),
-            max_tokens=int(slot_max_tokens),
-            repetition_penalty=float(params.get("repetition_penalty", 1.02)),
-        )
-        sp = _apply_arc_guided_decoding(sp)
-        setattr(sp, "stream_label", f"ARC-spatial/slot{slot_i}/{prim}")
-        prompts.append(prompt)
-        sp_list.append(sp)
-        slot_meta.append((slot_i, prim, params))
-        n_in = count_prompt_tokens(tokenizer, prompt)
-        max_needed = max(max_needed, n_in + int(slot_max_tokens))
+    for n_train in train_limits:
+        task_for_prompt = _arc_task_with_train_limit(task, n_train)
+        slot_max_tokens = arc_spatial_slot_max_tokens(task_for_prompt, test_index)
+        for _shrink in range(10):
+            task_body, system_used, _probe_tok, body_fmt = (
+                resolve_arc_spatial_task_body(
+                    tokenizer,
+                    task_id,
+                    task_for_prompt,
+                    test_index,
+                    probe_primitive,
+                    system_content=system_content,
+                    engine_ctx=engine_ctx,
+                    slot_max_tokens=slot_max_tokens,
+                    enable_thinking=grid_thinking,
+                )
+            )
+            prompts = []
+            sp_list = []
+            slot_meta = []
+            max_needed = 0
+            for slot_i in range(k):
+                prim = (
+                    feature_names[slot_i]
+                    if slot_i < len(feature_names)
+                    else f"slot{slot_i}"
+                )
+                params = (
+                    feature_params[slot_i]
+                    if slot_i < len(feature_params)
+                    else FEATURE_PARAMS[SPATIAL_PRIMITIVES[0]]
+                )
+                user_content = build_spatial_grid_user_content(
+                    task_id,
+                    task_for_prompt,
+                    test_index,
+                    prim,
+                    task_body=task_body,
+                    compact=ARC_FAST_INFERENCE,
+                )
+                prompt = _wrap_arc_chat_prompt(
+                    tokenizer,
+                    user_content,
+                    system_content=system_used,
+                    enable_thinking=grid_thinking,
+                    assistant_prefill=ARC_ASSISTANT_PREFILL,
+                )
+                sp = SamplingParams(
+                    temperature=float(ARC_GENERATION_TEMPERATURE),
+                    top_p=float(params.get("top_p", 1.0)),
+                    max_tokens=int(slot_max_tokens),
+                    repetition_penalty=float(params.get("repetition_penalty", 1.02)),
+                )
+                sp = _apply_arc_guided_decoding(sp)
+                setattr(sp, "stream_label", f"ARC-spatial/slot{slot_i}/{prim}")
+                prompts.append(prompt)
+                sp_list.append(sp)
+                slot_meta.append((slot_i, prim, params))
+                n_in = count_prompt_tokens(tokenizer, prompt)
+                max_needed = max(max_needed, n_in + int(slot_max_tokens))
+            if max_needed <= engine_ctx:
+                fitted = True
+                if n_train < n_train_full:
+                    shrink_note = f"train_pairs={n_train}/{n_train_full}"
+                if _shrink > 0:
+                    shrink_note = (
+                        f"{shrink_note} slot_max={slot_max_tokens}".strip()
+                    )
+                if body_fmt == "minimal":
+                    shrink_note = f"{shrink_note} body=minimal".strip()
+                break
+            slot_max_tokens = max(128, int(slot_max_tokens * 0.68))
+        if fitted:
+            break
 
-    if max_needed > engine_ctx:
+    if not fitted:
         need_ctx = int(math.ceil(max_needed / 256.0) * 256)
         raise ValueError(
-            f"ARC spatial grid batch needs {max_needed} tokens but vLLM "
-            f"max_model_len={engine_ctx}. Set VLLM_MAX_MODEL_LEN={need_ctx}."
+            f"ARC spatial grid needs {max_needed} tokens but vLLM "
+            f"max_model_len={engine_ctx}. Set VLLM_MAX_MODEL_LEN={need_ctx} "
+            f"or raise ARC_WORKER_VLLM_MAX_MODEL_LEN."
+        )
+    if shrink_note:
+        arc_eval_log(
+            f"[ARC-PHASE-1] Prompt budget fit: {shrink_note} "
+            f"(need={max_needed}/{engine_ctx})"
         )
 
     total_prompt_tok = sum(count_prompt_tokens(tokenizer, p) for p in prompts)
+    engines_per_gpu = int(os.environ.get("MBR_ENGINES_PER_GPU", "1") or 1)
+    sequential_slots = (
+        _MBR_WORKER_SUBPROCESS
+        or (
+            ARC_SPATIAL_SEQUENTIAL_SLOTS_WHEN_SHARED_GPU and engines_per_gpu > 1
+        )
+    )
+    slot_batch = 1 if sequential_slots else k
     arc_eval_log(
         f"[ARC-PHASE-1] Spatial grid pool: {k} JSON grid hypotheses "
-        f"(primitives, guided={ARC_GUIDED_JSON_DECODING}, thinking=False)"
+        f"(primitives, guided={ARC_GUIDED_JSON_DECODING}, thinking=False"
+        f"{', sequential=1 slot/gen' if sequential_slots else ''})"
     )
     arc_eval_log(
         f"[ARC-PHASE-1] Generate start: max_out={slot_max_tokens}/slot | "
-        f"prompt~{total_prompt_tok // max(1, k)}tok/slot"
+        f"prompt~{total_prompt_tok // max(1, k)}tok/slot | batch={slot_batch}"
     )
     t_gen = time.perf_counter()
-    outs = _vllm_generate_arc(vllm_llm, prompts, sp_list)
+    outs: List[Any] = []
+    for start in range(0, k, slot_batch):
+        chunk_prompts = prompts[start : start + slot_batch]
+        chunk_sp = sp_list[start : start + slot_batch]
+        outs.extend(_vllm_generate_arc(vllm_llm, chunk_prompts, chunk_sp))
     arc_eval_log(
         f"[ARC-PHASE-1] Generate done: {k}/{k} spatial slots in "
         f"{time.perf_counter() - t_gen:.1f}s"
@@ -6605,8 +6895,8 @@ def print_arc_gradeboard(per_task: List[Dict[str, Any]], split: str) -> None:
     print("━" * 78)
 
 
-def _find_running_script_source() -> Optional[str]:
-    """Best-effort path to the currently executing script (works in notebooks)."""
+def _collect_script_source_candidates() -> List[str]:
+    """Paths that might hold the live million_brains_dflash source."""
     candidates: List[str] = []
     try:
         candidates.append(os.path.abspath(__file__))
@@ -6618,24 +6908,134 @@ def _find_running_script_source() -> Optional[str]:
 
     frame = inspect.currentframe()
     depth = 0
-    while frame is not None and depth < 48:
+    while frame is not None and depth < 64:
         fname = frame.f_code.co_filename
-        if fname.endswith(".py") and os.path.isfile(fname):
-            candidates.append(os.path.abspath(fname))
+        if fname.endswith(".py"):
+            try:
+                ap = os.path.abspath(fname)
+                if os.path.isfile(ap):
+                    candidates.append(ap)
+            except Exception:
+                pass
         frame = frame.f_back
         depth += 1
 
+    ordered: List[str] = []
     seen: set = set()
     for path in candidates:
+        if path and path not in seen:
+            seen.add(path)
+            ordered.append(path)
+    return ordered
+
+
+def _is_materialized_worker_library_path(path: str) -> bool:
+    return os.path.abspath(path) == os.path.abspath(_canonical_worker_script_path())
+
+
+def _worker_library_markers() -> Tuple[str, Tuple[str, ...]]:
+    return (
+        f'SCRIPT_VERSION = "{SCRIPT_VERSION}"',
+        ("_multi_agent_worker_main", "MultiAgentEnginePool"),
+    )
+
+
+def _script_text_has_worker_markers(text: str) -> bool:
+    version_marker, required = _worker_library_markers()
+    return version_marker in text and all(tok in text for tok in required)
+
+
+def _script_source_sort_key(path: str) -> Tuple[int, int]:
+    """Lower = preferred. Never pick the materialized worker copy as source."""
+    if _is_materialized_worker_library_path(path):
+        return (90, 0)
+    p = path.replace("\\", "/").lower()
+    base = os.path.basename(p)
+    if "mbr_voter_worker" in base or "verify_arc" in base:
+        return (80, 0)
+    size = os.path.getsize(path) if os.path.isfile(path) else 0
+    if "ipykernel" in p or "ipython-input" in p:
+        return (0, -size)
+    if "/tmp/" in p or "/var/folders/" in p:
+        return (1, -size)
+    if "/kaggle/working/" in p:
+        return (50, -size)
+    return (10, -size)
+
+
+def _get_notebook_cell_source_bytes() -> Optional[bytes]:
+    """
+    Kaggle/Jupyter cells execute as __main__; IPython keeps the live cell text in In[].
+    This is the authoritative source when /kaggle/working/*.py is stale from a prior run.
+    """
+    if not _in_notebook:
+        return None
+    try:
+        import IPython
+
+        ip = IPython.get_ipython()
+        if ip is None:
+            return None
+        in_hist = ip.user_ns.get("In")
+        if not isinstance(in_hist, list):
+            return None
+        for cell in reversed(in_hist):
+            if not isinstance(cell, str):
+                continue
+            if _script_text_has_worker_markers(cell):
+                return cell.encode("utf-8")
+    except Exception:
+        pass
+    return None
+
+
+def _find_running_script_source() -> Optional[str]:
+    """Best-effort path to the currently executing script (works in notebooks)."""
+    ranked: List[Tuple[Tuple[int, int], str]] = []
+    seen: set = set()
+    for path in _collect_script_source_candidates():
         if not path or path in seen:
             continue
         seen.add(path)
-        base = os.path.basename(path).lower()
-        if "verify_arc" in base:
+        if _is_materialized_worker_library_path(path):
             continue
-        if os.path.isfile(path):
-            return path
-    return None
+        base = os.path.basename(path).lower()
+        if "verify_arc" in base or "mbr_voter_worker" in base:
+            continue
+        if not os.path.isfile(path):
+            continue
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if not _script_text_has_worker_markers(text):
+            continue
+        ranked.append((_script_source_sort_key(path), path))
+
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: item[0])
+    return ranked[0][1]
+
+
+def _validate_worker_library_file(path: str) -> None:
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="ignore")
+    except Exception as exc:
+        raise RuntimeError(
+            f"[VOTER-POOL] Cannot read worker library at {path!r}: {exc}"
+        ) from exc
+    if not _script_text_has_worker_markers(text):
+        found_ver = "unknown"
+        for line in text.splitlines()[:400]:
+            if "SCRIPT_VERSION" in line:
+                found_ver = line.strip()
+                break
+        raise RuntimeError(
+            "[VOTER-POOL] Worker library is stale or incomplete: "
+            f"{path!r} ({found_ver}; need {SCRIPT_VERSION!r} with "
+            "_multi_agent_worker_main). Delete it and re-run the notebook cell."
+        )
 
 
 def _canonical_worker_script_path() -> str:
@@ -6644,51 +7044,293 @@ def _canonical_worker_script_path() -> str:
     return os.path.abspath(os.path.join(os.getcwd(), "million_brains_dflash.py"))
 
 
+def _canonical_voter_worker_entry_path() -> str:
+    if _on_kaggle():
+        return "/kaggle/working/mbr_voter_worker.py"
+    return os.path.abspath(os.path.join(os.getcwd(), "mbr_voter_worker.py"))
+
+
+_EMBEDDED_VOTER_WORKER_ENTRY = r'''#!/usr/bin/env python3
+"""Minimal voter-pool worker entry (embedded fallback for Kaggle notebooks)."""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import traceback
+
+
+def main() -> None:
+    os.environ["MBR_AGENT_WORKER"] = "1"
+    worker_dir = os.path.dirname(os.path.abspath(__file__))
+    if worker_dir not in sys.path:
+        sys.path.insert(0, worker_dir)
+
+    if len(sys.argv) < 3:
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "error": "usage: mbr_voter_worker.py AGENT_ID GEN_PATH",
+                }
+            ),
+            flush=True,
+        )
+        raise SystemExit(2)
+
+    agent_id = int(sys.argv[1])
+    gen_path = sys.argv[2]
+    print(json.dumps({"status": "loading", "agent_id": agent_id}), flush=True)
+
+    library_path = os.path.join(worker_dir, "million_brains_dflash.py")
+    if not os.path.isfile(library_path):
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "agent_id": agent_id,
+                    "error": f"worker library missing: {library_path}",
+                }
+            ),
+            flush=True,
+        )
+        raise SystemExit(1)
+
+    try:
+        lib_text = open(library_path, encoding="utf-8", errors="ignore").read()
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "agent_id": agent_id,
+                    "error": f"cannot read worker library: {exc}",
+                }
+            ),
+            flush=True,
+        )
+        raise SystemExit(1) from exc
+
+    if "_multi_agent_worker_main" not in lib_text:
+        found_ver = "unknown"
+        for line in lib_text.splitlines()[:400]:
+            if "SCRIPT_VERSION" in line:
+                found_ver = line.strip()
+                break
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "agent_id": agent_id,
+                    "error": (
+                        "stale worker library at "
+                        f"{library_path} ({found_ver}); re-run parent notebook cell"
+                    ),
+                }
+            ),
+            flush=True,
+        )
+        raise SystemExit(1)
+
+    try:
+        import million_brains_dflash as mbr
+
+        if not hasattr(mbr, "_multi_agent_worker_main"):
+            os.execv(
+                sys.executable,
+                [
+                    sys.executable,
+                    "-u",
+                    library_path,
+                    "--mbr-agent-worker",
+                    str(agent_id),
+                    gen_path,
+                ],
+            )
+        mbr._multi_agent_worker_main(agent_id, gen_path)
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "agent_id": agent_id,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            ),
+            flush=True,
+        )
+        raise SystemExit(1) from exc
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _find_voter_worker_entry_source() -> Optional[str]:
+    candidates: List[str] = []
+    try:
+        candidates.append(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "mbr_voter_worker.py")
+        )
+    except NameError:
+        pass
+    main_src = _find_running_script_source()
+    if main_src:
+        candidates.append(os.path.join(os.path.dirname(main_src), "mbr_voter_worker.py"))
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _materialize_bytes_to_path(
+    canonical: str,
+    src_bytes: bytes,
+    *,
+    label: str,
+    source_hint: Optional[str] = None,
+    force: bool = False,
+) -> str:
+    needs_write = force or (not os.path.isfile(canonical))
+    if not needs_write:
+        try:
+            needs_write = Path(canonical).read_bytes() != src_bytes
+        except Exception:
+            needs_write = True
+    if needs_write:
+        Path(canonical).parent.mkdir(parents=True, exist_ok=True)
+        Path(canonical).write_bytes(src_bytes)
+        if source_hint:
+            print(
+                f"[VOTER-POOL] Materialized {label}: {source_hint} -> {canonical}",
+                flush=True,
+            )
+        else:
+            print(f"[VOTER-POOL] Materialized {label}: {canonical}", flush=True)
+    return canonical
+
+
+def _resolve_live_worker_library_bytes() -> Tuple[Optional[bytes], Optional[str]]:
+    """Authoritative in-memory source for the running script (notebook cell preferred)."""
+    nb_bytes = _get_notebook_cell_source_bytes()
+    if nb_bytes is not None:
+        return nb_bytes, "notebook cell (IPython In[])"
+    source = _find_running_script_source()
+    if source and os.path.isfile(source):
+        return Path(source).read_bytes(), source
+    return None, None
+
+
+def _worker_library_target_path() -> str:
+    explicit = os.environ.get("MBR_WORKER_SCRIPT_PATH") or MBR_WORKER_SCRIPT_PATH
+    if explicit:
+        return os.path.abspath(str(explicit))
+    return _canonical_worker_script_path()
+
+
+def _worker_library_needs_refresh(path: str, src_bytes: Optional[bytes] = None) -> bool:
+    if not os.path.isfile(path):
+        return True
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return True
+    if not _script_text_has_worker_markers(text):
+        return True
+    if src_bytes is not None:
+        try:
+            return Path(path).read_bytes() != src_bytes
+        except Exception:
+            return True
+    return False
+
+
 def _materialize_worker_script_path() -> str:
     """
     Copy the running script to a stable on-disk path so voter subprocesses can
     always re-exec it (Jupyter ipykernel temps, %run, plain .py, Kaggle notebook).
     """
-    explicit = os.environ.get("MBR_WORKER_SCRIPT_PATH") or MBR_WORKER_SCRIPT_PATH
-    if explicit:
-        path = os.path.abspath(str(explicit))
-        if os.path.isfile(path):
-            os.environ["MBR_WORKER_SCRIPT_PATH"] = path
-            return path
-        raise FileNotFoundError(
-            f"MBR_WORKER_SCRIPT_PATH={explicit!r} does not exist."
-        )
+    target = _worker_library_target_path()
+    src_bytes, source_hint = _resolve_live_worker_library_bytes()
 
-    canonical = _canonical_worker_script_path()
-    source = _find_running_script_source()
-
-    if source and os.path.isfile(source):
-        src_bytes = Path(source).read_bytes()
-        if (not os.path.isfile(canonical)) or Path(canonical).read_bytes() != src_bytes:
-            Path(canonical).parent.mkdir(parents=True, exist_ok=True)
-            Path(canonical).write_bytes(src_bytes)
-            print(
-                f"[VOTER-POOL] Materialized worker script: {source} -> {canonical}",
-                flush=True,
+    if src_bytes is not None:
+        needs_refresh = _worker_library_needs_refresh(target, src_bytes)
+        if needs_refresh:
+            if os.path.isfile(target):
+                try:
+                    old = Path(target).read_text(encoding="utf-8", errors="ignore")
+                    if not _script_text_has_worker_markers(old):
+                        print(
+                            f"[VOTER-POOL] Replacing stale worker library at {target}",
+                            flush=True,
+                        )
+                except Exception:
+                    pass
+            _materialize_bytes_to_path(
+                target,
+                src_bytes,
+                label="worker library",
+                source_hint=source_hint,
+                force=True,
             )
-        os.environ["MBR_WORKER_SCRIPT_PATH"] = canonical
-        return canonical
+        _validate_worker_library_file(target)
+        os.environ["MBR_WORKER_SCRIPT_PATH"] = target
+        return target
 
-    if os.path.isfile(canonical):
-        os.environ["MBR_WORKER_SCRIPT_PATH"] = canonical
-        return canonical
+    if os.path.isfile(target):
+        try:
+            _validate_worker_library_file(target)
+            os.environ["MBR_WORKER_SCRIPT_PATH"] = target
+            return target
+        except RuntimeError:
+            pass
 
     raise RuntimeError(
         "Cannot materialize voter-pool worker script. "
-        f"Tried source={source!r}, canonical={canonical!r}. "
-        "Save this file as million_brains_dflash.py in the working directory "
-        "or set MBR_WORKER_SCRIPT_PATH."
+        f"Tried notebook In[], frame sources, target={target!r}. "
+        "Re-run the notebook cell containing million_brains_dflash.py "
+        "(or delete /kaggle/working/million_brains_dflash.py and re-run)."
     )
 
 
+def _materialize_voter_worker_entry_path() -> str:
+    """Thin entry script that imports million_brains_dflash (never runs __main__)."""
+    canonical = _canonical_voter_worker_entry_path()
+    source = _find_voter_worker_entry_source()
+    if source and os.path.isfile(source):
+        src_bytes = Path(source).read_bytes()
+        _materialize_bytes_to_path(
+            canonical,
+            src_bytes,
+            label="voter entry",
+            source_hint=source,
+        )
+    else:
+        print(
+            "[VOTER-POOL] mbr_voter_worker.py not found beside main script; "
+            "writing embedded voter entry.",
+            flush=True,
+        )
+        _materialize_bytes_to_path(
+            canonical,
+            _EMBEDDED_VOTER_WORKER_ENTRY.encode("utf-8"),
+            label="voter entry (embedded)",
+        )
+    os.environ["MBR_VOTER_WORKER_ENTRY_PATH"] = canonical
+    return canonical
+
+
+def _voter_pool_worker_cwd() -> str:
+    library = _materialize_worker_script_path()
+    return os.path.dirname(library) or os.getcwd()
+
+
 def _resolve_multi_agent_worker_script_path() -> str:
-    """Stable path for voter subprocess re-exec (always materialized)."""
-    return _materialize_worker_script_path()
+    """Stable thin entry for voter subprocess (library materialized alongside)."""
+    _materialize_worker_script_path()
+    return _materialize_voter_worker_entry_path()
 
 
 def _resolve_voter_pool_gen_path() -> str:
@@ -6734,6 +7376,23 @@ def _resolve_voter_pool_gen_path() -> str:
     )
 
 
+def _read_worker_stream_line(stream: Any, timeout_s: float) -> Optional[str]:
+    """Read one line; None = timeout, '' = EOF."""
+    if timeout_s > 0:
+        try:
+            import select
+
+            ready, _, _ = select.select([stream], [], [], timeout_s)
+            if not ready:
+                return None
+        except Exception:
+            pass
+    line = stream.readline()
+    if line == "":
+        return ""
+    return line
+
+
 def _read_worker_json_message(
     stream: Any,
     *,
@@ -6741,6 +7400,7 @@ def _read_worker_json_message(
     expect_status: Optional[Any] = None,
     timeout_s: float = 7200.0,
     label: str = "message",
+    heartbeat_s: float = 30.0,
 ) -> Dict[str, Any]:
     """
     Read one JSON protocol line from a voter worker, skipping Kaggle/debug noise
@@ -6755,15 +7415,41 @@ def _read_worker_json_message(
     )
     deadline = time.perf_counter() + max(30.0, float(timeout_s))
     junk_preview: List[str] = []
+    wait_start = time.perf_counter()
     while time.perf_counter() < deadline:
-        line = stream.readline()
+        remaining = deadline - time.perf_counter()
+        poll_s = min(max(1.0, float(heartbeat_s)), remaining)
+        line = _read_worker_stream_line(stream, poll_s)
+        if line is None:
+            elapsed = time.perf_counter() - wait_start
+            proc = getattr(stream, "proc", None)
+            stderr_hint = ""
+            if proc is not None:
+                tail = _peek_worker_stderr_tail(proc)
+                if tail:
+                    stderr_hint = f" | {tail[:180]}"
+            print(
+                f"[VOTER-POOL] worker {agent_id} still waiting for {label} "
+                f"({elapsed:.0f}s elapsed){stderr_hint}",
+                flush=True,
+            )
+            continue
         if not line:
             proc = getattr(stream, "proc", None)
             rc = proc.poll() if proc is not None else None
-            raise RuntimeError(
+            stderr_tail = ""
+            if proc is not None and proc.stderr is not None:
+                try:
+                    stderr_tail = proc.stderr.read(8000) or ""
+                except Exception:
+                    pass
+            msg = (
                 f"Voter-pool worker {agent_id} EOF before {label} "
                 f"(exit={rc}, junk={junk_preview[:5]!r})"
             )
+            if stderr_tail.strip():
+                msg += f"\n--- worker stderr (tail) ---\n{stderr_tail[-4000:]}"
+            raise RuntimeError(msg)
         line = line.strip()
         if not line:
             continue
@@ -6784,6 +7470,8 @@ def _read_worker_json_message(
                 junk_preview.append(line[:160])
             continue
         status = rec.get("status")
+        if status == "loading" and "loading" not in accepted:
+            continue
         if status in accepted:
             return rec
         if status == "error":
@@ -6799,7 +7487,72 @@ def _multi_agent_gpu_util_per_engine(n_agents: int, n_gpus: int) -> float:
     n_gpus = max(1, int(n_gpus))
     n_agents = max(1, int(n_agents))
     engines_per_gpu = int(math.ceil(n_agents / n_gpus))
-    return max(0.35, min(0.88, 0.88 / engines_per_gpu))
+    util = 0.88 / engines_per_gpu
+    if engines_per_gpu >= 2:
+        util = min(util, 0.40)
+    elif engines_per_gpu == 1 and float(ARC_WORKER_VLLM_GPU_UTIL_CAP) > 0:
+        util = min(util, float(ARC_WORKER_VLLM_GPU_UTIL_CAP))
+    return max(0.32, min(0.88, util))
+
+
+def _voter_pool_agent_waves(n_agents: int, n_gpus: int) -> List[List[int]]:
+    """At most one new vLLM engine per physical GPU per wave (avoids parallel load OOM)."""
+    n_gpus = max(1, int(n_gpus))
+    waves: List[List[int]] = []
+    for agent_id in range(max(1, int(n_agents))):
+        wave_idx = agent_id // n_gpus
+        while len(waves) <= wave_idx:
+            waves.append([])
+        waves[wave_idx].append(agent_id)
+    return waves
+
+
+def _voter_worker_subprocess_env(
+    agent_id: int,
+    gpu_id: int,
+    *,
+    n_agents: int,
+    n_gpus: int,
+    base_gpu_util: float,
+) -> Dict[str, str]:
+    env = os.environ.copy()
+    wave_idx = int(agent_id) // max(1, int(n_gpus))
+    engines_per_gpu = int(math.ceil(max(1, int(n_agents)) / max(1, int(n_gpus))))
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    env["MBR_AGENT_WORKER"] = "1"
+    env["MBR_WORKER_GPU"] = str(gpu_id)
+    env["MBR_ENGINES_PER_GPU"] = str(engines_per_gpu)
+    env["MBR_WORKER_WAVE"] = str(wave_idx)
+    if wave_idx >= 1:
+        env["MBR_WORKER_MAX_MODEL_LEN"] = str(int(ARC_WORKER_VLLM_SHARED_MAX_MODEL_LEN))
+        env["MBR_WORKER_GPU_UTIL_SCALE"] = "0.72"
+    else:
+        env["MBR_WORKER_MAX_MODEL_LEN"] = str(int(ARC_WORKER_VLLM_MAX_MODEL_LEN))
+        env["MBR_WORKER_GPU_UTIL_SCALE"] = "1.0"
+    env["MBR_WORKER_BASE_GPU_UTIL"] = f"{float(base_gpu_util):.4f}"
+    env.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
+    env.setdefault("VLLM_CONFIGURE_LOGGING", "0")
+    env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    env["ARC_EVAL_VERBOSE"] = "0"
+    env["STREAM_ALL_OUTPUT"] = "0"
+    # Stock Kaggle vLLM lacks GuidedDecodingParams — skip in workers (parent may still log guided=True).
+    env["ARC_GUIDED_JSON_DECODING"] = "0"
+    return env
+
+
+def _peek_worker_stderr_tail(proc: subprocess.Popen, max_chars: int = 240) -> str:
+    if proc.stderr is None:
+        return ""
+    try:
+        import select
+
+        ready, _, _ = select.select([proc.stderr], [], [], 0.0)
+        if not ready:
+            return ""
+        chunk = proc.stderr.read(max_chars)
+        return (chunk or "").strip().splitlines()[-1] if chunk else ""
+    except Exception:
+        return ""
 
 
 def _canonical_grid_vote_key(grid: Optional[List[List[int]]]) -> Optional[str]:
@@ -6932,14 +7685,31 @@ class _WorkerStdoutToStderr:
         sys.stderr.flush()
 
 
+def _worker_redirect_stdout_fd_to_stderr() -> int:
+    """Redirect OS fd 1 -> stderr so vLLM C++ logs cannot block the JSON stdout pipe."""
+    saved_fd = os.dup(1)
+    os.dup2(2, 1)
+    return saved_fd
+
+
+def _worker_restore_stdout_fd(saved_fd: int) -> None:
+    os.dup2(saved_fd, 1)
+    os.close(saved_fd)
+
+
 def _multi_agent_worker_main(agent_id: int, gen_path: str) -> None:
     """Subprocess entry: one Qwen engine pinned to CUDA_VISIBLE_DEVICES from parent env."""
     gpu_id = int(os.environ.get("MBR_WORKER_GPU", "0"))
     saved_stdout = sys.stdout
+    saved_stdout_fd = _worker_redirect_stdout_fd_to_stderr()
     sys.stdout = _WorkerStdoutToStderr()
     llm: Any = None
     tokenizer: Any = None
     try:
+        print(
+            f"[VOTER-WORKER {agent_id}] cuda:{gpu_id} loading tokenizer from {gen_path}",
+            flush=True,
+        )
         local_only = os.path.isdir(gen_path) and local_dir_exists(gen_path)
         tokenizer = AutoTokenizer.from_pretrained(
             gen_path,
@@ -6955,15 +7725,31 @@ def _multi_agent_worker_main(agent_id: int, gen_path: str) -> None:
         gpu_util = (
             float(ARC_MULTI_AGENT_GPU_UTIL)
             if float(ARC_MULTI_AGENT_GPU_UTIL) > 0
-            else _multi_agent_gpu_util_per_engine(
+            else float(os.environ.get("MBR_WORKER_BASE_GPU_UTIL", "0") or 0)
+        )
+        if gpu_util <= 0:
+            gpu_util = _multi_agent_gpu_util_per_engine(
                 ARC_MULTI_AGENT_N, max(1, torch.cuda.device_count())
             )
+        gpu_util *= float(os.environ.get("MBR_WORKER_GPU_UTIL_SCALE", "1.0") or 1.0)
+        worker_max_len = int(os.environ.get("MBR_WORKER_MAX_MODEL_LEN", "0") or 0)
+        print(
+            f"[VOTER-WORKER {agent_id}] cuda:{gpu_id} loading vLLM "
+            f"(gpu_util={gpu_util:.2f}, max_model_len={worker_max_len or 'auto'}, "
+            f"wave={os.environ.get('MBR_WORKER_WAVE', '?')}, "
+            f"fast_load={ARC_WORKER_VLLM_FAST_LOAD})",
+            flush=True,
         )
         llm = create_inference_engine(
             gen_path,
             tokenizer,
             gpu_memory_utilization=gpu_util,
             dflash_draft_path=draft_path,
+        )
+        print(
+            f"[VOTER-WORKER {agent_id}] cuda:{gpu_id} vLLM ready "
+            f"(max_ctx={get_inference_max_context(llm)})",
+            flush=True,
         )
         ready = {
             "status": "ready",
@@ -6973,7 +7759,11 @@ def _multi_agent_worker_main(agent_id: int, gen_path: str) -> None:
             "gpu_util": gpu_util,
         }
     except Exception as exc:
-        sys.stdout = saved_stdout
+        if sys.stdout is not saved_stdout:
+            sys.stdout = saved_stdout
+        if saved_stdout_fd >= 0:
+            _worker_restore_stdout_fd(saved_stdout_fd)
+            saved_stdout_fd = -1
         print(
             json.dumps(
                 {
@@ -6989,6 +7779,8 @@ def _multi_agent_worker_main(agent_id: int, gen_path: str) -> None:
     finally:
         if sys.stdout is not saved_stdout:
             sys.stdout = saved_stdout
+        if saved_stdout_fd >= 0:
+            _worker_restore_stdout_fd(saved_stdout_fd)
 
     print(json.dumps(ready), flush=True)
 
@@ -7068,47 +7860,103 @@ class MultiAgentEnginePool:
             else _multi_agent_gpu_util_per_engine(self.n_agents, self.n_gpus)
         )
         self._workers: List[Dict[str, Any]] = []
-        script_path = _resolve_multi_agent_worker_script_path()
-        print(f"[VOTER-POOL] Worker script: {script_path}")
-        for agent_id in range(self.n_agents):
+        library_path = _materialize_worker_script_path()
+        entry_path = _resolve_multi_agent_worker_script_path()
+        worker_cwd = _voter_pool_worker_cwd()
+        print(
+            f"[VOTER-POOL] Worker entry: {entry_path} "
+            f"(library={library_path}, cwd={worker_cwd})"
+        )
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _spawn_worker(agent_id: int) -> Dict[str, Any]:
             gpu_id = agent_id % self.n_gpus
-            env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-            env["MBR_AGENT_WORKER"] = "1"
-            env["MBR_WORKER_GPU"] = str(gpu_id)
             proc = subprocess.Popen(
-                [sys.executable, "-u", script_path, "--mbr-agent-worker", str(agent_id), self.gen_path],
-                env=env,
+                [sys.executable, "-u", entry_path, str(agent_id), self.gen_path],
+                env=_voter_worker_subprocess_env(
+                    agent_id,
+                    gpu_id,
+                    n_agents=self.n_agents,
+                    n_gpus=self.n_gpus,
+                    base_gpu_util=self.gpu_util,
+                ),
+                cwd=worker_cwd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
             )
             assert proc.stdout is not None
             assert proc.stdin is not None
             proc.stdout.proc = proc  # type: ignore[attr-defined]
+            return {
+                "agent_id": agent_id,
+                "gpu_id": gpu_id,
+                "process": proc,
+                "stdin": proc.stdin,
+                "stdout": proc.stdout,
+            }
+
+        def _await_worker_ready(worker: Dict[str, Any]) -> Dict[str, Any]:
+            agent_id = int(worker["agent_id"])
             ready = _read_worker_json_message(
-                proc.stdout,
+                worker["stdout"],
                 agent_id=agent_id,
                 expect_status="ready",
                 timeout_s=1800.0,
                 label="ready",
+                heartbeat_s=30.0,
             )
             if ready.get("status") != "ready":
                 raise RuntimeError(
                     f"Voter-pool worker {agent_id} failed: {ready}"
                 )
-            self._workers.append(
-                {
-                    "agent_id": agent_id,
-                    "gpu_id": gpu_id,
-                    "process": proc,
-                    "stdin": proc.stdin,
-                    "stdout": proc.stdout,
-                    "max_ctx": ready.get("max_ctx"),
-                }
+            worker["max_ctx"] = ready.get("max_ctx")
+            return worker
+
+        if ARC_WORKER_LOAD_GPU_WAVES:
+            waves = _voter_pool_agent_waves(self.n_agents, self.n_gpus)
+            print(
+                f"[VOTER-POOL] Loading {self.n_agents} workers in {len(waves)} GPU wave(s) "
+                f"(~{self.gpu_util:.2f} gpu_util/engine, max_model_len="
+                f"{ARC_WORKER_VLLM_MAX_MODEL_LEN})...",
+                flush=True,
             )
+            for wave_idx, agent_ids in enumerate(waves):
+                gpu_map = [f"{aid}->cuda:{aid % self.n_gpus}" for aid in agent_ids]
+                print(
+                    f"[VOTER-POOL] Wave {wave_idx + 1}/{len(waves)}: "
+                    f"{', '.join(gpu_map)}",
+                    flush=True,
+                )
+                wave_workers = [_spawn_worker(agent_id) for agent_id in agent_ids]
+                with ThreadPoolExecutor(max_workers=len(wave_workers)) as pool:
+                    futures = [
+                        pool.submit(_await_worker_ready, w) for w in wave_workers
+                    ]
+                    for fut in as_completed(futures):
+                        done = fut.result()
+                        self._workers.append(done)
+                        print(
+                            f"[VOTER-POOL] worker {done['agent_id']} ready "
+                            f"(cuda:{done['gpu_id']}, max_ctx={done.get('max_ctx', '?')})",
+                            flush=True,
+                        )
+        else:
+            pending = [_spawn_worker(agent_id) for agent_id in range(self.n_agents)]
+            print(
+                f"[VOTER-POOL] Spawned {len(pending)} workers; loading vLLM in parallel "
+                f"(~{self.gpu_util:.2f} gpu_util/engine, worker max_model_len="
+                f"{ARC_WORKER_VLLM_MAX_MODEL_LEN})...",
+                flush=True,
+            )
+            with ThreadPoolExecutor(max_workers=len(pending)) as pool:
+                futures = [pool.submit(_await_worker_ready, w) for w in pending]
+                for fut in as_completed(futures):
+                    self._workers.append(fut.result())
+        self._workers.sort(key=lambda w: int(w["agent_id"]))
         hyp_n = arc_hypothesis_k()
         print(
             f"[VOTER-POOL] Ready: {self.n_agents} independent Qwen voters on "
@@ -7132,9 +7980,14 @@ class MultiAgentEnginePool:
         max_new_tokens: int = EVAL_MAX_NEW_TOKENS,
     ) -> List[Dict[str, Any]]:
         hyp_k = arc_hypothesis_k() if k is None else int(k)
+        infer_waves = (
+            _voter_pool_agent_waves(self.n_agents, self.n_gpus)
+            if ARC_VOTER_INFER_GPU_WAVES
+            else [list(range(self.n_agents))]
+        )
         print(
             f"[VOTER-POOL] Dispatch {task_id} test#{test_index}: "
-            f"{self.n_agents} voters in parallel "
+            f"{self.n_agents} voters in {len(infer_waves)} infer wave(s) "
             f"(each Phase1={hyp_k} props -> Phase2=1 grid) -> plurality vote",
             flush=True,
         )
@@ -7145,41 +7998,50 @@ class MultiAgentEnginePool:
             "k": hyp_k,
             "max_new_tokens": max_new_tokens,
         }
-        for w in self._workers:
-            agent_id = int(w["agent_id"])
-            cmd = {
-                "cmd": "mbr",
-                "payload": {
-                    **payload_base,
-                    "seed": int(seed) + agent_id * 10007,
-                },
-            }
-            w["stdin"].write(json.dumps(cmd) + "\n")
-            w["stdin"].flush()
-
+        workers_by_id = {int(w["agent_id"]): w for w in self._workers}
         results: List[Dict[str, Any]] = []
-        for w in self._workers:
-            try:
-                rec = _read_worker_json_message(
-                    w["stdout"],
-                    agent_id=int(w["agent_id"]),
-                    expect_status=("ok", "error"),
-                    timeout_s=7200.0,
-                    label="mbr result",
+        for wave_idx, agent_ids in enumerate(infer_waves):
+            if len(infer_waves) > 1:
+                print(
+                    f"[VOTER-POOL] Infer wave {wave_idx + 1}/{len(infer_waves)}: "
+                    f"agents {agent_ids}",
+                    flush=True,
                 )
-            except RuntimeError as exc:
-                rec = {
-                    "status": "error",
-                    "agent_id": w["agent_id"],
-                    "error": str(exc),
+            wave_workers = [workers_by_id[aid] for aid in agent_ids]
+            for w in wave_workers:
+                agent_id = int(w["agent_id"])
+                cmd = {
+                    "cmd": "mbr",
+                    "payload": {
+                        **payload_base,
+                        "seed": int(seed) + agent_id * 10007,
+                    },
                 }
-            if rec.get("status") == "ok" and "prediction" in rec:
-                pred = rec.get("prediction")
-                if isinstance(pred, list):
-                    rec["prediction"] = pred
-                else:
-                    rec["prediction"] = None
-            results.append(rec)
+                w["stdin"].write(json.dumps(cmd) + "\n")
+                w["stdin"].flush()
+            for w in wave_workers:
+                try:
+                    rec = _read_worker_json_message(
+                        w["stdout"],
+                        agent_id=int(w["agent_id"]),
+                        expect_status=("ok", "error"),
+                        timeout_s=7200.0,
+                        label="mbr result",
+                        heartbeat_s=45.0,
+                    )
+                except RuntimeError as exc:
+                    rec = {
+                        "status": "error",
+                        "agent_id": w["agent_id"],
+                        "error": str(exc),
+                    }
+                if rec.get("status") == "ok" and "prediction" in rec:
+                    pred = rec.get("prediction")
+                    if isinstance(pred, list):
+                        rec["prediction"] = pred
+                    else:
+                        rec["prediction"] = None
+                results.append(rec)
         results.sort(key=lambda r: int(r.get("agent_id", 0)))
         return results
 
@@ -8012,10 +8874,10 @@ if __name__ == "__main__":
         try:
             gen_path = _resolve_voter_pool_gen_path()
             model_name = gen_path
-            worker_script = _materialize_worker_script_path()
+            worker_entry = _resolve_multi_agent_worker_script_path()
             print(
                 f"\n[VOTER-POOL] Spawning {ARC_MULTI_AGENT_N} subprocess Qwen voters "
-                f"(script={worker_script}; parent does not load vLLM)."
+                f"(entry={worker_entry}; parent does not load vLLM)."
             )
             multi_agent_pool = create_multi_agent_pool(gen_path)
             local_only = os.path.isdir(gen_path) and local_dir_exists(gen_path)
@@ -8035,7 +8897,8 @@ if __name__ == "__main__":
     elif run_arc_eval:
         if ARC_MULTI_AGENT_ENABLED and ARC_MULTI_AGENT_REQUIRED:
             raise RuntimeError(
-                "[VOTER-POOL] ARC eval requires the 8-voter pool but it was not activated. "
+                f"[VOTER-POOL] ARC eval requires the {ARC_MULTI_AGENT_N}-voter pool "
+                "but it was not activated. "
                 "Set ARC_MULTI_AGENT_ENABLED=True and ensure eval paths are set."
             )
         voter_pool_single_reason = "ARC_MULTI_AGENT_ENABLED=False"
