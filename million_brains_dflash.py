@@ -180,7 +180,7 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-17h"  # bump when re-uploading to Kaggle to confirm latest script
+SCRIPT_VERSION = "2026-06-17i"  # bump when re-uploading to Kaggle to confirm latest script
 K = 4  # number of parallel drafter streams / feature-slots per super-block
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
 BLOCK_SIZE = 6  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
@@ -291,9 +291,9 @@ ARC_HYPOTHESIS_ENABLE_THINKING = True  # slots may emit </think> reasoning befor
 ARC_HYPOTHESIS_THINKING_TOKEN_CAP = 0  # 0 = no per-slot cap; shares ARC_MBR_OUTPUT_TOKEN_BUDGET (14k)
 ARC_FINAL_ENABLE_THINKING = False  # final grid: [[ prefill + greedy JSON (much faster than thinking pass)
 # Multi-agent layer: N independent Qwen instances (1 per GPU, round-robin) + plurality vote on final grid.
-ARC_MULTI_AGENT_ENABLED = False  # True = plurality vote; False = single engine + DFlash spec (faster default)
-ARC_MULTI_AGENT_N = 5  # independent Qwen3.5-4B instances per test case
-ARC_MULTI_AGENT_DISABLE_SPECULATIVE = False  # try DFlash per agent when multi-agent re-enabled
+ARC_MULTI_AGENT_ENABLED = True  # plurality vote across N independent Qwen workers
+ARC_MULTI_AGENT_N = 8  # 2 per L4 when 4 GPUs visible (round-robin agent_id % n_gpus)
+ARC_MULTI_AGENT_DISABLE_SPECULATIVE = True  # base-only per agent — spec+draft OOMs at 2 engines/GPU
 ARC_MULTI_AGENT_GPU_UTIL = 0.0  # 0 = auto (~0.88 / ceil(N / num_gpus)) per engine
 ARC_MULTI_AGENT_VOTE = "plurality"  # plurality = most common parsed grid; ties -> lowest agent id
 MBR_WORKER_SCRIPT_PATH = None  # None = auto; set e.g. /kaggle/working/million_brains_dflash.py in notebooks
@@ -4261,7 +4261,7 @@ def resolve_arc_final_prompt_bundle(
 ) -> Tuple[str, int, int, str]:
     """
     Build final grid prompt so input+output fits engine_ctx while preserving
-    final_output_tokens from the 8k MBR output budget.
+    final_output_tokens from the MBR output budget.
     Shrinks hypothesis text and task-body encoding before touching output budget.
     """
     max_input = max(256, engine_ctx - int(final_output_tokens) - 32)
@@ -5110,7 +5110,7 @@ def arc_mbr_hypothesis_pipeline(
     ctx_allows = max(64, engine_ctx - final_in - 32)
     if final_max_tokens > ctx_allows:
         stream_log(
-            f"[MBR-WARN] 8k output budget wants {final_max_tokens} tok for final grid "
+            f"[MBR-WARN] output budget wants {final_max_tokens} tok for final grid "
             f"but engine_ctx={engine_ctx} with prompt={final_in}tok only allows "
             f"{ctx_allows}tok output. Increase VLLM_MAX_MODEL_LEN (auto={arc_vllm_context_budget()})."
         )
