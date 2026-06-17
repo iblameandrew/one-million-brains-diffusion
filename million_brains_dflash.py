@@ -180,7 +180,7 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-17c"  # bump when re-uploading to Kaggle to confirm latest script
+SCRIPT_VERSION = "2026-06-17f"  # bump when re-uploading to Kaggle to confirm latest script
 K = 4  # number of parallel drafter streams / feature-slots per super-block
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
 BLOCK_SIZE = 6  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
@@ -285,7 +285,15 @@ ARC_FINAL_GRID_MIN_FRACTION = 0.50  # always reserve 50% of output budget for fi
 ARC_HYPOTHESIS_MAX_TOKENS = ARC_MBR_OUTPUT_TOKEN_BUDGET * 3 // 4 // K  # legacy default; task-aware below
 ARC_FINAL_GRID_MAX_TOKENS = ARC_MBR_OUTPUT_TOKEN_BUDGET // 4  # legacy default; task-aware below
 ARC_FINAL_HYP_CHAR_CAPS = (600, 360, 200, 100, 0)  # shrink hypothesis text in final prompt if needed
-ARC_HYPOTHESIS_ENABLE_THINKING = False  # thinking burns budget; hyp phase is text-only rules
+ARC_HYPOTHESIS_ENABLE_THINKING = True  # slots may emit </think> reasoning before TRANSFORMATION_HYPOTHESIS
+ARC_FINAL_ENABLE_THINKING = True  # final grid pass may think before JSON output (no [[ prefill)
+# Multi-agent layer: N independent Qwen instances (1 per GPU, round-robin) + plurality vote on final grid.
+ARC_MULTI_AGENT_ENABLED = True  # False = single vLLM engine (legacy path)
+ARC_MULTI_AGENT_N = 5  # independent Qwen3.5-4B instances per test case
+ARC_MULTI_AGENT_DISABLE_SPECULATIVE = True  # skip DFlash draft per agent to save VRAM
+ARC_MULTI_AGENT_GPU_UTIL = 0.0  # 0 = auto (~0.88 / ceil(N / num_gpus)) per engine
+ARC_MULTI_AGENT_VOTE = "plurality"  # plurality = most common parsed grid; ties -> lowest agent id
+MBR_WORKER_SCRIPT_PATH = None  # None = auto; set e.g. /kaggle/working/million_brains_dflash.py in notebooks
 ARC_CHAT_TEMPLATE_SLACK = 2048  # system + chat template overhead beyond raw task body
 ARC_SAVE_GRADE_IMAGES = True  # save PNG grade cards (arc_grades/ or /kaggle/working/arc_grades/)
 ARC_SHOW_TRAIN_EXAMPLES = True  # include train pair thumbnails on each grade card
@@ -297,6 +305,8 @@ ARC_ANSWER_REPORT_PATH = None  # None = auto (/kaggle/working/arc_answer_report.
 import os
 import sys
 import socket
+import subprocess
+import inspect
 import argparse
 import re
 import math
@@ -4162,6 +4172,7 @@ def resolve_arc_final_prompt_bundle(
     system_content: str,
     engine_ctx: int,
     final_output_tokens: int,
+    enable_thinking: bool = False,
     assistant_prefill: str = ARC_ASSISTANT_PREFILL,
 ) -> Tuple[str, int, int, str]:
     """
@@ -4200,7 +4211,7 @@ def resolve_arc_final_prompt_bundle(
                     tokenizer,
                     final_user,
                     system_content=sys_msg,
-                    enable_thinking=False,
+                    enable_thinking=enable_thinking,
                     assistant_prefill=assistant_prefill,
                 )
                 n_in = count_prompt_tokens(tokenizer, prompt)
@@ -4679,8 +4690,17 @@ def extract_arc_generated_suffix(result: Dict[str, Any], prompt: str) -> str:
             gen = final[len(prompt) :]
         else:
             gen = final
-    gen = _strip_model_artifacts(gen)
-    if ARC_ASSISTANT_PREFILL and gen and not gen.lstrip().startswith("["):
+    keep_thinking = ARC_FINAL_ENABLE_THINKING and not ARC_DISABLE_THINKING
+    if not keep_thinking:
+        gen = _strip_model_artifacts(gen)
+    thinking_in_gen = "<think>" in (gen or "").lower() or "</think>" in (gen or "").lower()
+    if (
+        ARC_ASSISTANT_PREFILL
+        and gen
+        and not gen.lstrip().startswith("[")
+        and not thinking_in_gen
+        and not keep_thinking
+    ):
         gen = ARC_ASSISTANT_PREFILL + gen
     return gen
 
@@ -4689,17 +4709,32 @@ def _extract_transformation_hypothesis(text: str) -> str:
     """Pull TRANSFORMATION_HYPOTHESIS block or return cleaned prose."""
     if not text:
         return ""
-    cleaned = _strip_model_artifacts(text)
-    match = re.search(
-        r"TRANSFORMATION_HYPOTHESIS\s*:\s*([\s\S]+)",
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    if match:
-        body = match.group(1).strip()
-        body = re.split(r"\n(?:TRANSFORMATION_HYPOTHESIS|HYPOTHESIS_GRID)\s*:", body, flags=re.I)[0]
-        return body.strip()
-    return cleaned.strip()
+    search_spaces: List[str] = [text]
+    thinking = _extract_thinking_content(text)
+    if thinking:
+        search_spaces.append(thinking)
+    post_think = text
+    if "</think>" in text.lower():
+        post_think = re.split(r"</think>", text, flags=re.IGNORECASE)[-1]
+    search_spaces.extend([post_think, _strip_model_artifacts(text)])
+
+    seen: set = set()
+    for search in search_spaces:
+        if not search or search in seen:
+            continue
+        seen.add(search)
+        match = re.search(
+            r"TRANSFORMATION_HYPOTHESIS\s*:\s*([\s\S]+)",
+            search,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            body = match.group(1).strip()
+            body = re.split(
+                r"\n(?:TRANSFORMATION_HYPOTHESIS|HYPOTHESIS_GRID)\s*:", body, flags=re.I
+            )[0]
+            return body.strip()
+    return _strip_model_artifacts(text).strip()
 
 
 def build_slot_hypothesis_user_content(
@@ -4800,14 +4835,21 @@ def collect_feature_slot_hypotheses(
     feature_names = alloc_out["feature_names"]
     feature_params = allocator.get_feature_params(feature_indices)
 
-    system_content = (
-        "You are an ARC-AGI pattern analyst. Study grid transformations from train pairs. "
-        "Never output a JSON grid or digit matrix in this phase — only describe rules, "
-        "patterns, and algorithms in plain text."
-    )
+    hyp_thinking = ARC_HYPOTHESIS_ENABLE_THINKING and not ARC_DISABLE_THINKING
+    if hyp_thinking:
+        system_content = (
+            "You are an ARC-AGI pattern analyst. Study grid transformations from train pairs. "
+            "Reason inside </think> tags. Never output a JSON grid or digit matrix — only "
+            "describe rules, patterns, and algorithms in plain text after thinking."
+        )
+    else:
+        system_content = (
+            "You are an ARC-AGI pattern analyst. Study grid transformations from train pairs. "
+            "Never output a JSON grid or digit matrix in this phase — only describe rules, "
+            "patterns, and algorithms in plain text."
+        )
 
     hypotheses: List[Dict[str, Any]] = []
-    hyp_thinking = ARC_HYPOTHESIS_ENABLE_THINKING and not ARC_FAST_INFERENCE
     engine_ctx = get_inference_max_context(vllm_llm)
     hyp_max_tokens = arc_hypothesis_max_tokens(task)
     probe_feat = max(
@@ -4936,14 +4978,36 @@ def arc_mbr_hypothesis_pipeline(
 
     engine_ctx = get_inference_max_context(vllm_llm)
     final_max_tokens = arc_mbr_final_output_budget(task, hyp_token_total)
-    final_system = (
-        "You solve ARC-AGI grid puzzles. You are given parallel textual hypotheses from "
-        "specialist analysts. Synthesize the best rule, then output exactly one JSON 2D "
-        "array of integers (0-9). No markdown fences, no prose after the array."
-    )
-    if ARC_FAST_INFERENCE:
+    final_thinking = ARC_FINAL_ENABLE_THINKING and not ARC_DISABLE_THINKING
+    final_prefill = "" if final_thinking else ARC_ASSISTANT_PREFILL
+    if final_thinking:
+        if ARC_STRUCTURED_THINKING:
+            final_system = (
+                "You solve ARC-AGI grid puzzles. Specialist hypotheses are provided. "
+                "Inside </think> use numbered steps; after each step write HYPOTHESIS_GRID: "
+                "with a JSON 2D array (partial guesses allowed). After </think> output "
+                "exactly one final JSON 2D array of integers (0-9). No markdown."
+            )
+        else:
+            final_system = (
+                "You solve ARC-AGI grid puzzles. Synthesize the specialist hypotheses "
+                "inside </think>, then after </think> output exactly one JSON 2D array "
+                "of integers (0-9). No markdown."
+            )
+        if ARC_FAST_INFERENCE:
+            final_system = (
+                "ARC solver. Think in </think>, refine HYPOTHESIS_GRID each step, "
+                "then output one JSON 2D int array (0-9) after </think>."
+            )
+    elif ARC_FAST_INFERENCE:
         final_system = (
             "ARC solver. Synthesize hypotheses, output one JSON 2D int array (0-9) only."
+        )
+    else:
+        final_system = (
+            "You solve ARC-AGI grid puzzles. You are given parallel textual hypotheses from "
+            "specialist analysts. Synthesize the best rule, then output exactly one JSON 2D "
+            "array of integers (0-9). No markdown fences, no prose after the array."
         )
 
     final_prompt, final_in, body_tok, body_fmt = resolve_arc_final_prompt_bundle(
@@ -4955,7 +5019,8 @@ def arc_mbr_hypothesis_pipeline(
         system_content=final_system,
         engine_ctx=engine_ctx,
         final_output_tokens=final_max_tokens,
-        assistant_prefill=ARC_ASSISTANT_PREFILL,
+        enable_thinking=final_thinking,
+        assistant_prefill=final_prefill,
     )
 
     ctx_allows = max(64, engine_ctx - final_in - 32)
@@ -4976,7 +5041,7 @@ def arc_mbr_hypothesis_pipeline(
         stream_log(
             f"[MBR-FINAL] grid synthesis "
             f"(max_tokens={final_max_tokens}, prompt={final_in}tok, body={body_tok}tok({body_fmt}), "
-            f"engine_ctx={engine_ctx}, prefill={ARC_ASSISTANT_PREFILL!r})"
+            f"engine_ctx={engine_ctx}, thinking={final_thinking}, prefill={final_prefill!r})"
         )
 
     grid_res = arc_direct_generate(
@@ -5739,8 +5804,468 @@ def print_arc_gradeboard(per_task: List[Dict[str, Any]], split: str) -> None:
     print("━" * 78)
 
 
+def _resolve_multi_agent_worker_script_path() -> str:
+    """
+    Path to re-execute this script in worker subprocesses.
+    Jupyter/Kaggle notebooks have no __file__; fall back to ipykernel temp path,
+    sys.argv[0], or /kaggle/working/million_brains_dflash.py.
+    """
+    explicit = os.environ.get("MBR_WORKER_SCRIPT_PATH") or MBR_WORKER_SCRIPT_PATH
+    if explicit:
+        path = os.path.abspath(str(explicit))
+        if os.path.isfile(path):
+            return path
+        raise FileNotFoundError(
+            f"MBR_WORKER_SCRIPT_PATH={explicit!r} does not exist."
+        )
+
+    candidates: List[str] = []
+    try:
+        candidates.append(os.path.abspath(__file__))
+    except NameError:
+        pass
+
+    if sys.argv and sys.argv[0] not in ("", "-c", "-m"):
+        candidates.append(os.path.abspath(sys.argv[0]))
+
+    try:
+        candidates.append(os.path.abspath(inspect.getfile(_resolve_multi_agent_worker_script_path)))
+    except (TypeError, OSError):
+        pass
+
+    frame = inspect.currentframe()
+    while frame is not None:
+        fname = frame.f_code.co_filename
+        if fname.endswith(".py") and os.path.isfile(fname):
+            candidates.append(os.path.abspath(fname))
+            break
+        frame = frame.f_back
+
+    if _on_kaggle():
+        candidates.append("/kaggle/working/million_brains_dflash.py")
+    candidates.append(os.path.join(os.getcwd(), "million_brains_dflash.py"))
+
+    seen: set = set()
+    for path in candidates:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if os.path.isfile(path):
+            return path
+
+    raise RuntimeError(
+        "Cannot resolve worker script path for multi-agent pool (no __file__ in notebook). "
+        "Save this script as /kaggle/working/million_brains_dflash.py and set "
+        "MBR_WORKER_SCRIPT_PATH='/kaggle/working/million_brains_dflash.py', "
+        "or export MBR_WORKER_SCRIPT_PATH before running."
+    )
+
+
+def _multi_agent_gpu_util_per_engine(n_agents: int, n_gpus: int) -> float:
+    """VRAM fraction of *total* GPU memory vLLM may use per engine when sharing GPUs."""
+    n_gpus = max(1, int(n_gpus))
+    n_agents = max(1, int(n_agents))
+    engines_per_gpu = int(math.ceil(n_agents / n_gpus))
+    return max(0.35, min(0.88, 0.88 / engines_per_gpu))
+
+
+def _canonical_grid_vote_key(grid: Optional[List[List[int]]]) -> Optional[str]:
+    if grid is None or not _is_valid_arc_grid(grid):
+        return None
+    return json.dumps(grid, separators=(",", ":"))
+
+
+def plurality_vote_agent_grids(
+    agent_results: List[Dict[str, Any]],
+) -> Tuple[Optional[List[List[int]]], Dict[str, Any]]:
+    """
+    Select the most common parsed grid across independent agent runs.
+    Ties: prefer the grid from the lowest agent_id among tied keys.
+    """
+    ballots: List[Tuple[str, List[List[int]], int]] = []
+    for rec in agent_results:
+        grid = rec.get("prediction")
+        key = _canonical_grid_vote_key(grid)
+        if key is None:
+            continue
+        ballots.append((key, grid, int(rec.get("agent_id", 0))))
+
+    if not ballots:
+        return None, {
+            "method": ARC_MULTI_AGENT_VOTE,
+            "n_agents": len(agent_results),
+            "n_parsed": 0,
+            "winner_votes": 0,
+            "vote_counts": {},
+            "tie": True,
+        }
+
+    counts = Counter(key for key, _, _ in ballots)
+    top_votes = max(counts.values())
+    tied_keys = {k for k, c in counts.items() if c == top_votes}
+    winner_key = min(
+        tied_keys,
+        key=lambda k: min(agent_id for key, _, agent_id in ballots if key == k),
+    )
+    winner_grid = json.loads(winner_key)
+    return winner_grid, {
+        "method": ARC_MULTI_AGENT_VOTE,
+        "n_agents": len(agent_results),
+        "n_parsed": len(ballots),
+        "winner_votes": counts[winner_key],
+        "vote_counts": dict(counts),
+        "tie": len(tied_keys) > 1,
+        "winner_key": winner_key,
+    }
+
+
+def _multi_agent_worker_execute_mbr(
+    llm: Any,
+    tokenizer: Any,
+    agent_id: int,
+    gpu_id: int,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Run one full MBR hypothesis pipeline inside an agent worker process."""
+    task_id = str(payload["task_id"])
+    task = payload["task"]
+    test_index = int(payload["test_index"])
+    seed = int(payload.get("seed", SEED))
+    k = int(payload.get("k", K))
+    t0 = time.perf_counter()
+    allocator = PermutationFeatureSlotAllocator(
+        internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=k
+    )
+    if ARC_SLOT_HYPOTHESIS_MODE:
+        mbr_res = arc_mbr_hypothesis_pipeline(
+            llm,
+            tokenizer,
+            task_id,
+            task,
+            test_index=test_index,
+            k=k,
+            allocator=allocator,
+            seed=seed,
+            verbose=False,
+        )
+        prompt_for_extract = mbr_res.get("final_prompt", "")
+    else:
+        prompt = build_arc_inference_prompt(
+            tokenizer, task_id, task, test_index=test_index
+        )
+        mbr_res = million_brains_dflash_generate(
+            llm,
+            tokenizer,
+            prompt,
+            max_new_tokens=int(payload.get("max_new_tokens", EVAL_MAX_NEW_TOKENS)),
+            k=k,
+            allocator=allocator,
+            seed=seed,
+            verbose=False,
+        )
+        prompt_for_extract = prompt
+
+    elapsed = time.perf_counter() - t0
+    answer_text = extract_arc_generated_suffix(mbr_res, prompt_for_extract)
+    prediction = parse_arc_answer_grid(answer_text)
+    return {
+        "status": "ok",
+        "agent_id": agent_id,
+        "gpu_id": gpu_id,
+        "prediction": prediction,
+        "parsed": prediction is not None,
+        "elapsed_s": elapsed,
+        "num_tokens": int(mbr_res.get("num_tokens", 0)),
+        "hypothesis_tokens": int(mbr_res.get("hypothesis_tokens", 0)),
+        "grid_tokens": int(mbr_res.get("grid_tokens", 0)),
+        "generation_mode": mbr_res.get("generation_mode"),
+        "grid_json": format_grid_json(prediction),
+    }
+
+
+def _multi_agent_worker_main(agent_id: int, gen_path: str) -> None:
+    """Subprocess entry: one Qwen engine pinned to CUDA_VISIBLE_DEVICES from parent env."""
+    gpu_id = int(os.environ.get("MBR_WORKER_GPU", "0"))
+    try:
+        local_only = os.path.isdir(gen_path) and local_dir_exists(gen_path)
+        tokenizer = AutoTokenizer.from_pretrained(
+            gen_path,
+            trust_remote_code=True,
+            local_files_only=local_only,
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        draft_path = None
+        if not ARC_MULTI_AGENT_DISABLE_SPECULATIVE:
+            _, auto_draft = resolve_generation_model_path(gen_path)
+            draft_path = auto_draft
+        gpu_util = (
+            float(ARC_MULTI_AGENT_GPU_UTIL)
+            if float(ARC_MULTI_AGENT_GPU_UTIL) > 0
+            else _multi_agent_gpu_util_per_engine(
+                ARC_MULTI_AGENT_N, max(1, torch.cuda.device_count())
+            )
+        )
+        llm = create_inference_engine(
+            gen_path,
+            tokenizer,
+            gpu_memory_utilization=gpu_util,
+            dflash_draft_path=draft_path,
+        )
+        ready = {
+            "status": "ready",
+            "agent_id": agent_id,
+            "gpu_id": gpu_id,
+            "max_ctx": get_inference_max_context(llm),
+            "gpu_util": gpu_util,
+        }
+        print(json.dumps(ready), flush=True)
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "agent_id": agent_id,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            ),
+            flush=True,
+        )
+        return
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "agent_id": agent_id,
+                        "error": "invalid JSON command",
+                    }
+                ),
+                flush=True,
+            )
+            continue
+        cmd = msg.get("cmd")
+        if cmd == "shutdown":
+            break
+        if cmd == "mbr":
+            try:
+                result = _multi_agent_worker_execute_mbr(
+                    llm,
+                    tokenizer,
+                    agent_id,
+                    gpu_id,
+                    msg.get("payload") or {},
+                )
+            except Exception as exc:
+                result = {
+                    "status": "error",
+                    "agent_id": agent_id,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            print(json.dumps(result, default=str), flush=True)
+            continue
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "agent_id": agent_id,
+                    "error": f"unknown cmd {cmd!r}",
+                }
+            ),
+            flush=True,
+        )
+
+
+class MultiAgentEnginePool:
+    """
+    N persistent Qwen subprocess workers (spawn + CUDA_VISIBLE_DEVICES per child).
+    Each test case runs MBR on all agents in parallel, then plurality-votes grids.
+    """
+
+    def __init__(
+        self,
+        gen_path: str,
+        *,
+        n_agents: int = ARC_MULTI_AGENT_N,
+        draft_path: Optional[str] = None,
+    ) -> None:
+        del draft_path  # draft path resolved inside workers when speculative enabled
+        self.gen_path = os.path.abspath(gen_path)
+        self.n_agents = max(1, int(n_agents))
+        self.n_gpus = max(1, torch.cuda.device_count() if torch.cuda.is_available() else 1)
+        self.gpu_util = (
+            float(ARC_MULTI_AGENT_GPU_UTIL)
+            if float(ARC_MULTI_AGENT_GPU_UTIL) > 0
+            else _multi_agent_gpu_util_per_engine(self.n_agents, self.n_gpus)
+        )
+        self._workers: List[Dict[str, Any]] = []
+        script_path = _resolve_multi_agent_worker_script_path()
+        print(f"[MULTI-AGENT] Worker script: {script_path}")
+        for agent_id in range(self.n_agents):
+            gpu_id = agent_id % self.n_gpus
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            env["MBR_AGENT_WORKER"] = "1"
+            env["MBR_WORKER_GPU"] = str(gpu_id)
+            proc = subprocess.Popen(
+                [sys.executable, "-u", script_path, "--mbr-agent-worker", str(agent_id), self.gen_path],
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            assert proc.stdout is not None
+            assert proc.stdin is not None
+            ready_line = proc.stdout.readline().strip()
+            try:
+                ready = json.loads(ready_line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"Multi-agent worker {agent_id} failed during startup: {ready_line!r}"
+                ) from exc
+            if ready.get("status") != "ready":
+                raise RuntimeError(
+                    f"Multi-agent worker {agent_id} failed: {ready}"
+                )
+            self._workers.append(
+                {
+                    "agent_id": agent_id,
+                    "gpu_id": gpu_id,
+                    "process": proc,
+                    "stdin": proc.stdin,
+                    "stdout": proc.stdout,
+                    "max_ctx": ready.get("max_ctx"),
+                }
+            )
+        print(
+            f"[MULTI-AGENT] Pool ready: {self.n_agents} Qwen instances on "
+            f"{self.n_gpus} GPU(s), ~{self.gpu_util:.2f} gpu_util/engine"
+        )
+        for w in self._workers:
+            print(
+                f"    agent {w['agent_id']} -> cuda:{w['gpu_id']} "
+                f"(max_ctx={w.get('max_ctx', '?')})"
+            )
+
+    def run_parallel_mbr(
+        self,
+        *,
+        task_id: str,
+        task: Dict[str, Any],
+        test_index: int,
+        seed: int,
+        k: int = K,
+        max_new_tokens: int = EVAL_MAX_NEW_TOKENS,
+    ) -> List[Dict[str, Any]]:
+        payload_base = {
+            "task_id": task_id,
+            "task": task,
+            "test_index": test_index,
+            "k": k,
+            "max_new_tokens": max_new_tokens,
+        }
+        for w in self._workers:
+            agent_id = int(w["agent_id"])
+            cmd = {
+                "cmd": "mbr",
+                "payload": {
+                    **payload_base,
+                    "seed": int(seed) + agent_id * 10007,
+                },
+            }
+            w["stdin"].write(json.dumps(cmd) + "\n")
+            w["stdin"].flush()
+
+        results: List[Dict[str, Any]] = []
+        for w in self._workers:
+            line = w["stdout"].readline().strip()
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                rec = {
+                    "status": "error",
+                    "agent_id": w["agent_id"],
+                    "error": f"bad worker JSON: {line!r}",
+                }
+            if rec.get("status") == "ok" and "prediction" in rec:
+                pred = rec.get("prediction")
+                if isinstance(pred, list):
+                    rec["prediction"] = pred
+                else:
+                    rec["prediction"] = None
+            results.append(rec)
+        results.sort(key=lambda r: int(r.get("agent_id", 0)))
+        return results
+
+    def shutdown(self) -> None:
+        for w in self._workers:
+            try:
+                w["stdin"].write(json.dumps({"cmd": "shutdown"}) + "\n")
+                w["stdin"].flush()
+            except Exception:
+                pass
+        for w in self._workers:
+            proc = w["process"]
+            try:
+                proc.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        self._workers.clear()
+
+
+def create_multi_agent_pool(gen_path: str) -> MultiAgentEnginePool:
+    return MultiAgentEnginePool(gen_path, n_agents=ARC_MULTI_AGENT_N)
+
+
+def print_multi_agent_vote_summary(
+    *,
+    task_id: str,
+    test_index: int,
+    agent_results: List[Dict[str, Any]],
+    vote_meta: Dict[str, Any],
+    pooled_pred: Optional[List[List[int]]],
+    gold: Optional[List[List[int]]] = None,
+) -> None:
+    print(
+        f"[MULTI-AGENT] {task_id} test#{test_index} — "
+        f"{vote_meta.get('winner_votes', 0)}/{vote_meta.get('n_parsed', 0)} parsed agents "
+        f"agree on pooled grid (tie={vote_meta.get('tie', False)})"
+    )
+    for rec in agent_results:
+        agent_id = rec.get("agent_id", "?")
+        gpu_id = rec.get("gpu_id", "?")
+        status = rec.get("status", "ok")
+        if status != "ok":
+            print(f"    agent {agent_id} cuda:{gpu_id} ERROR: {rec.get('error', '?')}")
+            continue
+        pred = rec.get("prediction")
+        label = "UNPARSED"
+        if pred is not None and gold is not None:
+            label = _grade_verdict_label(grid_cell_stats(pred, gold))
+        elif pred is not None:
+            label = _grid_shape_label(pred)
+        elapsed = rec.get("elapsed_s", 0.0)
+        tok = rec.get("num_tokens", 0)
+        print(
+            f"    agent {agent_id} cuda:{gpu_id} {label:<14} "
+            f"{tok} tok in {float(elapsed):.1f}s | {rec.get('grid_json', '')[:72]}"
+        )
+    print(f"    POOLED -> {format_grid_json(pooled_pred)[:120]}")
+
+
 def evaluate_arc_dataset(
-    vllm_llm: LLM,
+    vllm_llm: Optional[Any],
     tokenizer: Any,
     challenges_path: str,
     solutions_path: str,
@@ -5753,6 +6278,7 @@ def evaluate_arc_dataset(
     seed: int = SEED,
     split: str = ARC_DATA_SPLIT,
     visual_grading: bool = ARC_VISUAL_GRADING,
+    multi_agent_pool: Optional[MultiAgentEnginePool] = None,
 ) -> Dict[str, Any]:
     """
     Run million-brains-dflash on an ARC-AGI split.
@@ -5807,13 +6333,25 @@ def evaluate_arc_dataset(
         f"MBR mode: {'hypothesis slots + final grid' if ARC_SLOT_HYPOTHESIS_MODE else 'token speculative'} "
         f"| output_budget={ARC_MBR_OUTPUT_TOKEN_BUDGET} tok/test "
         f"| final_reserve>={int(ARC_MBR_OUTPUT_TOKEN_BUDGET * ARC_FINAL_GRID_MIN_FRACTION)} "
+        f"| hyp_thinking={ARC_HYPOTHESIS_ENABLE_THINKING} final_thinking={ARC_FINAL_ENABLE_THINKING} "
         f"| vLLM ctx auto={arc_vllm_context_budget()}"
     )
-    print(
-        f"vLLM speculative: {_inference_speculative_status(vllm_llm)} "
-        f"(ENABLE_VLLM_SPECULATIVE_DECODING={ENABLE_VLLM_SPECULATIVE_DECODING}, "
-        f"method={VLLM_SPECULATIVE_METHOD}, n={VLLM_NUM_SPECULATIVE_TOKENS})"
-    )
+    if multi_agent_pool is not None:
+        print(
+            f"Multi-agent: ENABLED | agents={multi_agent_pool.n_agents} "
+            f"| GPUs={multi_agent_pool.n_gpus} | vote={ARC_MULTI_AGENT_VOTE} "
+            f"| gpu_util/engine~{multi_agent_pool.gpu_util:.2f} "
+            f"| speculative_per_agent={'off' if ARC_MULTI_AGENT_DISABLE_SPECULATIVE else 'on'}"
+        )
+    else:
+        print(
+            f"Multi-agent: disabled (single engine)"
+        )
+        print(
+            f"vLLM speculative: {_inference_speculative_status(vllm_llm)} "
+            f"(ENABLE_VLLM_SPECULATIVE_DECODING={ENABLE_VLLM_SPECULATIVE_DECODING}, "
+            f"method={VLLM_SPECULATIVE_METHOD}, n={VLLM_NUM_SPECULATIVE_TOKENS})"
+        )
     if visual_grading and ARC_SAVE_GRADE_IMAGES:
         print(f"Grade images: {_arc_grade_output_dir()}/")
     print("-" * 80)
@@ -5857,12 +6395,57 @@ def evaluate_arc_dataset(
                 if ARC_SLOT_HYPOTHESIS_MODE
                 else "token-speculative"
             )
+            if multi_agent_pool is not None:
+                mbr_mode = f"multi-agent({multi_agent_pool.n_agents})+{mbr_mode}"
             arc_eval_log(
                 f"\n[ARC] >>> task {task_idx + 1}/{len(task_ids)} {task_id} "
                 f"test#{test_index} — starting MBR pass ({mbr_mode})…"
             )
             t0 = time.perf_counter()
-            if ARC_SLOT_HYPOTHESIS_MODE:
+            agent_results: List[Dict[str, Any]] = []
+            vote_meta: Dict[str, Any] = {}
+            mbr_res: Dict[str, Any] = {}
+            if multi_agent_pool is not None:
+                agent_results = multi_agent_pool.run_parallel_mbr(
+                    task_id=task_id,
+                    task=task,
+                    test_index=test_index,
+                    seed=seed + test_index,
+                    k=k,
+                    max_new_tokens=max_new_tokens,
+                )
+                mbr_pred, vote_meta = plurality_vote_agent_grids(agent_results)
+                mbr_elapsed = time.perf_counter() - t0
+                ok_results = [r for r in agent_results if r.get("status") == "ok"]
+                total_tokens = sum(int(r.get("num_tokens", 0)) for r in ok_results)
+                mbr_res = {
+                    "generation_mode": "multi_agent_plurality",
+                    "num_tokens": total_tokens,
+                    "hypothesis_tokens": sum(
+                        int(r.get("hypothesis_tokens", 0)) for r in ok_results
+                    ),
+                    "grid_tokens": sum(int(r.get("grid_tokens", 0)) for r in ok_results),
+                    "output_budget_cap": ARC_MBR_OUTPUT_TOKEN_BUDGET,
+                    "final_output_budget": ARC_MBR_OUTPUT_TOKEN_BUDGET,
+                    "prompt_tokens": 0,
+                    "agent_results": agent_results,
+                    "vote_meta": vote_meta,
+                }
+                mbr_timing = generation_timing_stats(
+                    mbr_elapsed,
+                    total_tokens,
+                    prompt_tokens=0,
+                )
+                mbr_answer_text = format_grid_json(mbr_pred)
+                print_multi_agent_vote_summary(
+                    task_id=task_id,
+                    test_index=test_index,
+                    agent_results=agent_results,
+                    vote_meta=vote_meta,
+                    pooled_pred=mbr_pred,
+                    gold=gold,
+                )
+            elif ARC_SLOT_HYPOTHESIS_MODE:
                 mbr_res = arc_mbr_hypothesis_pipeline(
                     vllm_llm,
                     tokenizer,
@@ -5876,6 +6459,16 @@ def evaluate_arc_dataset(
                     and not ARC_FAST_INFERENCE,
                 )
                 mbr_prompt_for_extract = mbr_res.get("final_prompt", prompt)
+                mbr_elapsed = time.perf_counter() - t0
+                mbr_timing = generation_timing_stats(
+                    mbr_elapsed,
+                    mbr_res["num_tokens"],
+                    prompt_tokens=mbr_res.get("prompt_tokens", 0),
+                )
+                mbr_answer_text = extract_arc_generated_suffix(
+                    mbr_res, mbr_prompt_for_extract
+                )
+                mbr_pred = parse_arc_answer_grid(mbr_answer_text)
             else:
                 mbr_res = million_brains_dflash_generate(
                     vllm_llm,
@@ -5895,27 +6488,39 @@ def evaluate_arc_dataset(
                     },
                 )
                 mbr_prompt_for_extract = prompt
-            mbr_elapsed = time.perf_counter() - t0
-            mbr_timing = generation_timing_stats(
-                mbr_elapsed,
-                mbr_res["num_tokens"],
-                prompt_tokens=mbr_res.get("prompt_tokens", 0),
-            )
+                mbr_elapsed = time.perf_counter() - t0
+                mbr_timing = generation_timing_stats(
+                    mbr_elapsed,
+                    mbr_res["num_tokens"],
+                    prompt_tokens=mbr_res.get("prompt_tokens", 0),
+                )
+                mbr_answer_text = extract_arc_generated_suffix(
+                    mbr_res, mbr_prompt_for_extract
+                )
+                mbr_pred = parse_arc_answer_grid(mbr_answer_text)
+
+            if multi_agent_pool is None:
+                arc_eval_log(
+                    f"[ARC] <<< task {task_idx + 1}/{len(task_ids)} {task_id} "
+                    f"test#{test_index} — MBR done | {format_timing_line(mbr_timing)} | "
+                    f"out_budget={mbr_res.get('output_budget_cap', ARC_MBR_OUTPUT_TOKEN_BUDGET)} "
+                    f"hyp={mbr_res.get('hypothesis_tokens', 0)} "
+                    f"final_cap={mbr_res.get('final_output_budget', '?')} "
+                    f"grid_out={mbr_res.get('grid_tokens', 0)}"
+                )
+            else:
+                arc_eval_log(
+                    f"[ARC] <<< task {task_idx + 1}/{len(task_ids)} {task_id} "
+                    f"test#{test_index} — MULTI-AGENT pooled | "
+                    f"{format_timing_line(mbr_timing)} | "
+                    f"vote={vote_meta.get('winner_votes', 0)}/"
+                    f"{vote_meta.get('n_parsed', 0)} "
+                    f"agents={multi_agent_pool.n_agents} "
+                    f"tokens_total={mbr_res.get('num_tokens', 0)}"
+                )
             summary["mbr"]["time"] += mbr_elapsed
-            summary["mbr"]["tokens"] += mbr_res["num_tokens"]
+            summary["mbr"]["tokens"] += int(mbr_res.get("num_tokens", 0))
             summary["mbr"]["tests"] += 1
-            mbr_answer_text = extract_arc_generated_suffix(
-                mbr_res, mbr_prompt_for_extract
-            )
-            mbr_pred = parse_arc_answer_grid(mbr_answer_text)
-            arc_eval_log(
-                f"[ARC] <<< task {task_idx + 1}/{len(task_ids)} {task_id} "
-                f"test#{test_index} — MBR done | {format_timing_line(mbr_timing)} | "
-                f"out_budget={mbr_res.get('output_budget_cap', ARC_MBR_OUTPUT_TOKEN_BUDGET)} "
-                f"hyp={mbr_res.get('hypothesis_tokens', 0)} "
-                f"final_cap={mbr_res.get('final_output_budget', '?')} "
-                f"grid_out={mbr_res.get('grid_tokens', 0)}"
-            )
 
             grade_info = grade_arc_test_case(
                 task_id=task_id,
@@ -5962,6 +6567,7 @@ def evaluate_arc_dataset(
                 "mbr_match_rate": mbr_stats["match_rate"],
                 "mbr_timing": mbr_timing,
                 "mbr_mode": mbr_res.get("generation_mode"),
+                "multi_agent_vote": vote_meta if multi_agent_pool is not None else None,
             }
             summary["answer_comparisons"].append(comparison_rec)
 
@@ -6231,6 +6837,11 @@ def benchmark(
 # MAIN ENTRY POINT (Kaggle script style - just run the file)
 # =============================================================================
 if __name__ == "__main__":
+    if "--mbr-agent-worker" in sys.argv:
+        _wi = sys.argv.index("--mbr-agent-worker")
+        _multi_agent_worker_main(int(sys.argv[_wi + 1]), sys.argv[_wi + 2])
+        raise SystemExit(0)
+
     args = parse_cli_args()
 
     print(
@@ -6252,8 +6863,42 @@ if __name__ == "__main__":
 
     # 3) Choose & load model (local/offline first; remote only when online)
     model_name = "unknown"
+    multi_agent_pool: Optional[MultiAgentEnginePool] = None
+    run_arc_eval = (
+        not args.demo_only
+        and args.eval_challenges
+        and args.eval_solutions
+    )
     try:
-        if PREFER_LOCAL_MODELS:
+        if ARC_MULTI_AGENT_ENABLED and run_arc_eval:
+            bundle_base, _bundle_draft = discover_qwen_dflash_bundle_paths()
+            gen_path = (
+                bundle_base
+                or resolve_checkpoint_dir(LOCAL_BASE_DIR)
+                or resolve_local_model_path()
+            )
+            if gen_path:
+                gen_path, _draft = resolve_generation_model_path(gen_path)
+            if not gen_path or not os.path.isdir(gen_path):
+                raise RuntimeError(
+                    f"[MULTI-AGENT] BASE checkpoint not found for pool "
+                    f"(tried bundle={bundle_base!r}, LOCAL_BASE_DIR={LOCAL_BASE_DIR!r})"
+                )
+            model_name = gen_path
+            print(
+                f"\n[MULTI-AGENT] Spawning {ARC_MULTI_AGENT_N} subprocess Qwen workers "
+                f"(parent process does not load vLLM — saves coordinator GPU VRAM)."
+            )
+            multi_agent_pool = create_multi_agent_pool(gen_path)
+            tokenizer = AutoTokenizer.from_pretrained(
+                gen_path,
+                trust_remote_code=True,
+                local_files_only=True,
+            )
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            vllm_llm, hf_model = None, None
+        elif PREFER_LOCAL_MODELS:
             dflash_llm, dflash_tok, base_llm, base_tok = load_local_models()
             vllm_llm, tokenizer, hf_model = dflash_llm, dflash_tok, None
             model_name = resolve_local_model_path() or LOCAL_DFLASH_DIR or "local"
@@ -6270,15 +6915,13 @@ if __name__ == "__main__":
     # 4) Sanity: force the banner again so it is unmistakable in the log
     print_one_million_brains_banner(_LIVE_PATCH_SUCCESS)
 
-    verify_inference_engine(vllm_llm, tokenizer)
+    if multi_agent_pool is None:
+        verify_inference_engine(vllm_llm, tokenizer)
+    else:
+        print("[VERIFY] Multi-agent pool ready — per-agent smoke tests run at worker startup.")
 
     # 5) Evaluation / benchmark
     results: Dict[str, Any] = {}
-    run_arc_eval = (
-        not args.demo_only
-        and args.eval_challenges
-        and args.eval_solutions
-    )
     run_demo = args.demo_only or args.run_demo_benchmark or not run_arc_eval
 
     if run_arc_eval:
@@ -6291,12 +6934,19 @@ if __name__ == "__main__":
             max_new_tokens=args.eval_max_new_tokens,
             split=args.arc_split,
             visual_grading=ARC_VISUAL_GRADING and not args.no_arc_visuals,
+            multi_agent_pool=multi_agent_pool,
         )
 
     if run_demo:
-        results["demo"] = benchmark(
-            vllm_llm, tokenizer, BENCHMARK_PROMPT, max_new=TARGET_MAX_TOKENS
-        )
+        if vllm_llm is None:
+            print("[demo] Skipped — multi-agent mode does not load a parent vLLM engine.")
+        else:
+            results["demo"] = benchmark(
+                vllm_llm, tokenizer, BENCHMARK_PROMPT, max_new=TARGET_MAX_TOKENS
+            )
+
+    if multi_agent_pool is not None:
+        multi_agent_pool.shutdown()
 
     # 6) Final summary line (useful when scanning Kaggle logs)
     if "demo" in results:

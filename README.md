@@ -24,7 +24,7 @@ This is the **Fast Million Brains** idea: rapidly reconfiguring a compact set of
 
 ## Key Files
 
-- `million_brains_dflash.py` — the full implementation (installs vLLM + dependencies, live monkey-patches for DFlash-style extension, runs a benchmark comparing classic vs. million-brains-dflash mode).
+- `million_brains_dflash.py` — the full implementation (installs vLLM + dependencies, live monkey-patches for DFlash-style extension, runs the million-brains-dflash benchmark).
 
 ## Quick Start (Kaggle)
 
@@ -34,7 +34,7 @@ This is the **Fast Million Brains** idea: rapidly reconfiguring a compact set of
    - Perform the live-edit / monkey-patch of vLLM draft mechanisms
    - Print the **MILLION-BRAINS-DFLASH INITIALIZED** banner
    - Load a small Qwen model (with fallbacks)
-   - Run head-to-head benchmark (classic vs. full feature-slot parallel mode)
+   - Run the million-brains-dflash benchmark (K=4 feature-slot parallel mode)
    - Report tokens/sec, average accepted tokens per block, feature reallocations, etc.
 
 ## How the "Grammar" Works
@@ -56,12 +56,12 @@ All 11,880 possible allocations (for K=4) are reachable and deterministic given 
 
 ## Benchmark Output (example)
 
-The script ends with a comparison table:
+The script ends with a results table:
 
-- Tokens/sec for classic vs. million-brains-dflash
+- Tokens/sec for million-brains-dflash
 - Average accepted tokens per super-block
 - Number of feature reallocations (how often the permutation grammar + mirror mechanism swapped in better features)
-- Side-by-side generated samples
+- Sample generated output
 
 ## Requirements
 
