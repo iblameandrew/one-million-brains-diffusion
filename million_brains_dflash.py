@@ -180,7 +180,7 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-17n"  # bump when re-uploading to Kaggle to confirm latest script
+SCRIPT_VERSION = "2026-06-17p"  # bump when re-uploading to Kaggle to confirm latest script
 K = 4  # benchmark / token-speculative super-block width (not ARC hypothesis count)
 ARC_HYPOTHESIS_SLOTS = 8  # ARC eval: batched hypothesis proposals per engine (vLLM shows N/N)
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
@@ -228,7 +228,7 @@ VLLM_GPU_MEMORY_UTILIZATION = 0.88  # base-only fallback; spec uses VLLM_SPEC_GP
 VLLM_TENSOR_PARALLEL_SIZE = 0  # 0=auto (retry with tp=2 when 2+ GPUs visible)
 # vLLM native speculative decoding (DFlash draft + target base in one engine)
 # Stock Kaggle vLLM cannot load Qwen3.5-4B-DFlash as draft_model (TransformersForCausalLM crash).
-# MBR K=4 hypothesis slots + final grid = app-level parallel drafting on base-only vLLM.
+# ARC Phase-1 (ARC_HYPOTHESIS_SLOTS) + Phase-2 final grid = app-level parallel drafting on base-only vLLM.
 ENABLE_VLLM_SPECULATIVE_DECODING = False  # set True only with vllm-project/speculators (method=dflash)
 VLLM_REQUIRE_SPECULATIVE = False  # must stay False on Kaggle — spec attempts loop-crash the kernel
 VLLM_SINGLE_ENGINE_SPECULATIVE = False  # only skips multi-agent when native vLLM spec is ON
@@ -1869,8 +1869,14 @@ def print_one_million_brains_banner(success: bool = True):
     print(banner)
     if success:
         print(
-            " ONE-MILLION-BRAINS-FLASH INITIALIZED  |  K=%d  |  FEATURES=%d  |  REALLOCATION=%s"
-            % (K, NUM_PERSONALITY_FEATURES, str(ENABLE_FEATURE_REALLOCATION).upper())
+            " ONE-MILLION-BRAINS-FLASH INITIALIZED  |  "
+            "ARC_HYP_SLOTS=%d  |  BENCHMARK_K=%d  |  FEATURES=%d  |  REALLOCATION=%s"
+            % (
+                ARC_HYPOTHESIS_SLOTS,
+                K,
+                NUM_PERSONALITY_FEATURES,
+                str(ENABLE_FEATURE_REALLOCATION).upper(),
+            )
         )
         print(
             " Patch status: %s"
@@ -2986,8 +2992,8 @@ def _vllm_dflash_draft_speculative_viable(draft_path: Optional[str]) -> Tuple[bo
         False,
         "Qwen3.5-4B-DFlash draft incompatible with stock vLLM draft_model "
         "(crashes loading drafter as TransformersForCausalLM). "
-        "Using base-only vLLM; MBR K=4 hypothesis batch = parallel drafting. "
-        "Native DFlash spec requires vllm-project/speculators.",
+        f"Using base-only vLLM; ARC Phase-1 batches {ARC_HYPOTHESIS_SLOTS} hypothesis proposals "
+        f"(not BENCHMARK_K={K}). Native DFlash spec requires vllm-project/speculators.",
     )
 
 
@@ -3793,9 +3799,13 @@ def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
     )
     gen_path = getattr(llm, "model_path", None)
     draft_path = getattr(llm, "dflash_draft_path", None)
-    print("\n[VERIFY] Inference engine smoke test")
+    print("\n[VERIFY] Inference engine smoke test (parent/coordinator engine)")
     print(f"    script   : {SCRIPT_VERSION}")
     print(f"    engine   : {engine_label}")
+    print(
+        f"    arc_eval : Phase1={arc_hypothesis_k()} proposals/engine, "
+        f"Phase2=1 grid/engine (see ARC PIPELINE banner at eval start)"
+    )
     if torch.cuda.is_available():
         snap = _cuda_vram_snapshot()
         print(
@@ -5282,6 +5292,10 @@ def collect_feature_slot_hypotheses(
             f"Qwen native context is 150k+; only GPU KV cache limits vLLM."
         )
 
+    arc_eval_log(
+        f"[ARC-PHASE-1] Hypothesis pool: batching {k} text proposals in one vLLM call "
+        f"(watch for 'Rendering prompts: {k}/{k}' — NOT the voter/agent count)"
+    )
     outs = vllm_llm.generate(prompts, sp_list)
     for out, (slot_i, feat_name, _params), prompt in zip(outs, slot_meta, prompts):
         gen_ids: List[int] = list(out.outputs[0].token_ids) if out.outputs else []
@@ -5304,6 +5318,11 @@ def collect_feature_slot_hypotheses(
                 f"    {rec['text'][:500]}{'...' if len(rec['text']) > 500 else ''}"
             )
 
+    hyp_tok = sum(int(h.get("num_tokens", 0)) for h in hypotheses)
+    arc_eval_log(
+        f"[ARC-PHASE-1] Hypothesis pool done: {len(hypotheses)} proposals, "
+        f"{hyp_tok} output tokens (feeds Phase 2)"
+    )
     return hypotheses
 
 
@@ -5394,16 +5413,19 @@ def arc_mbr_hypothesis_pipeline(
         )
         final_max_tokens = ctx_allows
 
+    arc_eval_log(
+        f"[ARC-BUDGET] total_out={ARC_MBR_OUTPUT_TOKEN_BUDGET} | "
+        f"phase1_hyp_used={hyp_token_total} | phase2_final_allocated={final_max_tokens} "
+        f"(grid_need~{arc_final_grid_max_tokens(task)})"
+    )
+    arc_eval_log(
+        f"[ARC-PHASE-2] Final grid: 1 synthesis prompt "
+        f"(watch for 'Rendering prompts: 1/1') | prompt={final_in}tok | "
+        f"max_out={final_max_tokens} | thinking={final_thinking} | prefill={final_prefill!r}"
+    )
     if verbose or STREAM_ALL_OUTPUT:
         stream_log(
-            f"[MBR-BUDGET] output_cap={ARC_MBR_OUTPUT_TOKEN_BUDGET} "
-            f"hyp_used={hyp_token_total} final_allocated={final_max_tokens} "
-            f"(grid_need~{arc_final_grid_max_tokens(task)})"
-        )
-        stream_log(
-            f"[MBR-FINAL] grid synthesis "
-            f"(max_tokens={final_max_tokens}, prompt={final_in}tok, body={body_tok}tok({body_fmt}), "
-            f"engine_ctx={engine_ctx}, thinking={final_thinking}, prefill={final_prefill!r})"
+            f"[MBR-FINAL] detail: body={body_tok}tok({body_fmt}) engine_ctx={engine_ctx}"
         )
 
     grid_res = arc_direct_generate(
@@ -6471,7 +6493,7 @@ class MultiAgentEnginePool:
         )
         self._workers: List[Dict[str, Any]] = []
         script_path = _resolve_multi_agent_worker_script_path()
-        print(f"[MULTI-AGENT] Worker script: {script_path}")
+        print(f"[VOTER-POOL] Worker script: {script_path}")
         for agent_id in range(self.n_agents):
             gpu_id = agent_id % self.n_gpus
             env = os.environ.copy()
@@ -6494,11 +6516,11 @@ class MultiAgentEnginePool:
                 ready = json.loads(ready_line)
             except json.JSONDecodeError as exc:
                 raise RuntimeError(
-                    f"Multi-agent worker {agent_id} failed during startup: {ready_line!r}"
+                    f"Voter-pool worker {agent_id} failed during startup: {ready_line!r}"
                 ) from exc
             if ready.get("status") != "ready":
                 raise RuntimeError(
-                    f"Multi-agent worker {agent_id} failed: {ready}"
+                    f"Voter-pool worker {agent_id} failed: {ready}"
                 )
             self._workers.append(
                 {
@@ -6510,13 +6532,15 @@ class MultiAgentEnginePool:
                     "max_ctx": ready.get("max_ctx"),
                 }
             )
+        hyp_n = arc_hypothesis_k()
         print(
-            f"[MULTI-AGENT] Pool ready: {self.n_agents} Qwen instances on "
-            f"{self.n_gpus} GPU(s), ~{self.gpu_util:.2f} gpu_util/engine"
+            f"[VOTER-POOL] Ready: {self.n_agents} independent Qwen voters on "
+            f"{self.n_gpus} GPU(s) (~{self.gpu_util:.2f} gpu_util/engine). "
+            f"Each voter: Phase1={hyp_n} proposals + Phase2=1 grid."
         )
         for w in self._workers:
             print(
-                f"    agent {w['agent_id']} -> cuda:{w['gpu_id']} "
+                f"    voter {w['agent_id']} -> cuda:{w['gpu_id']} "
                 f"(max_ctx={w.get('max_ctx', '?')})"
             )
 
@@ -6531,6 +6555,12 @@ class MultiAgentEnginePool:
         max_new_tokens: int = EVAL_MAX_NEW_TOKENS,
     ) -> List[Dict[str, Any]]:
         hyp_k = arc_hypothesis_k() if k is None else int(k)
+        print(
+            f"[VOTER-POOL] Dispatch {task_id} test#{test_index}: "
+            f"{self.n_agents} voters in parallel "
+            f"(each Phase1={hyp_k} props -> Phase2=1 grid) -> plurality vote",
+            flush=True,
+        )
         payload_base = {
             "task_id": task_id,
             "task": task,
@@ -6591,6 +6621,91 @@ def create_multi_agent_pool(gen_path: str) -> MultiAgentEnginePool:
     return MultiAgentEnginePool(gen_path, n_agents=ARC_MULTI_AGENT_N)
 
 
+def print_post_load_arc_config(
+    multi_agent_pool: Optional[MultiAgentEnginePool],
+    *,
+    single_engine_reason: Optional[str] = None,
+) -> None:
+    """Short cheat-sheet printed right after model load (before ARC eval banner)."""
+    hyp_n = arc_hypothesis_k()
+    print("\n" + "-" * 72)
+    print("RUNTIME ARC CONFIG — QUICK REFERENCE")
+    print("-" * 72)
+    if multi_agent_pool is not None:
+        n = multi_agent_pool.n_agents
+        print(
+            f"  Voter pool   : {n} independent Qwen workers on "
+            f"{multi_agent_pool.n_gpus} GPU(s)"
+        )
+        print(
+            f"  Per test     : {n} voters x (Phase1:{hyp_n} props + Phase2:1 grid) "
+            f"-> 1 plurality-voted grid"
+        )
+    else:
+        suffix = f" — {single_engine_reason}" if single_engine_reason else ""
+        print(f"  Voter pool   : SINGLE ENGINE{suffix}")
+        print(f"  Per test     : Phase1:{hyp_n} props -> Phase2:1 grid (no cross-engine vote)")
+    print(f"  BENCHMARK_K  : {K} (demo benchmark only — NOT used in ARC Phase 1/2)")
+    print(
+        f"  vLLM hints   : Phase1 shows 'Rendering prompts: {hyp_n}/{hyp_n}' | "
+        f"Phase2 shows 'Rendering prompts: 1/1'"
+    )
+    print("-" * 72 + "\n")
+
+
+def print_arc_pipeline_architecture(
+    *,
+    multi_agent_pool: Optional[MultiAgentEnginePool] = None,
+    vllm_llm: Optional[Any] = None,
+) -> None:
+    """
+    One-screen map of ARC eval logging — avoids confusing vLLM N/N with voter count or benchmark K.
+    """
+    hyp_n = arc_hypothesis_k()
+    print("\n" + "=" * 80)
+    print("ARC PIPELINE — HOW TO READ THE LOGS")
+    print("=" * 80)
+    print(
+        "  Each Qwen engine runs TWO phases per test case:\n"
+        f"    [ARC-PHASE-1]  Hypothesis pool  -> {hyp_n} parallel TEXT proposals\n"
+        "                   vLLM shows: Rendering prompts: "
+        f"{hyp_n}/{hyp_n}  (= proposal count, NOT voters)\n"
+        "    [ARC-PHASE-2]  Final grid       -> 1 JSON grid synthesis\n"
+        "                   vLLM shows: Rendering prompts: 1/1"
+    )
+    print("")
+    if multi_agent_pool is not None:
+        n = multi_agent_pool.n_agents
+        g = multi_agent_pool.n_gpus
+        print(
+            f"  VOTER POOL (multi-agent): {n} independent Qwen workers on {g} GPU(s)\n"
+            f"    Each voter runs Phase 1 ({hyp_n} props) + Phase 2, then plurality vote\n"
+            f"    Text rules per test: up to {n} voters x {hyp_n} proposals = {n * hyp_n}\n"
+            f"    Final answer: 1 grid chosen by {ARC_MULTI_AGENT_VOTE} vote across {n} voters"
+        )
+    else:
+        print(
+            f"  VOTER POOL: single engine (set ARC_MULTI_AGENT_ENABLED=True for "
+            f"{ARC_MULTI_AGENT_N} voters)\n"
+            f"    Phase 1 collects {hyp_n} proposals -> Phase 2 emits 1 grid (no cross-engine vote)"
+        )
+    print("")
+    print(
+        f"  BENCHMARK_K={K} is for the demo/token-speculative path only — "
+        f"ARC hypothesis count is ARC_HYPOTHESIS_SLOTS={ARC_HYPOTHESIS_SLOTS}"
+    )
+    if vllm_llm is not None:
+        print(
+            f"  vLLM native DFlash speculative: {_inference_speculative_status(vllm_llm)} "
+            f"(ENABLE_VLLM_SPECULATIVE_DECODING={ENABLE_VLLM_SPECULATIVE_DECODING})"
+        )
+    else:
+        print(
+            "  vLLM native DFlash speculative: n/a (multi-agent parent; each worker loads its own engine)"
+        )
+    print("=" * 80 + "\n")
+
+
 def print_multi_agent_vote_summary(
     *,
     task_id: str,
@@ -6600,17 +6715,20 @@ def print_multi_agent_vote_summary(
     pooled_pred: Optional[List[List[int]]],
     gold: Optional[List[List[int]]] = None,
 ) -> None:
+    hyp_n = arc_hypothesis_k()
+    n_agents = int(vote_meta.get("n_agents", len(agent_results)))
     print(
-        f"[MULTI-AGENT] {task_id} test#{test_index} — "
-        f"{vote_meta.get('winner_votes', 0)}/{vote_meta.get('n_parsed', 0)} parsed agents "
-        f"agree on pooled grid (tie={vote_meta.get('tie', False)})"
+        f"[ARC-VOTE] {task_id} test#{test_index} — plurality result after "
+        f"{n_agents} voters (each voter ran Phase1={hyp_n} props + Phase2 grid): "
+        f"{vote_meta.get('winner_votes', 0)}/{vote_meta.get('n_parsed', 0)} parsed grids agree "
+        f"(tie={vote_meta.get('tie', False)})"
     )
     for rec in agent_results:
         agent_id = rec.get("agent_id", "?")
         gpu_id = rec.get("gpu_id", "?")
         status = rec.get("status", "ok")
         if status != "ok":
-            print(f"    agent {agent_id} cuda:{gpu_id} ERROR: {rec.get('error', '?')}")
+            print(f"    voter {agent_id} cuda:{gpu_id} ERROR: {rec.get('error', '?')}")
             continue
         pred = rec.get("prediction")
         label = "UNPARSED"
@@ -6621,7 +6739,7 @@ def print_multi_agent_vote_summary(
         elapsed = rec.get("elapsed_s", 0.0)
         tok = rec.get("num_tokens", 0)
         print(
-            f"    agent {agent_id} cuda:{gpu_id} {label:<14} "
+            f"    voter {agent_id} cuda:{gpu_id} {label:<14} "
             f"{tok} tok in {float(elapsed):.1f}s | {rec.get('grid_json', '')[:72]}"
         )
     print(f"    POOLED -> {format_grid_json(pooled_pred)[:120]}")
@@ -6642,6 +6760,7 @@ def evaluate_arc_dataset(
     split: str = ARC_DATA_SPLIT,
     visual_grading: bool = ARC_VISUAL_GRADING,
     multi_agent_pool: Optional[MultiAgentEnginePool] = None,
+    voter_pool_single_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run million-brains-dflash on an ARC-AGI split.
@@ -6690,35 +6809,42 @@ def evaluate_arc_dataset(
         print(f"Smoke task only: {EVAL_SMOKE_TASK_ID}")
     print(
         f"ARC generation: chat_template={ARC_USE_CHAT_TEMPLATE}, "
-        f"temp={ARC_GENERATION_TEMPERATURE}"
+        f"temp={ARC_GENERATION_TEMPERATURE}, "
+        f"output_budget={ARC_MBR_OUTPUT_TOKEN_BUDGET} tok/test, "
+        f"hyp_thinking={ARC_HYPOTHESIS_ENABLE_THINKING}, "
+        f"final_thinking={ARC_FINAL_ENABLE_THINKING}"
     )
-    print(
-        f"MBR mode: {'hypothesis slots + final grid' if ARC_SLOT_HYPOTHESIS_MODE else 'token speculative'} "
-        f"| output_budget={ARC_MBR_OUTPUT_TOKEN_BUDGET} tok/test "
-        f"| final_reserve>={int(ARC_MBR_OUTPUT_TOKEN_BUDGET * ARC_FINAL_GRID_MIN_FRACTION)} "
-        f"| hyp_slots={arc_hypothesis_k()} (ARC_HYPOTHESIS_SLOTS) benchmark_K={k} "
-        f"| hyp_thinking={ARC_HYPOTHESIS_ENABLE_THINKING}(cap={ARC_HYPOTHESIS_THINKING_TOKEN_CAP}) "
-        f"final_thinking={ARC_FINAL_ENABLE_THINKING} "
-        f"| vLLM ctx auto={arc_vllm_context_budget()} eager={VLLM_ENFORCE_EAGER}"
+    print_arc_pipeline_architecture(
+        multi_agent_pool=multi_agent_pool,
+        vllm_llm=vllm_llm,
     )
     if multi_agent_pool is not None:
         print(
-            f"Multi-agent: ENABLED | agents={multi_agent_pool.n_agents} "
-            f"| GPUs={multi_agent_pool.n_gpus} | vote={ARC_MULTI_AGENT_VOTE} "
-            f"| gpu_util/engine~{multi_agent_pool.gpu_util:.2f} "
-            f"| speculative_per_agent={'off' if ARC_MULTI_AGENT_DISABLE_SPECULATIVE else 'on'}"
+            f"[CONFIG] Voter pool ACTIVE: {multi_agent_pool.n_agents} workers / "
+            f"{multi_agent_pool.n_gpus} GPUs | vote={ARC_MULTI_AGENT_VOTE} | "
+            f"gpu_util/engine~{multi_agent_pool.gpu_util:.2f}"
         )
     else:
+        if voter_pool_single_reason:
+            reason = voter_pool_single_reason
+        elif not ARC_MULTI_AGENT_ENABLED:
+            reason = "ARC_MULTI_AGENT_ENABLED=False"
+        elif ARC_MULTI_AGENT_ENABLED:
+            reason = (
+                f"pool not active (expected {ARC_MULTI_AGENT_N} voters) — "
+                "see [VOTER-POOL][WARN] at startup"
+            )
+        else:
+            reason = "single engine"
         print(
-            f"Multi-agent: disabled (single engine) | "
-            f"decision_pool={arc_hypothesis_k()} hypothesis proposals/engine "
-            f"(enable ARC_MULTI_AGENT_ENABLED for {ARC_MULTI_AGENT_N} independent voters)"
+            f"[CONFIG] Voter pool: SINGLE ENGINE ({reason}) | "
+            f"Phase1={arc_hypothesis_k()} props/test | Phase2=1 grid/test"
         )
-        print(
-            f"vLLM speculative: {_inference_speculative_status(vllm_llm)} "
-            f"(ENABLE_VLLM_SPECULATIVE_DECODING={ENABLE_VLLM_SPECULATIVE_DECODING}, "
-            f"method={VLLM_SPECULATIVE_METHOD}, n={VLLM_NUM_SPECULATIVE_TOKENS})"
-        )
+        if vllm_llm is not None:
+            print(
+                f"[CONFIG] vLLM speculative: {_inference_speculative_status(vllm_llm)} "
+                f"(ENABLE_VLLM_SPECULATIVE_DECODING={ENABLE_VLLM_SPECULATIVE_DECODING})"
+            )
     if visual_grading and ARC_SAVE_GRADE_IMAGES:
         print(f"Grade images: {_arc_grade_output_dir()}/")
     print("-" * 80)
@@ -6757,17 +6883,18 @@ def evaluate_arc_dataset(
             gold = gold_tests[test_index]
             test_input = task["test"][test_index]["input"]
 
-            mbr_mode = (
-                "hypothesis-slots+final-grid"
-                if ARC_SLOT_HYPOTHESIS_MODE
-                else "token-speculative"
-            )
+            hyp_n = arc_hypothesis_k()
             if multi_agent_pool is not None:
-                mbr_mode = f"multi-agent({multi_agent_pool.n_agents})+{mbr_mode}"
-            arc_eval_log(
-                f"\n[ARC] >>> task {task_idx + 1}/{len(task_ids)} {task_id} "
-                f"test#{test_index} — starting MBR pass ({mbr_mode})…"
-            )
+                arc_eval_log(
+                    f"\n[ARC] >>> task {task_idx + 1}/{len(task_ids)} {task_id} "
+                    f"test#{test_index} — {multi_agent_pool.n_agents} voters x "
+                    f"(Phase1:{hyp_n} props + Phase2:1 grid) -> plurality vote"
+                )
+            else:
+                arc_eval_log(
+                    f"\n[ARC] >>> task {task_idx + 1}/{len(task_ids)} {task_id} "
+                    f"test#{test_index} — single engine: Phase1:{hyp_n} props -> Phase2:1 grid"
+                )
             t0 = time.perf_counter()
             agent_results: List[Dict[str, Any]] = []
             vote_meta: Dict[str, Any] = {}
@@ -6869,21 +6996,18 @@ def evaluate_arc_dataset(
             if multi_agent_pool is None:
                 arc_eval_log(
                     f"[ARC] <<< task {task_idx + 1}/{len(task_ids)} {task_id} "
-                    f"test#{test_index} — MBR done | {format_timing_line(mbr_timing)} | "
-                    f"out_budget={mbr_res.get('output_budget_cap', ARC_MBR_OUTPUT_TOKEN_BUDGET)} "
-                    f"hyp={mbr_res.get('hypothesis_tokens', 0)} "
-                    f"final_cap={mbr_res.get('final_output_budget', '?')} "
-                    f"grid_out={mbr_res.get('grid_tokens', 0)}"
+                    f"test#{test_index} — done (single engine) | {format_timing_line(mbr_timing)} | "
+                    f"phase1_hyp_tok={mbr_res.get('hypothesis_tokens', 0)} "
+                    f"phase2_grid_tok={mbr_res.get('grid_tokens', 0)} "
+                    f"budget={mbr_res.get('output_budget_cap', ARC_MBR_OUTPUT_TOKEN_BUDGET)}"
                 )
             else:
                 arc_eval_log(
                     f"[ARC] <<< task {task_idx + 1}/{len(task_ids)} {task_id} "
-                    f"test#{test_index} — MULTI-AGENT pooled | "
-                    f"{format_timing_line(mbr_timing)} | "
+                    f"test#{test_index} — done (voter pool) | {format_timing_line(mbr_timing)} | "
                     f"vote={vote_meta.get('winner_votes', 0)}/"
-                    f"{vote_meta.get('n_parsed', 0)} "
-                    f"agents={multi_agent_pool.n_agents} "
-                    f"tokens_total={mbr_res.get('num_tokens', 0)}"
+                    f"{vote_meta.get('n_parsed', 0)} of {multi_agent_pool.n_agents} voters | "
+                    f"tokens_all_voters={mbr_res.get('num_tokens', 0)}"
                 )
             summary["mbr"]["time"] += mbr_elapsed
             summary["mbr"]["tokens"] += int(mbr_res.get("num_tokens", 0))
@@ -7128,7 +7252,9 @@ def benchmark(
     and sample text.
     """
     print("\n" + "=" * 80)
-    print("BENCHMARK: MILLION-BRAINS-DFLASH (K=4, Fast Million Brains)")
+    print(
+        f"BENCHMARK: MILLION-BRAINS-DFLASH (BENCHMARK_K={K} — demo only, not ARC eval)"
+    )
     print("=" * 80)
     print(f"Prompt (first 180 chars): {prompt[:180]}...")
     print(
@@ -7216,7 +7342,13 @@ if __name__ == "__main__":
     )
     print(f"    SCRIPT_VERSION={SCRIPT_VERSION}")
     print(
-        f"    K={K}, BLOCK_SIZE={BLOCK_SIZE}, ENABLE_FEATURE_REALLOCATION={ENABLE_FEATURE_REALLOCATION}"
+        f"    ARC_HYPOTHESIS_SLOTS={ARC_HYPOTHESIS_SLOTS} (Phase-1 proposal pool) | "
+        f"BENCHMARK_K={K} (demo only) | BLOCK_SIZE={BLOCK_SIZE}"
+    )
+    print(
+        f"    ARC_MULTI_AGENT_ENABLED={ARC_MULTI_AGENT_ENABLED} "
+        f"ARC_MULTI_AGENT_N={ARC_MULTI_AGENT_N} | "
+        f"ENABLE_FEATURE_REALLOCATION={ENABLE_FEATURE_REALLOCATION}"
     )
     print(f"    SEED={SEED}, TARGET_MAX_TOKENS={TARGET_MAX_TOKENS}")
     print_arc_data_config(
@@ -7231,6 +7363,7 @@ if __name__ == "__main__":
     # 3) Choose & load model (local/offline first; remote only when online)
     model_name = "unknown"
     multi_agent_pool: Optional[MultiAgentEnginePool] = None
+    voter_pool_single_reason: Optional[str] = None
     run_arc_eval = (
         not args.demo_only
         and args.eval_challenges
@@ -7246,9 +7379,8 @@ if __name__ == "__main__":
             )
         )
         print(
-            f"[CONFIG] ARC_MULTI_AGENT_ENABLED={ARC_MULTI_AGENT_ENABLED} "
-            f"use_multi_agent={use_multi_agent} "
-            f"ARC_HYPOTHESIS_SLOTS={ARC_HYPOTHESIS_SLOTS} "
+            f"[CONFIG] voter_pool={'MULTI-AGENT x' + str(ARC_MULTI_AGENT_N) if use_multi_agent else 'SINGLE ENGINE'} | "
+            f"hypothesis_slots={ARC_HYPOTHESIS_SLOTS}/test/phase1 | "
             f"run_arc_eval={run_arc_eval}"
         )
         if (
@@ -7257,10 +7389,11 @@ if __name__ == "__main__":
             and not use_multi_agent
             and ENABLE_VLLM_SPECULATIVE_DECODING
         ):
-            print(
-                "[LOAD] Multi-agent pool skipped — VLLM_SINGLE_ENGINE_SPECULATIVE=True "
-                "(one DFlash spec engine on 4×L4; 8 workers cannot load draft+target)."
+            voter_pool_single_reason = (
+                "VLLM_SINGLE_ENGINE_SPECULATIVE=True with native spec ON "
+                "(one spec engine; cannot spawn voter pool)"
             )
+            print(f"[VOTER-POOL] Skipped — {voter_pool_single_reason}")
         if use_multi_agent:
             bundle_base, _bundle_draft = discover_qwen_dflash_bundle_paths()
             gen_path = (
@@ -7272,13 +7405,13 @@ if __name__ == "__main__":
                 gen_path, _draft = resolve_generation_model_path(gen_path)
             if not gen_path or not os.path.isdir(gen_path):
                 raise RuntimeError(
-                    f"[MULTI-AGENT] BASE checkpoint not found for pool "
+                    f"[VOTER-POOL] BASE checkpoint not found for pool "
                     f"(tried bundle={bundle_base!r}, LOCAL_BASE_DIR={LOCAL_BASE_DIR!r})"
                 )
             model_name = gen_path
             print(
-                f"\n[MULTI-AGENT] Spawning {ARC_MULTI_AGENT_N} subprocess Qwen workers "
-                f"(parent process does not load vLLM — saves coordinator GPU VRAM)."
+                f"\n[VOTER-POOL] Spawning {ARC_MULTI_AGENT_N} subprocess Qwen voters "
+                f"(parent does not load vLLM — each voter runs Phase1+Phase2)."
             )
             multi_agent_pool = create_multi_agent_pool(gen_path)
             tokenizer = AutoTokenizer.from_pretrained(
@@ -7300,15 +7433,30 @@ if __name__ == "__main__":
     except RuntimeError as _local_e:
         print(_local_e)
         if ARC_MULTI_AGENT_ENABLED and run_arc_eval:
+            voter_pool_single_reason = (
+                "voter pool spawn failed — using single engine with "
+                f"Phase1={ARC_HYPOTHESIS_SLOTS} props"
+            )
             print(
-                "[MULTI-AGENT][WARN] Pool spawn failed — falling back to single engine "
-                f"with {ARC_HYPOTHESIS_SLOTS} hypothesis slots. "
+                f"[VOTER-POOL][WARN] {voter_pool_single_reason}. "
                 "Save script to /kaggle/working/million_brains_dflash.py or set "
                 "MBR_WORKER_SCRIPT_PATH."
             )
+        elif not ARC_MULTI_AGENT_ENABLED and run_arc_eval:
+            voter_pool_single_reason = "ARC_MULTI_AGENT_ENABLED=False"
         print("[LOCAL-LOAD] Falling back to remote model resolution...")
         model_name, backend = pick_model_name()
         vllm_llm, tokenizer, hf_model = load_models(model_name)
+
+    if (
+        multi_agent_pool is None
+        and voter_pool_single_reason is None
+        and run_arc_eval
+    ):
+        if not ARC_MULTI_AGENT_ENABLED:
+            voter_pool_single_reason = "ARC_MULTI_AGENT_ENABLED=False"
+        else:
+            voter_pool_single_reason = "single engine (voter pool not spawned)"
 
     # 4) Sanity: force the banner again so it is unmistakable in the log
     print_one_million_brains_banner(_LIVE_PATCH_SUCCESS)
@@ -7316,7 +7464,16 @@ if __name__ == "__main__":
     if multi_agent_pool is None:
         verify_inference_engine(vllm_llm, tokenizer)
     else:
-        print("[VERIFY] Multi-agent pool ready — per-agent smoke tests run at worker startup.")
+        print(
+            "[VERIFY] Voter pool ready — each worker ran a smoke test at startup "
+            f"(expect {ARC_MULTI_AGENT_N} x Phase1={arc_hypothesis_k()} + Phase2 per task)."
+        )
+
+    if run_arc_eval:
+        print_post_load_arc_config(
+            multi_agent_pool,
+            single_engine_reason=voter_pool_single_reason,
+        )
 
     # 5) Evaluation / benchmark
     results: Dict[str, Any] = {}
@@ -7333,11 +7490,15 @@ if __name__ == "__main__":
             split=args.arc_split,
             visual_grading=ARC_VISUAL_GRADING and not args.no_arc_visuals,
             multi_agent_pool=multi_agent_pool,
+            voter_pool_single_reason=voter_pool_single_reason,
         )
 
     if run_demo:
         if vllm_llm is None:
-            print("[demo] Skipped — multi-agent mode does not load a parent vLLM engine.")
+            print(
+                "[demo] Skipped — voter-pool mode has no parent vLLM engine "
+                f"(BENCHMARK_K={K} demo needs single-engine load)."
+            )
         else:
             results["demo"] = benchmark(
                 vllm_llm, tokenizer, BENCHMARK_PROMPT, max_new=TARGET_MAX_TOKENS
@@ -7376,7 +7537,15 @@ if __name__ == "__main__":
     try:
         payload: Dict[str, Any] = {
             "model": model_name,
-            "k": K,
+            "script_version": SCRIPT_VERSION,
+            "benchmark_k": K,
+            "arc_hypothesis_slots": ARC_HYPOTHESIS_SLOTS,
+            "arc_multi_agent_n": ARC_MULTI_AGENT_N,
+            "voter_pool": (
+                f"multi_x{multi_agent_pool.n_agents}"
+                if multi_agent_pool is not None
+                else "single"
+            ),
             "block_size": BLOCK_SIZE,
         }
         if "demo" in results:
