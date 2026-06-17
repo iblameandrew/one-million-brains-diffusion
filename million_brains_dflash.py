@@ -180,7 +180,7 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-17i"  # bump when re-uploading to Kaggle to confirm latest script
+SCRIPT_VERSION = "2026-06-17j"  # bump when re-uploading to Kaggle to confirm latest script
 K = 4  # number of parallel drafter streams / feature-slots per super-block
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
 BLOCK_SIZE = 6  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
@@ -223,15 +223,19 @@ DRAFT_BUNDLE_DIR_NAMES = frozenset({"qwen3.5-4b-dflash", "qwen3-5-4b-dflash"})
 VLLM_ENFORCE_EAGER = False  # prefer CUDA graphs; load loop retries enforce_eager=True on failure
 VLLM_RUNNER = "generate"  # do not let vLLM pick pooling/embedding runner
 VLLM_FALLBACK_TO_HF = True  # HuggingFace wrapper if vLLM still cannot load the checkpoint
-VLLM_GPU_MEMORY_UTILIZATION = 0.70  # single-GPU L4: higher util helps DFlash spec load (adaptive cap still applies)
+VLLM_GPU_MEMORY_UTILIZATION = 0.88  # base-only fallback; spec uses VLLM_SPEC_GPU_MEMORY_UTILIZATION
 VLLM_TENSOR_PARALLEL_SIZE = 0  # 0=auto (retry with tp=2 when 2+ GPUs visible)
 # vLLM native speculative decoding (DFlash draft + target base in one engine)
 ENABLE_VLLM_SPECULATIVE_DECODING = True
+VLLM_REQUIRE_SPECULATIVE = True  # refuse silent base-only fallback when DFlash draft is available
+VLLM_SINGLE_ENGINE_SPECULATIVE = True  # one spec engine on 4×L4; skips multi-agent pool (8 workers cannot fit draft)
 VLLM_SPECULATIVE_METHOD = "dflash"  # "dflash" | "draft_model" | "auto"
 VLLM_NUM_SPECULATIVE_TOKENS = BLOCK_SIZE  # DFlash block width per speculation step
-VLLM_SPEC_DRAFT_GPU_UTIL_SCALE = 1.0  # do not shrink util for target+draft (was 0.88; caused spec VRAM fallback)
-VLLM_SPEC_PREFER_LOWER_CONTEXT = True  # try spec at 12288 before full ARC max_model_len (fits draft+target on L4)
-VLLM_SPEC_FIRST_MAX_MODEL_LEN = 12288  # first speculative attempt context (raise if 30x30 truncates)
+VLLM_SPEC_GPU_MEMORY_UTILIZATION = 0.90  # draft+target needs ~90% of 22GB L4 (0.70 left no room for draft)
+VLLM_SPEC_DRAFT_GPU_UTIL_SCALE = 1.0  # do not shrink util for target+draft
+VLLM_SPEC_MAX_MODEL_LEN = 16384  # cap KV for spec load (prompt resolver shrinks; 22272 OOMs with draft on L4)
+VLLM_SPEC_PREFER_TENSOR_PARALLEL = 2  # try tp=2 first on Kaggle 4×L4 — spreads base weights across 2 GPUs
+VLLM_SPEC_TRY_SMALLEST_CONTEXT_FIRST = True  # 8192→16384 ascending; fits draft+target before huge KV reserve
 PREFER_HF_INFERENCE = False  # L4/A10+: prefer vLLM fast kernels; HF only on load failure
 SKIP_VLLM_FOR_QWEN35 = False  # attempt vLLM for Qwen3.5-4B (set True on broken vLLM hosts)
 AUTO_PREFETCH_TO_WORKING = True  # when online, cache a small Qwen checkpoint into /kaggle/working
@@ -2761,22 +2765,30 @@ def _cuda_vram_snapshot(device: int = 0) -> Dict[str, float]:
     }
 
 
-def _adaptive_vllm_gpu_util(requested: float) -> float:
+def _adaptive_vllm_gpu_util(requested: float, *, speculative: bool = False) -> float:
     """
     Cap gpu_memory_utilization so vLLM's requested slice fits in *free* VRAM.
     vLLM checks: free >= utilization * total (not utilization * free).
+    Speculative (base+draft) needs a higher floor — 0.70×22GB leaves no room for draft weights.
     """
     snap = _cuda_vram_snapshot()
     if snap["total_gib"] <= 0:
         return requested
-    safe = (snap["free_gib"] / snap["total_gib"]) * 0.88
-    util = min(float(requested), safe)
-    util = max(0.38, min(0.88, util))
+    if speculative:
+        safe = (snap["free_gib"] / snap["total_gib"]) * 0.95
+        util = min(float(requested), safe)
+        util = max(0.55, min(0.92, util))
+        label = "speculative"
+    else:
+        safe = (snap["free_gib"] / snap["total_gib"]) * 0.88
+        util = min(float(requested), safe)
+        util = max(0.38, min(0.88, util))
+        label = "base-only"
     print(
         f"[LOAD] VRAM cuda:0 "
         f"free {snap['free_gib']:.2f}/{snap['total_gib']:.2f} GiB "
         f"(allocated {snap['allocated_gib']:.2f}) "
-        f"-> gpu_memory_utilization={util:.2f}"
+        f"-> gpu_memory_utilization={util:.2f} ({label})"
     )
     return util
 
@@ -2793,10 +2805,15 @@ def _release_cuda_cache() -> None:
             pass
 
 
-def _vllm_tensor_parallel_candidates() -> List[int]:
+def _vllm_tensor_parallel_candidates(*, speculative: bool = False) -> List[int]:
     if int(VLLM_TENSOR_PARALLEL_SIZE) > 0:
         return [int(VLLM_TENSOR_PARALLEL_SIZE)]
     n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if speculative and n_gpu >= 2:
+        pref = max(2, int(VLLM_SPEC_PREFER_TENSOR_PARALLEL))
+        if n_gpu >= pref:
+            return [pref, 1, 2] if pref != 2 else [2, 1]
+        return [1, 2]
     if n_gpu >= 2:
         return [1, 2]
     return [1]
@@ -2861,20 +2878,19 @@ def _inference_speculative_status(llm: Any) -> str:
     return "off"
 
 
-def _vllm_max_len_candidates(arc_need: int, *, spec_first: bool = False) -> List[int]:
-    """Ordered max_model_len values to try; spec_first tries lower ctx before full ARC budget."""
+def _vllm_max_len_candidates(arc_need: int, *, speculative: bool = False) -> List[int]:
+    """Ordered max_model_len values to try for vLLM load attempts."""
+    if speculative:
+        spec_cap = int(VLLM_SPEC_MAX_MODEL_LEN) if int(VLLM_SPEC_MAX_MODEL_LEN) > 0 else arc_need
+        effective_cap = min(arc_need, spec_cap)
+        pool = sorted({4096, 6144, 8192, 10240, 11264, 12288, 14336, 16384, effective_cap})
+        pool = [m for m in pool if m <= effective_cap]
+        if VLLM_SPEC_TRY_SMALLEST_CONTEXT_FIRST:
+            return pool
+        return sorted(pool, reverse=True)
+
     pool = sorted({arc_need, 12288, 11264, 10240, 8192, 6144, 4096}, reverse=True)
-    pool = [m for i, m in enumerate(pool) if m not in pool[:i]]
-    if not spec_first or not VLLM_SPEC_PREFER_LOWER_CONTEXT:
-        return pool
-    first = int(VLLM_SPEC_FIRST_MAX_MODEL_LEN)
-    head = [m for m in pool if m <= first]
-    tail = [m for m in pool if m > first]
-    ordered: List[int] = []
-    for m in head + tail:
-        if m not in ordered:
-            ordered.append(m)
-    return ordered
+    return [m for i, m in enumerate(pool) if m not in pool[:i]]
 
 
 def _append_vllm_attempt_variants(
@@ -2912,12 +2928,15 @@ def _build_vllm_attempts(
     dflash_draft_path: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     custom = _needs_custom_vllm_handling(model_path)
-    util = _adaptive_vllm_gpu_util(gpu_memory_utilization)
+    base_util = _adaptive_vllm_gpu_util(gpu_memory_utilization, speculative=False)
+    spec_util = _adaptive_vllm_gpu_util(
+        float(VLLM_SPEC_GPU_MEMORY_UTILIZATION), speculative=True
+    )
     arc_need = arc_vllm_context_budget()
     if int(VLLM_MAX_MODEL_LEN) > 0:
         arc_need = min(arc_need, int(VLLM_MAX_MODEL_LEN))
-    fallback_max_lens = _vllm_max_len_candidates(arc_need, spec_first=False)
-    spec_max_lens = _vllm_max_len_candidates(arc_need, spec_first=True)
+    fallback_max_lens = _vllm_max_len_candidates(arc_need, speculative=False)
+    spec_max_lens = _vllm_max_len_candidates(arc_need, speculative=True)
 
     hf_overrides: Dict[str, Any] = {}
     if os.path.isfile(os.path.join(model_path, "config.json")):
@@ -2936,10 +2955,6 @@ def _build_vllm_attempts(
             print(f"[LOAD] Could not inspect config.json: {exc}")
 
     hf_extra = {"hf_overrides": hf_overrides} if hf_overrides else {}
-    tp_sizes = _vllm_tensor_parallel_candidates()
-    util_steps = [util]
-    if util > 0.45:
-        util_steps.append(max(0.38, util - 0.10))
 
     spec_root = (
         _build_vllm_speculative_config(dflash_draft_path)
@@ -2954,19 +2969,28 @@ def _build_vllm_attempts(
         )
         print(
             f"[LOAD] Speculative max_model_len order: {spec_max_lens} "
-            f"(ARC budget={arc_need}; prefer_lower_ctx={VLLM_SPEC_PREFER_LOWER_CONTEXT})"
+            f"(ARC budget={arc_need}, spec_cap={VLLM_SPEC_MAX_MODEL_LEN}, "
+            f"tp_pref={VLLM_SPEC_PREFER_TENSOR_PARALLEL})"
         )
 
     spec_attempts: List[Dict[str, Any]] = []
     fallback_attempts: List[Dict[str, Any]] = []
     seen: set = set()
+    spec_tp_sizes = _vllm_tensor_parallel_candidates(speculative=True)
+    tp_sizes = _vllm_tensor_parallel_candidates(speculative=False)
+    util_steps = [base_util]
+    if base_util > 0.45:
+        util_steps.append(max(0.38, base_util - 0.10))
+    spec_util_steps = [spec_util]
+    if spec_util > 0.60:
+        spec_util_steps.append(max(0.55, spec_util - 0.08))
 
     if spec_root:
         for max_len in spec_max_lens:
-            for tp in tp_sizes:
-                for u in util_steps:
-                    spec_util = max(
-                        0.35, float(u) * float(VLLM_SPEC_DRAFT_GPU_UTIL_SCALE)
+            for tp in spec_tp_sizes:
+                for u in spec_util_steps:
+                    spec_load_util = max(
+                        0.55, float(u) * float(VLLM_SPEC_DRAFT_GPU_UTIL_SCALE)
                     )
                     spec_cfg = dict(spec_root)
                     spec_cfg["max_model_len"] = max_len
@@ -2975,7 +2999,7 @@ def _build_vllm_attempts(
                         "trust_remote_code": True,
                         "dtype": "auto",
                         "max_model_len": max_len,
-                        "gpu_memory_utilization": spec_util,
+                        "gpu_memory_utilization": spec_load_util,
                         "tensor_parallel_size": tp,
                         "speculative_config": spec_cfg,
                     }
@@ -2988,25 +3012,36 @@ def _build_vllm_attempts(
                         hf_extra=hf_extra,
                     )
 
-    for max_len in fallback_max_lens:
-        for tp in tp_sizes:
-            for u in util_steps:
-                base: Dict[str, Any] = {
-                    "model": model_path,
-                    "trust_remote_code": True,
-                    "dtype": "auto",
-                    "max_model_len": max_len,
-                    "gpu_memory_utilization": u,
-                    "tensor_parallel_size": tp,
-                }
-                _append_vllm_attempt_variants(
-                    fallback_attempts,
-                    seen,
-                    base,
-                    custom=custom,
-                    hf_overrides=hf_overrides,
-                    hf_extra=hf_extra,
-                )
+    skip_base_fallback = bool(
+        dflash_draft_path
+        and ENABLE_VLLM_SPECULATIVE_DECODING
+        and VLLM_REQUIRE_SPECULATIVE
+    )
+    if skip_base_fallback:
+        print(
+            "[LOAD] VLLM_REQUIRE_SPECULATIVE=True — will not fall back to base-only "
+            "without DFlash draft."
+        )
+    else:
+        for max_len in fallback_max_lens:
+            for tp in tp_sizes:
+                for u in util_steps:
+                    base: Dict[str, Any] = {
+                        "model": model_path,
+                        "trust_remote_code": True,
+                        "dtype": "auto",
+                        "max_model_len": max_len,
+                        "gpu_memory_utilization": u,
+                        "tensor_parallel_size": tp,
+                    }
+                    _append_vllm_attempt_variants(
+                        fallback_attempts,
+                        seen,
+                        base,
+                        custom=custom,
+                        hf_overrides=hf_overrides,
+                        hf_extra=hf_extra,
+                    )
 
     return spec_attempts, fallback_attempts
 
@@ -3484,6 +3519,13 @@ def create_inference_engine(
                         "[LOAD] [WARN] DFlash draft available but this attempt "
                         "loaded WITHOUT speculative_config (VRAM fallback)."
                     )
+                    if VLLM_REQUIRE_SPECULATIVE:
+                        print(
+                            "[LOAD] Rejecting base-only engine "
+                            "(VLLM_REQUIRE_SPECULATIVE=True)."
+                        )
+                        _release_cuda_cache()
+                        continue
                 return llm
             except Exception as exc:
                 last_err = exc
@@ -3492,6 +3534,18 @@ def create_inference_engine(
                     f"{type(exc).__name__}: {exc}"
                 )
                 _release_cuda_cache()
+
+    if (
+        draft_path
+        and ENABLE_VLLM_SPECULATIVE_DECODING
+        and VLLM_REQUIRE_SPECULATIVE
+    ):
+        raise RuntimeError(
+            "[LOAD] DFlash speculative decoding required but all vLLM spec attempts "
+            f"failed for {gen_path}. Last error: {last_err}. "
+            "Try: restart kernel (fresh VRAM), set VLLM_SPEC_MAX_MODEL_LEN=12288, "
+            "or VLLM_SPEC_PREFER_TENSOR_PARALLEL=2 on 4×L4."
+        ) from last_err
 
     if VLLM_FALLBACK_TO_HF:
         print(
@@ -6955,7 +7009,25 @@ if __name__ == "__main__":
         and args.eval_solutions
     )
     try:
-        if ARC_MULTI_AGENT_ENABLED and run_arc_eval:
+        use_multi_agent = (
+            ARC_MULTI_AGENT_ENABLED
+            and run_arc_eval
+            and not (
+                VLLM_SINGLE_ENGINE_SPECULATIVE
+                and ENABLE_VLLM_SPECULATIVE_DECODING
+            )
+        )
+        if (
+            ARC_MULTI_AGENT_ENABLED
+            and run_arc_eval
+            and not use_multi_agent
+            and ENABLE_VLLM_SPECULATIVE_DECODING
+        ):
+            print(
+                "[LOAD] Multi-agent pool skipped — VLLM_SINGLE_ENGINE_SPECULATIVE=True "
+                "(one DFlash spec engine on 4×L4; 8 workers cannot load draft+target)."
+            )
+        if use_multi_agent:
             bundle_base, _bundle_draft = discover_qwen_dflash_bundle_paths()
             gen_path = (
                 bundle_base
