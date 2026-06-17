@@ -180,7 +180,7 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-17l"  # bump when re-uploading to Kaggle to confirm latest script
+SCRIPT_VERSION = "2026-06-17m"  # bump when re-uploading to Kaggle to confirm latest script
 K = 4  # number of parallel drafter streams / feature-slots per super-block
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
 BLOCK_SIZE = 6  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
@@ -226,9 +226,11 @@ VLLM_FALLBACK_TO_HF = True  # HuggingFace wrapper if vLLM still cannot load the 
 VLLM_GPU_MEMORY_UTILIZATION = 0.88  # base-only fallback; spec uses VLLM_SPEC_GPU_MEMORY_UTILIZATION
 VLLM_TENSOR_PARALLEL_SIZE = 0  # 0=auto (retry with tp=2 when 2+ GPUs visible)
 # vLLM native speculative decoding (DFlash draft + target base in one engine)
-ENABLE_VLLM_SPECULATIVE_DECODING = True
-VLLM_REQUIRE_SPECULATIVE = False  # True loops 96× worker crashes when spec cannot load; False allows base-only fallback
-VLLM_SINGLE_ENGINE_SPECULATIVE = True  # one spec engine on 4×L4; skips multi-agent pool (8 workers cannot fit draft)
+# Stock Kaggle vLLM cannot load Qwen3.5-4B-DFlash as draft_model (TransformersForCausalLM crash).
+# MBR K=4 hypothesis slots + final grid = app-level parallel drafting on base-only vLLM.
+ENABLE_VLLM_SPECULATIVE_DECODING = False  # set True only with vllm-project/speculators (method=dflash)
+VLLM_REQUIRE_SPECULATIVE = False  # must stay False on Kaggle — spec attempts loop-crash the kernel
+VLLM_SINGLE_ENGINE_SPECULATIVE = True  # one base engine on 4×L4; skips multi-agent pool
 VLLM_LANGUAGE_MODEL_ONLY = True  # Qwen3.5 text-only: skip vision encoder; required for draft_model spec on stock vLLM
 VLLM_SPECULATIVE_METHOD = "auto"  # auto: dflash if vLLM supports it, else draft_model (stock Kaggle vLLM)
 VLLM_NUM_SPECULATIVE_TOKENS = BLOCK_SIZE  # DFlash block width per speculation step
@@ -339,6 +341,8 @@ import torch.nn.functional as F
 
 def _suppress_noisy_third_party_logs() -> None:
     """Kaggle notebooks spam transformers/vLLM deprecation lines every worker spawn."""
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     warnings.filterwarnings(
         "ignore",
         message=r".*Qwen2VLImageProcessorFast.*",
@@ -352,6 +356,8 @@ def _suppress_noisy_third_party_logs() -> None:
         "transformers",
         "transformers.image_processing_utils",
         "transformers.processing_utils",
+        "vllm",
+        "vllm.model_executor",
     ):
         logging.getLogger(logger_name).setLevel(logging.ERROR)
 
@@ -2847,7 +2853,7 @@ def _vllm_engine_extra_kwargs(model_path: str) -> Dict[str, Any]:
 def _vllm_native_speculative_viable(model_path: str) -> Tuple[bool, str]:
     """
     Stock vLLM rejects draft_model speculative decoding for multimodal targets.
-    ARC is text-only — language_model_only=True fixes this on Qwen3.5-4B.
+    ARC is text-only — language_model_only=True fixes this on Qwen3.5-4B target.
     """
     try:
         info = _checkpoint_model_info(model_path)
@@ -2867,6 +2873,10 @@ def _vllm_native_speculative_viable(model_path: str) -> Tuple[bool, str]:
 _VLLM_SPEC_ABORT_MARKERS = (
     "does not support multimodal",
     "Speculative Decoding with draft models",
+    "Argument input_ids not found",
+    "TransformersForCausalLM has no vLLM implementation",
+    "Loading drafter model",
+    "Engine core initialization failed",
 )
 
 
@@ -2956,6 +2966,41 @@ def _resolve_vllm_speculative_method(draft_path: str) -> str:
         )
         return "draft_model"
     return requested
+
+
+def _vllm_dflash_draft_speculative_viable(draft_path: Optional[str]) -> Tuple[bool, str]:
+    """
+    Qwen3.5-4B-DFlash cannot load as stock vLLM draft_model (TransformersForCausalLM
+    + torch.compile ValueError on input_ids). Needs vllm-project/speculators method=dflash.
+    """
+    if not draft_path:
+        return True, ""
+    resolved = resolve_checkpoint_dir(draft_path) or draft_path
+    if not is_dflash_draft_checkpoint(resolved):
+        return True, ""
+    supported = _vllm_supported_speculative_methods()
+    if "dflash" in supported:
+        return True, "vLLM speculators dflash method available"
+    return (
+        False,
+        "Qwen3.5-4B-DFlash draft incompatible with stock vLLM draft_model "
+        "(crashes loading drafter as TransformersForCausalLM). "
+        "Using base-only vLLM; MBR K=4 hypothesis batch = parallel drafting. "
+        "Native DFlash spec requires vllm-project/speculators.",
+    )
+
+
+def _vllm_speculative_load_viable(
+    model_path: str, draft_path: Optional[str]
+) -> Tuple[bool, str]:
+    for check in (
+        lambda: _vllm_native_speculative_viable(model_path),
+        lambda: _vllm_dflash_draft_speculative_viable(draft_path),
+    ):
+        ok, reason = check()
+        if not ok:
+            return ok, reason
+    return True, ""
 
 
 def _build_vllm_speculative_config(
@@ -3096,7 +3141,7 @@ def _build_vllm_attempts(
     if engine_extras:
         print(f"[LOAD] vLLM engine extras: {engine_extras}")
 
-    spec_viable, spec_reason = _vllm_native_speculative_viable(model_path)
+    spec_viable, spec_reason = _vllm_speculative_load_viable(model_path, dflash_draft_path)
     spec_root = None
     if dflash_draft_path and ENABLE_VLLM_SPECULATIVE_DECODING:
         if spec_viable:
@@ -3105,6 +3150,10 @@ def _build_vllm_attempts(
                 print(f"[LOAD] Native speculative: {spec_reason}")
         else:
             print(f"[LOAD] Skipping vLLM native speculative — {spec_reason}")
+    elif dflash_draft_path and not ENABLE_VLLM_SPECULATIVE_DECODING:
+        _probe_ok, probe_reason = _vllm_dflash_draft_speculative_viable(dflash_draft_path)
+        if not _probe_ok:
+            print(f"[LOAD] vLLM native spec OFF — {probe_reason}")
 
     if spec_root:
         print(
@@ -3135,9 +3184,13 @@ def _build_vllm_attempts(
         spec_util_steps.append(max(0.55, spec_util - 0.08))
 
     if spec_root:
-        for max_len in spec_max_lens:
-            for tp in spec_tp_sizes:
-                for u in spec_util_steps:
+        # One probe config first — avoid 180× EngineCore respawn loops on Kaggle.
+        probe_lens = spec_max_lens[:1]
+        probe_tp = spec_tp_sizes[:1]
+        probe_utils = spec_util_steps[:1]
+        for max_len in probe_lens:
+            for tp in probe_tp:
+                for u in probe_utils:
                     spec_load_util = max(
                         0.55, float(u) * float(VLLM_SPEC_DRAFT_GPU_UTIL_SCALE)
                     )
