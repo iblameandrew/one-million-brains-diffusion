@@ -198,7 +198,7 @@ elif not _MBR_WORKER_SUBPROCESS:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-18m"  # spatial prompt fit uses full chat wrap (not body-only)
+SCRIPT_VERSION = "2026-06-18o"  # Phase-1 sequential slots only (prompt parallelism off)
 K = 4  # benchmark / token-speculative super-block width (not ARC hypothesis count)
 ARC_HYPOTHESIS_SLOTS = 8  # ARC eval: batched hypothesis proposals per engine (vLLM shows N/N)
 NUM_PERSONALITY_FEATURES = 12  # spatial primitive bank size (legacy name for allocator)
@@ -329,12 +329,13 @@ ARC_MULTI_AGENT_DISABLE_SPECULATIVE = True  # base-only per agent — spec+draft
 ARC_MULTI_AGENT_GPU_UTIL = 0.0  # 0 = auto (~0.88 / ceil(N / num_gpus)) per engine
 ARC_WORKER_VLLM_MAX_MODEL_LEN = 10240  # 30x30 terse prompts need ~9600 tok (8192 too small)
 ARC_WORKER_VLLM_GPU_UTIL_CAP = 0.70  # headroom for KV at 8k ctx (0.88 OOMs)
-ARC_WORKER_VLLM_MAX_NUM_SEQS = 2  # vLLM default ~128 seq slots exhaust KV on 22GB L4
+ARC_PHASE1_PROMPT_PARALLELISM = False  # False = 1 hypothesis slot per vLLM generate() (reliable on L4)
+ARC_WORKER_VLLM_MAX_NUM_SEQS = 1  # match sequential Phase-1 (no multi-prompt batching)
 ARC_WORKER_VLLM_SHARED_MAX_MODEL_LEN = 4096  # wave-1+ engines sharing a GPU with wave-0
 ARC_WORKER_VLLM_FAST_LOAD = True  # voter subprocesses: 1-2 vLLM attempts, enforce_eager=True
 ARC_WORKER_LOAD_GPU_WAVES = True  # one vLLM load per GPU at a time (wave 0..N)
 ARC_VOTER_INFER_GPU_WAVES = True  # inference: one active voter per GPU at a time
-ARC_SPATIAL_SEQUENTIAL_SLOTS_WHEN_SHARED_GPU = True  # Phase-1: 1 slot/generate when 2 engines/GPU
+ARC_SPATIAL_SEQUENTIAL_SLOTS_WHEN_SHARED_GPU = True  # when parallelism on: 1 slot/gen if 2 engines/GPU
 ARC_MULTI_AGENT_VOTE = "plurality"  # plurality = most common parsed grid; ties -> lowest agent id
 MBR_WORKER_SCRIPT_PATH = None  # None = auto; set e.g. /kaggle/working/million_brains_dflash.py in notebooks
 ARC_CHAT_TEMPLATE_SLACK = 2048  # system + chat template overhead beyond raw task body
@@ -3283,20 +3284,35 @@ def _build_vllm_worker_fast_attempts(
         util = min(util, cap)
     engine_extras = _vllm_engine_extra_kwargs(model_path)
     max_num_seqs = max(1, int(ARC_WORKER_VLLM_MAX_NUM_SEQS))
+    engines_per_gpu = max(1, int(os.environ.get("MBR_ENGINES_PER_GPU", "1") or 1))
+    prefer_eager = engines_per_gpu > 1
     common: Dict[str, Any] = {
         "model": model_path,
         "trust_remote_code": True,
         "dtype": "auto",
         "tensor_parallel_size": 1,
-        "enforce_eager": True,
         "runner": VLLM_RUNNER,
         "max_num_seqs": max_num_seqs,
         "max_num_batched_tokens": min(max_len, 4096),
         **engine_extras,
     }
     attempts = [
-        {**common, "max_model_len": max_len, "gpu_memory_utilization": util},
+        {
+            **common,
+            "max_model_len": max_len,
+            "gpu_memory_utilization": util,
+            "enforce_eager": prefer_eager,
+        },
     ]
+    if not prefer_eager:
+        attempts.append(
+            {
+                **common,
+                "max_model_len": max_len,
+                "gpu_memory_utilization": util,
+                "enforce_eager": True,
+            }
+        )
     for fallback_len in (9728, 8192):
         if max_len > fallback_len:
             attempts.append(
@@ -3304,6 +3320,7 @@ def _build_vllm_worker_fast_attempts(
                     **common,
                     "max_model_len": fallback_len,
                     "gpu_memory_utilization": max(0.32, util - 0.06),
+                    "enforce_eager": True,
                 }
             )
     return attempts
@@ -4383,6 +4400,78 @@ def _arc_task_with_train_limit(task: Dict[str, Any], n_train: int) -> Dict[str, 
     return {**task, "train": train[:n_keep]}
 
 
+def _arc_grid_cell_count(grid: List[List[int]]) -> int:
+    if not grid or not grid[0]:
+        return 0
+    return len(grid) * len(grid[0])
+
+
+def _arc_largest_grid_cells(task: Dict[str, Any], test_index: int = 0) -> int:
+    largest = 0
+    for ex in task.get("train") or []:
+        for key in ("input", "output"):
+            largest = max(largest, _arc_grid_cell_count(ex.get(key) or []))
+    tests = task.get("test") or []
+    if test_index < len(tests):
+        largest = max(
+            largest, _arc_grid_cell_count(tests[test_index].get("input") or [])
+        )
+    return largest
+
+
+def _arc_task_needs_compact_prompt(
+    task: Dict[str, Any], test_index: int = 0, *, cell_threshold: int = 400
+) -> bool:
+    """True for 20x20+ grids — skip verbose encodings and train-pair sweeps."""
+    return _arc_largest_grid_cells(task, test_index) >= int(cell_threshold)
+
+
+def arc_phase1_slot_batch_size(k: int) -> int:
+    """How many Phase-1 slots to pass per vLLM generate() call."""
+    if not ARC_PHASE1_PROMPT_PARALLELISM:
+        return 1
+    engines_per_gpu = max(1, int(os.environ.get("MBR_ENGINES_PER_GPU", "1") or 1))
+    if ARC_SPATIAL_SEQUENTIAL_SLOTS_WHEN_SHARED_GPU and engines_per_gpu > 1:
+        return 1
+    return min(max(1, int(k)), max(1, int(ARC_WORKER_VLLM_MAX_NUM_SEQS)))
+
+
+def _arc_phase1_generate_slots(
+    vllm_llm: Any,
+    prompts: List[str],
+    sp_list: List[Any],
+    *,
+    label: str = "phase1",
+) -> List[Any]:
+    """Run Phase-1 slot generation; serial (batch=1) or batched per ARC_PHASE1_PROMPT_PARALLELISM."""
+    k = len(prompts)
+    slot_batch = arc_phase1_slot_batch_size(k)
+    outs: List[Any] = []
+    for start in range(0, k, slot_batch):
+        end = min(start + slot_batch, k)
+        _worker_emit_progress(f"{label} generate slots {start + 1}-{end}/{k}")
+        outs.extend(
+            _vllm_generate_arc(
+                vllm_llm,
+                prompts[start:end],
+                sp_list[start:end],
+            )
+        )
+    return outs
+
+
+def _worker_emit_progress(msg: str) -> None:
+    """Mid-task heartbeat on worker stdout (parent skips until final ok/error JSON)."""
+    if os.environ.get("MBR_AGENT_WORKER") != "1":
+        return
+    agent_id = int(os.environ.get("MBR_WORKER_AGENT_ID", "0") or 0)
+    sys.stdout.write(
+        json.dumps({"status": "progress", "agent_id": agent_id, "msg": msg})
+        + "\n"
+    )
+    sys.stdout.flush()
+
+
 def format_arc_task_body_minimal(
     task_id: str,
     task: Dict[str, Any],
@@ -4614,11 +4703,12 @@ def resolve_arc_spatial_task_body(
         systems.append(
             "ARC spatial solver. Output one JSON 2D int array (0-9). No prose."
         )
-    formats = (
-        ("rows", "terse", "minified", "ascii")
-        if ARC_FAST_INFERENCE or _MBR_WORKER_SUBPROCESS
-        else ("ascii", "minified", "terse", "rows")
-    )
+    if _arc_task_needs_compact_prompt(task, test_index):
+        formats: Tuple[str, ...] = ("rows",)
+    elif ARC_FAST_INFERENCE or _MBR_WORKER_SUBPROCESS:
+        formats = ("rows", "terse", "minified", "ascii")
+    else:
+        formats = ("ascii", "minified", "terse", "rows")
     best: Tuple[str, str, int, str] = ("", system_content, 10**9, "minified")
 
     for sys_msg in systems:
@@ -5645,9 +5735,15 @@ def collect_feature_slot_hypotheses(
 
     total_prompt_tok = sum(count_prompt_tokens(tokenizer, p) for p in prompts)
     avg_prompt_tok = total_prompt_tok // max(1, k)
+    slot_batch = arc_phase1_slot_batch_size(k)
+    parallel_tag = (
+        f"batch={slot_batch}"
+        if ARC_PHASE1_PROMPT_PARALLELISM and slot_batch > 1
+        else "sequential=1 slot/gen"
+    )
     arc_eval_log(
-        f"[ARC-PHASE-1] Hypothesis pool: batching {k} text proposals in one vLLM call "
-        f"(Rendering prompts: {k}/{k} = slot count, NOT voters)"
+        f"[ARC-PHASE-1] Hypothesis pool: {k} text proposals ({parallel_tag}; "
+        f"Rendering prompts: {k}/{k} = slot count, NOT voters)"
     )
     arc_eval_log(
         f"[ARC-PHASE-1] Generate start: max_out={hyp_max_tokens}/slot | thinking={hyp_thinking} | "
@@ -5656,7 +5752,9 @@ def collect_feature_slot_hypotheses(
         f"first slot may take 30-120s on L4; vLLM tqdm stays 0/{k} until one slot finishes"
     )
     t_gen = time.perf_counter()
-    outs = _vllm_generate_arc(vllm_llm, prompts, sp_list)
+    outs = _arc_phase1_generate_slots(
+        vllm_llm, prompts, sp_list, label="phase1-hyp"
+    )
     arc_eval_log(
         f"[ARC-PHASE-1] Generate done: {k}/{k} slots in {time.perf_counter() - t_gen:.1f}s"
     )
@@ -5800,11 +5898,17 @@ def collect_spatial_grid_hypotheses(
     max_needed = engine_ctx + 1
     task_for_prompt = task
     n_train_full = len(task.get("train") or [])
-    train_limits = [n_train_full] + [
-        n for n in (3, 2, 1, 0) if n < n_train_full
-    ]
+    if _arc_task_needs_compact_prompt(task, test_index):
+        train_limits = [0] + [
+            n for n in (1, 2, 3, n_train_full) if 0 < n <= n_train_full
+        ]
+    else:
+        train_limits = [n_train_full] + [
+            n for n in (3, 2, 1, 0) if n < n_train_full
+        ]
     fitted = False
     shrink_note = ""
+    _worker_emit_progress(f"phase1 prompt fit start ({task_id})")
 
     for n_train in train_limits:
         task_for_prompt = _arc_task_with_train_limit(task, n_train)
@@ -5895,29 +5999,29 @@ def collect_spatial_grid_hypotheses(
         )
 
     total_prompt_tok = sum(count_prompt_tokens(tokenizer, p) for p in prompts)
-    engines_per_gpu = int(os.environ.get("MBR_ENGINES_PER_GPU", "1") or 1)
-    sequential_slots = (
-        _MBR_WORKER_SUBPROCESS
-        or (
-            ARC_SPATIAL_SEQUENTIAL_SLOTS_WHEN_SHARED_GPU and engines_per_gpu > 1
-        )
+    slot_batch = arc_phase1_slot_batch_size(k)
+    guided_on = _arc_guided_json_enabled()
+    parallel_tag = (
+        f"batch={slot_batch}"
+        if ARC_PHASE1_PROMPT_PARALLELISM and slot_batch > 1
+        else "sequential=1 slot/gen"
     )
-    slot_batch = 1 if sequential_slots else k
     arc_eval_log(
         f"[ARC-PHASE-1] Spatial grid pool: {k} JSON grid hypotheses "
-        f"(primitives, guided={ARC_GUIDED_JSON_DECODING}, thinking=False"
-        f"{', sequential=1 slot/gen' if sequential_slots else ''})"
+        f"(primitives, guided={guided_on}, thinking=False, {parallel_tag})"
     )
     arc_eval_log(
         f"[ARC-PHASE-1] Generate start: max_out={slot_max_tokens}/slot | "
-        f"prompt~{total_prompt_tok // max(1, k)}tok/slot | batch={slot_batch}"
+        f"prompt~{total_prompt_tok // max(1, k)}tok/slot | {parallel_tag}"
+    )
+    _worker_emit_progress(
+        f"phase1 generate 0/{k} slots ({parallel_tag}, ~"
+        f"{total_prompt_tok // max(1, k)}tok/slot)"
     )
     t_gen = time.perf_counter()
-    outs: List[Any] = []
-    for start in range(0, k, slot_batch):
-        chunk_prompts = prompts[start : start + slot_batch]
-        chunk_sp = sp_list[start : start + slot_batch]
-        outs.extend(_vllm_generate_arc(vllm_llm, chunk_prompts, chunk_sp))
+    outs = _arc_phase1_generate_slots(
+        vllm_llm, prompts, sp_list, label="phase1-spatial"
+    )
     arc_eval_log(
         f"[ARC-PHASE-1] Generate done: {k}/{k} spatial slots in "
         f"{time.perf_counter() - t_gen:.1f}s"
@@ -6459,8 +6563,11 @@ def format_timing_detail_line(timing: Dict[str, Any]) -> str:
 
 
 def arc_eval_log(message: str) -> None:
-    """Print + flush so Kaggle notebooks show ARC progress immediately."""
-    print(message, flush=True)
+    """Print + flush; workers use stderr so stdout stays JSON-protocol clean."""
+    if os.environ.get("MBR_AGENT_WORKER") == "1":
+        print(message, flush=True, file=sys.stderr)
+    else:
+        print(message, flush=True)
 
 
 def print_arc_answer_comparison(
@@ -7472,6 +7579,14 @@ def _read_worker_json_message(
         status = rec.get("status")
         if status == "loading" and "loading" not in accepted:
             continue
+        if status == "progress":
+            msg = rec.get("msg") or rec.get("message") or ""
+            if msg:
+                print(
+                    f"[VOTER-POOL] worker {agent_id} progress: {msg}",
+                    flush=True,
+                )
+            continue
         if status in accepted:
             return rec
         if status == "error":
@@ -7535,6 +7650,8 @@ def _voter_worker_subprocess_env(
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
     env["ARC_EVAL_VERBOSE"] = "0"
     env["STREAM_ALL_OUTPUT"] = "0"
+    env["STREAM_GENERATION"] = "0"
+    env["MBR_WORKER_AGENT_ID"] = str(agent_id)
     # Stock Kaggle vLLM lacks GuidedDecodingParams — skip in workers (parent may still log guided=True).
     env["ARC_GUIDED_JSON_DECODING"] = "0"
     return env
@@ -7618,6 +7735,7 @@ def _multi_agent_worker_execute_mbr(
     test_index = int(payload["test_index"])
     seed = int(payload.get("seed", SEED))
     k = int(payload.get("k", K))
+    _worker_emit_progress(f"mbr start {task_id} test#{test_index}")
     t0 = time.perf_counter()
     allocator = PermutationFeatureSlotAllocator(
         internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=k
@@ -8106,13 +8224,18 @@ def print_arc_pipeline_architecture(
     One-screen map of ARC eval logging — avoids confusing vLLM N/N with voter count or benchmark K.
     """
     hyp_n = arc_hypothesis_k()
+    phase1_mode = (
+        "1 slot/vLLM call (parallelism off)"
+        if not ARC_PHASE1_PROMPT_PARALLELISM
+        else f"up to {ARC_WORKER_VLLM_MAX_NUM_SEQS} slots/vLLM call"
+    )
     print("\n" + "=" * 80)
     print("ARC PIPELINE — HOW TO READ THE LOGS")
     print("=" * 80)
     if ARC_SPATIAL_GRID_ENSEMBLE:
         phase1_line = (
             f"    [ARC-PHASE-1]  Spatial pool     -> {hyp_n} JSON grid hypotheses "
-            f"(guided={ARC_GUIDED_JSON_DECODING}, thinking=False)\n"
+            f"(guided={ARC_GUIDED_JSON_DECODING}, thinking=False, {phase1_mode})\n"
         )
         phase2_line = (
             "    [ARC-PHASE-2]  Pixel majority   -> per-cell vote across parsed grids\n"
@@ -8813,7 +8936,8 @@ if __name__ == "__main__":
     print(
         f"    RECOVERY: live_patch={ENABLE_DFLASH_LIVE_PATCH} "
         f"thinking=False guided={ARC_GUIDED_JSON_DECODING} "
-        f"spatial_ensemble={ARC_SPATIAL_GRID_ENSEMBLE}"
+        f"spatial_ensemble={ARC_SPATIAL_GRID_ENSEMBLE} "
+        f"phase1_parallel={ARC_PHASE1_PROMPT_PARALLELISM}"
     )
     print(
         f"    ARC_MULTI_AGENT_ENABLED={ARC_MULTI_AGENT_ENABLED} "
@@ -8934,8 +9058,9 @@ if __name__ == "__main__":
         verify_inference_engine(vllm_llm, tokenizer)
     else:
         print(
-            "[VERIFY] Voter pool ready — each worker ran a smoke test at startup "
-            f"(expect {ARC_MULTI_AGENT_N} x Phase1={arc_hypothesis_k()} + Phase2 per task)."
+            "[VERIFY] Voter pool ready — workers loaded vLLM at startup "
+            f"(expect ~{ARC_MULTI_AGENT_N * arc_hypothesis_k()} Phase-1 slots + "
+            "pixel vote per test; first task may take 1-3 min on 30x30 grids)."
         )
 
     if run_arc_eval:
