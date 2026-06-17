@@ -180,7 +180,7 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-17q"  # bump when re-uploading to Kaggle to confirm latest script
+SCRIPT_VERSION = "2026-06-17r"  # bump when re-uploading to Kaggle to confirm latest script
 K = 4  # benchmark / token-speculative super-block width (not ARC hypothesis count)
 ARC_HYPOTHESIS_SLOTS = 8  # ARC eval: batched hypothesis proposals per engine (vLLM shows N/N)
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
@@ -300,6 +300,7 @@ ARC_HYPOTHESIS_THINKING_TOKEN_CAP = 512  # per-slot cap when hypothesis thinking
 ARC_FINAL_ENABLE_THINKING = False  # final grid: [[ prefill + greedy JSON (much faster than thinking pass)
 # Multi-agent layer: N independent Qwen instances (1 per GPU, round-robin) + plurality vote on final grid.
 ARC_MULTI_AGENT_ENABLED = True  # plurality vote across N independent Qwen workers
+ARC_MULTI_AGENT_REQUIRED = True  # ARC eval: never silently fall back to single engine
 ARC_MULTI_AGENT_N = 8  # 2 per L4 when 4 GPUs visible (round-robin agent_id % n_gpus)
 ARC_MULTI_AGENT_DISABLE_SPECULATIVE = True  # base-only per agent — spec+draft OOMs at 2 engines/GPU
 ARC_MULTI_AGENT_GPU_UTIL = 0.0  # 0 = auto (~0.88 / ceil(N / num_gpus)) per engine
@@ -327,6 +328,7 @@ import json
 import hashlib
 import traceback
 import re
+from pathlib import Path
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional, Any
@@ -6205,21 +6207,8 @@ def print_arc_gradeboard(per_task: List[Dict[str, Any]], split: str) -> None:
     print("━" * 78)
 
 
-def _resolve_multi_agent_worker_script_path() -> str:
-    """
-    Path to re-execute this script in worker subprocesses.
-    Jupyter/Kaggle notebooks have no __file__; fall back to ipykernel temp path,
-    sys.argv[0], or /kaggle/working/million_brains_dflash.py.
-    """
-    explicit = os.environ.get("MBR_WORKER_SCRIPT_PATH") or MBR_WORKER_SCRIPT_PATH
-    if explicit:
-        path = os.path.abspath(str(explicit))
-        if os.path.isfile(path):
-            return path
-        raise FileNotFoundError(
-            f"MBR_WORKER_SCRIPT_PATH={explicit!r} does not exist."
-        )
-
+def _find_running_script_source() -> Optional[str]:
+    """Best-effort path to the currently executing script (works in notebooks)."""
     candidates: List[str] = []
     try:
         candidates.append(os.path.abspath(__file__))
@@ -6229,36 +6218,121 @@ def _resolve_multi_agent_worker_script_path() -> str:
     if sys.argv and sys.argv[0] not in ("", "-c", "-m"):
         candidates.append(os.path.abspath(sys.argv[0]))
 
-    try:
-        candidates.append(os.path.abspath(inspect.getfile(_resolve_multi_agent_worker_script_path)))
-    except (TypeError, OSError):
-        pass
-
     frame = inspect.currentframe()
-    while frame is not None:
+    depth = 0
+    while frame is not None and depth < 48:
         fname = frame.f_code.co_filename
         if fname.endswith(".py") and os.path.isfile(fname):
             candidates.append(os.path.abspath(fname))
-            break
         frame = frame.f_back
-
-    if _on_kaggle():
-        candidates.append("/kaggle/working/million_brains_dflash.py")
-    candidates.append(os.path.join(os.getcwd(), "million_brains_dflash.py"))
+        depth += 1
 
     seen: set = set()
     for path in candidates:
         if not path or path in seen:
             continue
         seen.add(path)
+        base = os.path.basename(path).lower()
+        if "verify_arc" in base:
+            continue
         if os.path.isfile(path):
             return path
+    return None
+
+
+def _canonical_worker_script_path() -> str:
+    if _on_kaggle():
+        return "/kaggle/working/million_brains_dflash.py"
+    return os.path.abspath(os.path.join(os.getcwd(), "million_brains_dflash.py"))
+
+
+def _materialize_worker_script_path() -> str:
+    """
+    Copy the running script to a stable on-disk path so voter subprocesses can
+    always re-exec it (Jupyter ipykernel temps, %run, plain .py, Kaggle notebook).
+    """
+    explicit = os.environ.get("MBR_WORKER_SCRIPT_PATH") or MBR_WORKER_SCRIPT_PATH
+    if explicit:
+        path = os.path.abspath(str(explicit))
+        if os.path.isfile(path):
+            os.environ["MBR_WORKER_SCRIPT_PATH"] = path
+            return path
+        raise FileNotFoundError(
+            f"MBR_WORKER_SCRIPT_PATH={explicit!r} does not exist."
+        )
+
+    canonical = _canonical_worker_script_path()
+    source = _find_running_script_source()
+
+    if source and os.path.isfile(source):
+        src_bytes = Path(source).read_bytes()
+        if (not os.path.isfile(canonical)) or Path(canonical).read_bytes() != src_bytes:
+            Path(canonical).parent.mkdir(parents=True, exist_ok=True)
+            Path(canonical).write_bytes(src_bytes)
+            print(
+                f"[VOTER-POOL] Materialized worker script: {source} -> {canonical}",
+                flush=True,
+            )
+        os.environ["MBR_WORKER_SCRIPT_PATH"] = canonical
+        return canonical
+
+    if os.path.isfile(canonical):
+        os.environ["MBR_WORKER_SCRIPT_PATH"] = canonical
+        return canonical
 
     raise RuntimeError(
-        "Cannot resolve worker script path for multi-agent pool (no __file__ in notebook). "
-        "Save this script as /kaggle/working/million_brains_dflash.py and set "
-        "MBR_WORKER_SCRIPT_PATH='/kaggle/working/million_brains_dflash.py', "
-        "or export MBR_WORKER_SCRIPT_PATH before running."
+        "Cannot materialize voter-pool worker script. "
+        f"Tried source={source!r}, canonical={canonical!r}. "
+        "Save this file as million_brains_dflash.py in the working directory "
+        "or set MBR_WORKER_SCRIPT_PATH."
+    )
+
+
+def _resolve_multi_agent_worker_script_path() -> str:
+    """Stable path for voter subprocess re-exec (always materialized)."""
+    return _materialize_worker_script_path()
+
+
+def _resolve_voter_pool_gen_path() -> str:
+    """
+    Resolve BASE generation checkpoint for voter pool without loading a parent vLLM.
+    Tries local bundle paths first, then prefetch + pick_model_name().
+    """
+    bundle_base, _bundle_draft = discover_qwen_dflash_bundle_paths()
+    for raw in (
+        bundle_base,
+        resolve_checkpoint_dir(LOCAL_BASE_DIR),
+        resolve_local_model_path(),
+    ):
+        if not raw:
+            continue
+        gen_path, _draft = resolve_generation_model_path(raw)
+        if gen_path and os.path.isdir(gen_path):
+            print(f"[VOTER-POOL] Generation checkpoint: {gen_path}", flush=True)
+            return os.path.abspath(gen_path)
+
+    ensure_model_available()
+    for raw in (resolve_local_model_path(),):
+        if not raw:
+            continue
+        gen_path, _draft = resolve_generation_model_path(raw)
+        if gen_path and os.path.isdir(gen_path):
+            print(f"[VOTER-POOL] Generation checkpoint (post-prefetch): {gen_path}", flush=True)
+            return os.path.abspath(gen_path)
+
+    model_name, _backend = pick_model_name()
+    gen_path, _draft = resolve_generation_model_path(model_name)
+    if gen_path and os.path.isdir(gen_path):
+        print(f"[VOTER-POOL] Generation checkpoint (resolved): {gen_path}", flush=True)
+        return os.path.abspath(gen_path)
+    if os.path.isdir(model_name):
+        print(f"[VOTER-POOL] Generation checkpoint (model id): {model_name}", flush=True)
+        return os.path.abspath(model_name)
+
+    raise RuntimeError(
+        "[VOTER-POOL] No BASE generation checkpoint found for voter pool. "
+        f"Tried bundle={bundle_base!r}, LOCAL_BASE_DIR={LOCAL_BASE_DIR!r}, "
+        f"pick_model_name()={model_name!r}."
     )
 
 
@@ -6703,9 +6777,9 @@ def print_arc_pipeline_architecture(
         )
     else:
         print(
-            f"  VOTER POOL: single engine (set ARC_MULTI_AGENT_ENABLED=True for "
-            f"{ARC_MULTI_AGENT_N} voters)\n"
-            f"    Phase 1 collects {hyp_n} proposals -> Phase 2 emits 1 grid (no cross-engine vote)"
+            f"  VOTER POOL: single engine (ARC_MULTI_AGENT_ENABLED=False or demo-only run)\n"
+            f"    Phase 1 collects {hyp_n} proposals -> Phase 2 emits 1 grid (no cross-engine vote)\n"
+            f"    ARC eval default: {ARC_MULTI_AGENT_N} voters when ARC_MULTI_AGENT_REQUIRED=True"
         )
     print("")
     print(
@@ -7365,6 +7439,7 @@ if __name__ == "__main__":
     )
     print(
         f"    ARC_MULTI_AGENT_ENABLED={ARC_MULTI_AGENT_ENABLED} "
+        f"ARC_MULTI_AGENT_REQUIRED={ARC_MULTI_AGENT_REQUIRED} "
         f"ARC_MULTI_AGENT_N={ARC_MULTI_AGENT_N} | "
         f"ENABLE_FEATURE_REALLOCATION={ENABLE_FEATURE_REALLOCATION}"
     )
@@ -7378,103 +7453,100 @@ if __name__ == "__main__":
     # 2) Optional one-time prefetch when Kaggle Internet is enabled
     ensure_model_available()
 
-    # 3) Choose & load model (local/offline first; remote only when online)
+    # 3) Choose & load model (voter pool is default for ARC eval; single engine for demo only)
     model_name = "unknown"
     multi_agent_pool: Optional[MultiAgentEnginePool] = None
     voter_pool_single_reason: Optional[str] = None
+    vllm_llm: Optional[Any] = None
+    tokenizer: Any = None
+    hf_model: Optional[Any] = None
     run_arc_eval = (
         not args.demo_only
         and args.eval_challenges
         and args.eval_solutions
     )
-    try:
-        use_multi_agent = (
-            ARC_MULTI_AGENT_ENABLED
-            and run_arc_eval
-            and not (
-                VLLM_SINGLE_ENGINE_SPECULATIVE
-                and ENABLE_VLLM_SPECULATIVE_DECODING
-            )
-        )
-        print(
-            f"[CONFIG] voter_pool={'MULTI-AGENT x' + str(ARC_MULTI_AGENT_N) if use_multi_agent else 'SINGLE ENGINE'} | "
-            f"hypothesis_slots={ARC_HYPOTHESIS_SLOTS}/test/phase1 | "
-            f"run_arc_eval={run_arc_eval}"
-        )
-        if (
-            ARC_MULTI_AGENT_ENABLED
-            and run_arc_eval
-            and not use_multi_agent
+    use_multi_agent = (
+        ARC_MULTI_AGENT_ENABLED
+        and run_arc_eval
+        and not (
+            VLLM_SINGLE_ENGINE_SPECULATIVE
             and ENABLE_VLLM_SPECULATIVE_DECODING
-        ):
-            voter_pool_single_reason = (
-                "VLLM_SINGLE_ENGINE_SPECULATIVE=True with native spec ON "
-                "(one spec engine; cannot spawn voter pool)"
-            )
-            print(f"[VOTER-POOL] Skipped — {voter_pool_single_reason}")
-        if use_multi_agent:
-            bundle_base, _bundle_draft = discover_qwen_dflash_bundle_paths()
-            gen_path = (
-                bundle_base
-                or resolve_checkpoint_dir(LOCAL_BASE_DIR)
-                or resolve_local_model_path()
-            )
-            if gen_path:
-                gen_path, _draft = resolve_generation_model_path(gen_path)
-            if not gen_path or not os.path.isdir(gen_path):
-                raise RuntimeError(
-                    f"[VOTER-POOL] BASE checkpoint not found for pool "
-                    f"(tried bundle={bundle_base!r}, LOCAL_BASE_DIR={LOCAL_BASE_DIR!r})"
-                )
+        )
+    )
+    print(
+        f"[CONFIG] voter_pool={'REQUIRED x' + str(ARC_MULTI_AGENT_N) if use_multi_agent else 'off (demo/single)'} | "
+        f"hypothesis_slots={ARC_HYPOTHESIS_SLOTS}/test/phase1 | "
+        f"run_arc_eval={run_arc_eval} | ARC_MULTI_AGENT_REQUIRED={ARC_MULTI_AGENT_REQUIRED}"
+    )
+    if (
+        ARC_MULTI_AGENT_ENABLED
+        and run_arc_eval
+        and not use_multi_agent
+        and ENABLE_VLLM_SPECULATIVE_DECODING
+    ):
+        msg = (
+            "VLLM_SINGLE_ENGINE_SPECULATIVE=True with native spec ON blocks voter pool"
+        )
+        if ARC_MULTI_AGENT_REQUIRED:
+            raise RuntimeError(f"[VOTER-POOL] {msg}")
+        voter_pool_single_reason = msg
+        print(f"[VOTER-POOL] Skipped — {msg}")
+
+    if use_multi_agent:
+        try:
+            gen_path = _resolve_voter_pool_gen_path()
             model_name = gen_path
+            worker_script = _materialize_worker_script_path()
             print(
                 f"\n[VOTER-POOL] Spawning {ARC_MULTI_AGENT_N} subprocess Qwen voters "
-                f"(parent does not load vLLM — each voter runs Phase1+Phase2)."
+                f"(script={worker_script}; parent does not load vLLM)."
             )
             multi_agent_pool = create_multi_agent_pool(gen_path)
+            local_only = os.path.isdir(gen_path) and local_dir_exists(gen_path)
             tokenizer = AutoTokenizer.from_pretrained(
                 gen_path,
                 trust_remote_code=True,
-                local_files_only=True,
+                local_files_only=local_only,
             )
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
             vllm_llm, hf_model = None, None
-        elif PREFER_LOCAL_MODELS:
+        except Exception as exc:
+            raise RuntimeError(
+                f"[VOTER-POOL] Failed to start required {ARC_MULTI_AGENT_N}-voter pool "
+                f"(ARC_MULTI_AGENT_REQUIRED={ARC_MULTI_AGENT_REQUIRED}): {exc}"
+            ) from exc
+    elif run_arc_eval:
+        if ARC_MULTI_AGENT_ENABLED and ARC_MULTI_AGENT_REQUIRED:
+            raise RuntimeError(
+                "[VOTER-POOL] ARC eval requires the 8-voter pool but it was not activated. "
+                "Set ARC_MULTI_AGENT_ENABLED=True and ensure eval paths are set."
+            )
+        voter_pool_single_reason = "ARC_MULTI_AGENT_ENABLED=False"
+        if PREFER_LOCAL_MODELS:
             dflash_llm, dflash_tok, base_llm, base_tok = load_local_models()
             vllm_llm, tokenizer, hf_model = dflash_llm, dflash_tok, None
             model_name = resolve_local_model_path() or LOCAL_DFLASH_DIR or "local"
             if base_llm is not None:
                 _available_engines = {"dflash": dflash_llm, "base": base_llm}
         else:
-            raise RuntimeError("PREFER_LOCAL_MODELS=False — use remote path")
-    except RuntimeError as _local_e:
-        print(_local_e)
-        if ARC_MULTI_AGENT_ENABLED and run_arc_eval:
-            voter_pool_single_reason = (
-                "voter pool spawn failed — using single engine with "
-                f"Phase1={ARC_HYPOTHESIS_SLOTS} props"
-            )
-            print(
-                f"[VOTER-POOL][WARN] {voter_pool_single_reason}. "
-                "Save script to /kaggle/working/million_brains_dflash.py or set "
-                "MBR_WORKER_SCRIPT_PATH."
-            )
-        elif not ARC_MULTI_AGENT_ENABLED and run_arc_eval:
-            voter_pool_single_reason = "ARC_MULTI_AGENT_ENABLED=False"
-        print("[LOCAL-LOAD] Falling back to remote model resolution...")
-        model_name, backend = pick_model_name()
+            model_name, _backend = pick_model_name()
+            vllm_llm, tokenizer, hf_model = load_models(model_name)
+    elif PREFER_LOCAL_MODELS:
+        try:
+            dflash_llm, dflash_tok, base_llm, base_tok = load_local_models()
+            vllm_llm, tokenizer, hf_model = dflash_llm, dflash_tok, None
+            model_name = resolve_local_model_path() or LOCAL_DFLASH_DIR or "local"
+            if base_llm is not None:
+                _available_engines = {"dflash": dflash_llm, "base": base_llm}
+        except RuntimeError as _local_e:
+            print(_local_e)
+            print("[LOCAL-LOAD] Falling back to remote model resolution...")
+            model_name, _backend = pick_model_name()
+            vllm_llm, tokenizer, hf_model = load_models(model_name)
+    else:
+        model_name, _backend = pick_model_name()
         vllm_llm, tokenizer, hf_model = load_models(model_name)
-
-    if (
-        multi_agent_pool is None
-        and voter_pool_single_reason is None
-        and run_arc_eval
-    ):
-        if not ARC_MULTI_AGENT_ENABLED:
-            voter_pool_single_reason = "ARC_MULTI_AGENT_ENABLED=False"
-        else:
-            voter_pool_single_reason = "single engine (voter pool not spawned)"
 
     # 4) Sanity: force the banner again so it is unmistakable in the log
     print_one_million_brains_banner(_LIVE_PATCH_SUCCESS)
