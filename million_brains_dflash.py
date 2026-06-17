@@ -180,8 +180,9 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-17m"  # bump when re-uploading to Kaggle to confirm latest script
-K = 4  # number of parallel drafter streams / feature-slots per super-block
+SCRIPT_VERSION = "2026-06-17n"  # bump when re-uploading to Kaggle to confirm latest script
+K = 4  # benchmark / token-speculative super-block width (not ARC hypothesis count)
+ARC_HYPOTHESIS_SLOTS = 8  # ARC eval: batched hypothesis proposals per engine (vLLM shows N/N)
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
 BLOCK_SIZE = 6  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
 MAX_SUPERBLOCKS = 32  # safety cap on super-blocks
@@ -230,7 +231,7 @@ VLLM_TENSOR_PARALLEL_SIZE = 0  # 0=auto (retry with tp=2 when 2+ GPUs visible)
 # MBR K=4 hypothesis slots + final grid = app-level parallel drafting on base-only vLLM.
 ENABLE_VLLM_SPECULATIVE_DECODING = False  # set True only with vllm-project/speculators (method=dflash)
 VLLM_REQUIRE_SPECULATIVE = False  # must stay False on Kaggle — spec attempts loop-crash the kernel
-VLLM_SINGLE_ENGINE_SPECULATIVE = True  # one base engine on 4×L4; skips multi-agent pool
+VLLM_SINGLE_ENGINE_SPECULATIVE = False  # only skips multi-agent when native vLLM spec is ON
 VLLM_LANGUAGE_MODEL_ONLY = True  # Qwen3.5 text-only: skip vision encoder; required for draft_model spec on stock vLLM
 VLLM_SPECULATIVE_METHOD = "auto"  # auto: dflash if vLLM supports it, else draft_model (stock Kaggle vLLM)
 VLLM_NUM_SPECULATIVE_TOKENS = BLOCK_SIZE  # DFlash block width per speculation step
@@ -291,7 +292,7 @@ ARC_MBR_OUTPUT_TOKEN_BUDGET = 14000  # total OUTPUT tokens per test (hyp slots +
 ARC_FINAL_GRID_MIN_TOKENS = 512  # floor for final JSON grid pass
 ARC_FINAL_GRID_MAX_FRACTION = 0.85  # final may use up to 85% of output budget for large grids
 ARC_FINAL_GRID_MIN_FRACTION = 0.50  # always reserve 50% of output budget for final grid synthesis
-ARC_HYPOTHESIS_MAX_TOKENS = ARC_MBR_OUTPUT_TOKEN_BUDGET * 3 // 4 // K  # legacy default; task-aware below
+ARC_HYPOTHESIS_MAX_TOKENS = ARC_MBR_OUTPUT_TOKEN_BUDGET * 3 // 4 // 8  # legacy default; task-aware below
 ARC_FINAL_GRID_MAX_TOKENS = ARC_MBR_OUTPUT_TOKEN_BUDGET // 4  # legacy default; task-aware below
 ARC_FINAL_HYP_CHAR_CAPS = (360, 200, 120, 60, 0)  # shrink hypothesis text in final prompt if needed
 ARC_HYPOTHESIS_ENABLE_THINKING = True  # slots may emit </think> reasoning before TRANSFORMATION_HYPOTHESIS
@@ -4282,6 +4283,11 @@ def arc_final_grid_max_tokens(task: Dict[str, Any]) -> int:
     return min(ceiling, max(floor, need))
 
 
+def arc_hypothesis_k() -> int:
+    """Parallel hypothesis proposals per MBR engine (independent of benchmark K=4)."""
+    return max(1, min(int(ARC_HYPOTHESIS_SLOTS), NUM_PERSONALITY_FEATURES))
+
+
 def arc_hypothesis_max_tokens(task: Dict[str, Any]) -> int:
     """Per-slot hypothesis cap — never steal more than half the output budget."""
     budget = int(ARC_MBR_OUTPUT_TOKEN_BUDGET)
@@ -4290,7 +4296,7 @@ def arc_hypothesis_max_tokens(task: Dict[str, Any]) -> int:
         int(budget * ARC_FINAL_GRID_MIN_FRACTION),
     )
     hyp_pool = max(0, budget - final_reserve)
-    per_slot = max(64, hyp_pool // max(1, K))
+    per_slot = max(64, hyp_pool // max(1, arc_hypothesis_k()))
     if ARC_HYPOTHESIS_ENABLE_THINKING and not ARC_DISABLE_THINKING:
         think_cap = int(ARC_HYPOTHESIS_THINKING_TOKEN_CAP)
         if think_cap > 0:
@@ -5172,12 +5178,13 @@ def collect_feature_slot_hypotheses(
     task: Dict[str, Any],
     test_index: int,
     *,
-    k: int = K,
+    k: Optional[int] = None,
     allocator: Optional[PermutationFeatureSlotAllocator] = None,
     seed: int = 42,
     verbose: bool = False,
 ) -> List[Dict[str, Any]]:
     """K parallel one-shot passes: each slot proposes a textual transformation rule."""
+    k = arc_hypothesis_k() if k is None else int(k)
     random.seed(seed)
     if allocator is None:
         allocator = PermutationFeatureSlotAllocator(
@@ -5307,7 +5314,7 @@ def arc_mbr_hypothesis_pipeline(
     task: Dict[str, Any],
     test_index: int = 0,
     *,
-    k: int = K,
+    k: Optional[int] = None,
     allocator: Optional[PermutationFeatureSlotAllocator] = None,
     seed: int = 42,
     verbose: bool = False,
@@ -5317,6 +5324,7 @@ def arc_mbr_hypothesis_pipeline(
       1) K feature-slots each propose textual transformation/pattern hypotheses.
       2) One final pass synthesizes hypotheses into a single output grid.
     """
+    k = arc_hypothesis_k() if k is None else int(k)
     hypotheses = collect_feature_slot_hypotheses(
         vllm_llm,
         tokenizer,
@@ -6519,14 +6527,15 @@ class MultiAgentEnginePool:
         task: Dict[str, Any],
         test_index: int,
         seed: int,
-        k: int = K,
+        k: Optional[int] = None,
         max_new_tokens: int = EVAL_MAX_NEW_TOKENS,
     ) -> List[Dict[str, Any]]:
+        hyp_k = arc_hypothesis_k() if k is None else int(k)
         payload_base = {
             "task_id": task_id,
             "task": task,
             "test_index": test_index,
-            "k": k,
+            "k": hyp_k,
             "max_new_tokens": max_new_tokens,
         }
         for w in self._workers:
@@ -6687,6 +6696,7 @@ def evaluate_arc_dataset(
         f"MBR mode: {'hypothesis slots + final grid' if ARC_SLOT_HYPOTHESIS_MODE else 'token speculative'} "
         f"| output_budget={ARC_MBR_OUTPUT_TOKEN_BUDGET} tok/test "
         f"| final_reserve>={int(ARC_MBR_OUTPUT_TOKEN_BUDGET * ARC_FINAL_GRID_MIN_FRACTION)} "
+        f"| hyp_slots={arc_hypothesis_k()} (ARC_HYPOTHESIS_SLOTS) benchmark_K={k} "
         f"| hyp_thinking={ARC_HYPOTHESIS_ENABLE_THINKING}(cap={ARC_HYPOTHESIS_THINKING_TOKEN_CAP}) "
         f"final_thinking={ARC_FINAL_ENABLE_THINKING} "
         f"| vLLM ctx auto={arc_vllm_context_budget()} eager={VLLM_ENFORCE_EAGER}"
@@ -6700,7 +6710,9 @@ def evaluate_arc_dataset(
         )
     else:
         print(
-            f"Multi-agent: disabled (single engine)"
+            f"Multi-agent: disabled (single engine) | "
+            f"decision_pool={arc_hypothesis_k()} hypothesis proposals/engine "
+            f"(enable ARC_MULTI_AGENT_ENABLED for {ARC_MULTI_AGENT_N} independent voters)"
         )
         print(
             f"vLLM speculative: {_inference_speculative_status(vllm_llm)} "
@@ -6766,7 +6778,7 @@ def evaluate_arc_dataset(
                     task=task,
                     test_index=test_index,
                     seed=seed + test_index,
-                    k=k,
+                    k=arc_hypothesis_k(),
                     max_new_tokens=max_new_tokens,
                 )
                 mbr_pred, vote_meta = plurality_vote_agent_grids(agent_results)
@@ -6807,7 +6819,7 @@ def evaluate_arc_dataset(
                     task_id,
                     task,
                     test_index=test_index,
-                    k=k,
+                    k=arc_hypothesis_k(),
                     allocator=allocator,
                     seed=seed + test_index,
                     verbose=(ARC_EVAL_VERBOSE or STREAM_ALL_OUTPUT)
@@ -7233,6 +7245,12 @@ if __name__ == "__main__":
                 and ENABLE_VLLM_SPECULATIVE_DECODING
             )
         )
+        print(
+            f"[CONFIG] ARC_MULTI_AGENT_ENABLED={ARC_MULTI_AGENT_ENABLED} "
+            f"use_multi_agent={use_multi_agent} "
+            f"ARC_HYPOTHESIS_SLOTS={ARC_HYPOTHESIS_SLOTS} "
+            f"run_arc_eval={run_arc_eval}"
+        )
         if (
             ARC_MULTI_AGENT_ENABLED
             and run_arc_eval
@@ -7281,6 +7299,13 @@ if __name__ == "__main__":
             raise RuntimeError("PREFER_LOCAL_MODELS=False — use remote path")
     except RuntimeError as _local_e:
         print(_local_e)
+        if ARC_MULTI_AGENT_ENABLED and run_arc_eval:
+            print(
+                "[MULTI-AGENT][WARN] Pool spawn failed — falling back to single engine "
+                f"with {ARC_HYPOTHESIS_SLOTS} hypothesis slots. "
+                "Save script to /kaggle/working/million_brains_dflash.py or set "
+                "MBR_WORKER_SCRIPT_PATH."
+            )
         print("[LOCAL-LOAD] Falling back to remote model resolution...")
         model_name, backend = pick_model_name()
         vllm_llm, tokenizer, hf_model = load_models(model_name)
