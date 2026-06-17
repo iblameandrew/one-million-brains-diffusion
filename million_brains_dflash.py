@@ -180,7 +180,7 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-17f"  # bump when re-uploading to Kaggle to confirm latest script
+SCRIPT_VERSION = "2026-06-17g"  # bump when re-uploading to Kaggle to confirm latest script
 K = 4  # number of parallel drafter streams / feature-slots per super-block
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
 BLOCK_SIZE = 6  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
@@ -220,16 +220,18 @@ LOCAL_DFLASH_DIR = f"{KAGGLE_QWEN_BUNDLE_ROOT}/Qwen3.5-4B-DFlash"  # DFlash draf
 BASE_BUNDLE_DIR_NAMES = frozenset({"qwen3.5-4b", "qwen3-5-4b"})
 DRAFT_BUNDLE_DIR_NAMES = frozenset({"qwen3.5-4b-dflash", "qwen3-5-4b-dflash"})
 # vLLM load safety for custom DFlash / Qwen3.5 checkpoints (avoid pooling + torch.compile crash)
-VLLM_ENFORCE_EAGER = True  # required for custom architectures on vLLM v1
+VLLM_ENFORCE_EAGER = False  # prefer CUDA graphs; load loop retries enforce_eager=True on failure
 VLLM_RUNNER = "generate"  # do not let vLLM pick pooling/embedding runner
 VLLM_FALLBACK_TO_HF = True  # HuggingFace wrapper if vLLM still cannot load the checkpoint
-VLLM_GPU_MEMORY_UTILIZATION = 0.55  # L4/Kaggle safe default (0.85 OOMs when ~8GiB already in use)
+VLLM_GPU_MEMORY_UTILIZATION = 0.70  # single-GPU L4: higher util helps DFlash spec load (adaptive cap still applies)
 VLLM_TENSOR_PARALLEL_SIZE = 0  # 0=auto (retry with tp=2 when 2+ GPUs visible)
 # vLLM native speculative decoding (DFlash draft + target base in one engine)
 ENABLE_VLLM_SPECULATIVE_DECODING = True
 VLLM_SPECULATIVE_METHOD = "dflash"  # "dflash" | "draft_model" | "auto"
 VLLM_NUM_SPECULATIVE_TOKENS = BLOCK_SIZE  # DFlash block width per speculation step
-VLLM_SPEC_DRAFT_GPU_UTIL_SCALE = 0.88  # shrink base util when loading target + draft
+VLLM_SPEC_DRAFT_GPU_UTIL_SCALE = 1.0  # do not shrink util for target+draft (was 0.88; caused spec VRAM fallback)
+VLLM_SPEC_PREFER_LOWER_CONTEXT = True  # try spec at 12288 before full ARC max_model_len (fits draft+target on L4)
+VLLM_SPEC_FIRST_MAX_MODEL_LEN = 12288  # first speculative attempt context (raise if 30x30 truncates)
 PREFER_HF_INFERENCE = False  # L4/A10+: prefer vLLM fast kernels; HF only on load failure
 SKIP_VLLM_FOR_QWEN35 = False  # attempt vLLM for Qwen3.5-4B (set True on broken vLLM hosts)
 AUTO_PREFETCH_TO_WORKING = True  # when online, cache a small Qwen checkpoint into /kaggle/working
@@ -276,7 +278,7 @@ ARC_TRY_VLLM = True  # ARC eval requires vLLM for speed; HF fallback if load fai
 # Qwen3.5-4B native context is 150k+ (YaRN); vLLM max_model_len is a VRAM budget we set at load.
 # KV cache grows with max_model_len — 4k was only to fit L4 OOM; ARC 30x30 tasks need ~8k+.
 VLLM_MAX_MODEL_LEN = 0  # 0 = auto (ARC prompt + output budget); set e.g. 16384 if VRAM allows
-ARC_MAX_PROMPT_TOKENS = 8192  # target input budget for large ARC grids (30x30 train pairs)
+ARC_MAX_PROMPT_TOKENS = 6144  # tighter input budget; resolver shrinks further; lowers KV bandwidth on decode
 ARC_SLOT_HYPOTHESIS_MODE = True  # MBR: slots propose transformation text; one final pass emits grid
 ARC_MBR_OUTPUT_TOKEN_BUDGET = 8000  # total OUTPUT tokens per test (hyp slots + final grid combined)
 ARC_FINAL_GRID_MIN_TOKENS = 512  # floor for final JSON grid pass
@@ -284,13 +286,14 @@ ARC_FINAL_GRID_MAX_FRACTION = 0.85  # final may use up to 85% of output budget f
 ARC_FINAL_GRID_MIN_FRACTION = 0.50  # always reserve 50% of output budget for final grid synthesis
 ARC_HYPOTHESIS_MAX_TOKENS = ARC_MBR_OUTPUT_TOKEN_BUDGET * 3 // 4 // K  # legacy default; task-aware below
 ARC_FINAL_GRID_MAX_TOKENS = ARC_MBR_OUTPUT_TOKEN_BUDGET // 4  # legacy default; task-aware below
-ARC_FINAL_HYP_CHAR_CAPS = (600, 360, 200, 100, 0)  # shrink hypothesis text in final prompt if needed
+ARC_FINAL_HYP_CHAR_CAPS = (360, 200, 120, 60, 0)  # shrink hypothesis text in final prompt if needed
 ARC_HYPOTHESIS_ENABLE_THINKING = True  # slots may emit </think> reasoning before TRANSFORMATION_HYPOTHESIS
-ARC_FINAL_ENABLE_THINKING = True  # final grid pass may think before JSON output (no [[ prefill)
+ARC_HYPOTHESIS_THINKING_TOKEN_CAP = 384  # per-slot cap when thinking on (prevents burning full 8k on hyp phase)
+ARC_FINAL_ENABLE_THINKING = False  # final grid: [[ prefill + greedy JSON (much faster than thinking pass)
 # Multi-agent layer: N independent Qwen instances (1 per GPU, round-robin) + plurality vote on final grid.
-ARC_MULTI_AGENT_ENABLED = True  # False = single vLLM engine (legacy path)
+ARC_MULTI_AGENT_ENABLED = False  # True = plurality vote; False = single engine + DFlash spec (faster default)
 ARC_MULTI_AGENT_N = 5  # independent Qwen3.5-4B instances per test case
-ARC_MULTI_AGENT_DISABLE_SPECULATIVE = True  # skip DFlash draft per agent to save VRAM
+ARC_MULTI_AGENT_DISABLE_SPECULATIVE = False  # try DFlash per agent when multi-agent re-enabled
 ARC_MULTI_AGENT_GPU_UTIL = 0.0  # 0 = auto (~0.88 / ceil(N / num_gpus)) per engine
 ARC_MULTI_AGENT_VOTE = "plurality"  # plurality = most common parsed grid; ties -> lowest agent id
 MBR_WORKER_SCRIPT_PATH = None  # None = auto; set e.g. /kaggle/working/million_brains_dflash.py in notebooks
@@ -2858,23 +2861,63 @@ def _inference_speculative_status(llm: Any) -> str:
     return "off"
 
 
+def _vllm_max_len_candidates(arc_need: int, *, spec_first: bool = False) -> List[int]:
+    """Ordered max_model_len values to try; spec_first tries lower ctx before full ARC budget."""
+    pool = sorted({arc_need, 12288, 11264, 10240, 8192, 6144, 4096}, reverse=True)
+    pool = [m for i, m in enumerate(pool) if m not in pool[:i]]
+    if not spec_first or not VLLM_SPEC_PREFER_LOWER_CONTEXT:
+        return pool
+    first = int(VLLM_SPEC_FIRST_MAX_MODEL_LEN)
+    head = [m for m in pool if m <= first]
+    tail = [m for m in pool if m > first]
+    ordered: List[int] = []
+    for m in head + tail:
+        if m not in ordered:
+            ordered.append(m)
+    return ordered
+
+
+def _append_vllm_attempt_variants(
+    target: List[Dict[str, Any]],
+    seen: set,
+    base: Dict[str, Any],
+    *,
+    custom: bool,
+    hf_overrides: Dict[str, Any],
+    hf_extra: Dict[str, Any],
+) -> None:
+    """Add enforce_eager=False first (fast path), then eager=True fallbacks."""
+
+    def _add(**kwargs: Any) -> None:
+        key = tuple(sorted((k, repr(v)) for k, v in kwargs.items()))
+        if key in seen:
+            return
+        seen.add(key)
+        target.append(kwargs)
+
+    eager_first = not VLLM_ENFORCE_EAGER
+    if eager_first:
+        _add(**base, runner=VLLM_RUNNER, enforce_eager=False, **hf_extra)
+    if custom or hf_overrides or VLLM_ENFORCE_EAGER:
+        _add(**base, runner=VLLM_RUNNER, enforce_eager=True, **hf_extra)
+    if not eager_first:
+        _add(**base, runner=VLLM_RUNNER, enforce_eager=VLLM_ENFORCE_EAGER, **hf_extra)
+    _add(**base, enforce_eager=True, **hf_extra)
+
+
 def _build_vllm_attempts(
     model_path: str,
     gpu_memory_utilization: float,
     *,
     dflash_draft_path: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     custom = _needs_custom_vllm_handling(model_path)
     util = _adaptive_vllm_gpu_util(gpu_memory_utilization)
     arc_need = arc_vllm_context_budget()
     if int(VLLM_MAX_MODEL_LEN) > 0:
         arc_need = min(arc_need, int(VLLM_MAX_MODEL_LEN))
-    # Try largest context first (ARC 30x30 needs it); fall back on VRAM OOM.
-    max_lens = sorted(
-        {arc_need, 12288, 11264, 10240, 8192, 6144, 4096},
-        reverse=True,
-    )
-    max_lens = [m for i, m in enumerate(max_lens) if m not in max_lens[:i]]
+    fallback_max_lens = _vllm_max_len_candidates(arc_need, spec_first=False)
+    spec_max_lens = _vllm_max_len_candidates(arc_need, spec_first=True)
 
     hf_overrides: Dict[str, Any] = {}
     if os.path.isfile(os.path.join(model_path, "config.json")):
@@ -2909,19 +2952,43 @@ def _build_vllm_attempts(
             f"n_tokens={spec_root['num_speculative_tokens']} "
             f"draft={spec_root['model']}"
         )
+        print(
+            f"[LOAD] Speculative max_model_len order: {spec_max_lens} "
+            f"(ARC budget={arc_need}; prefer_lower_ctx={VLLM_SPEC_PREFER_LOWER_CONTEXT})"
+        )
 
     spec_attempts: List[Dict[str, Any]] = []
     fallback_attempts: List[Dict[str, Any]] = []
     seen: set = set()
 
-    def _add(target: List[Dict[str, Any]], **kwargs: Any) -> None:
-        key = tuple(sorted((k, repr(v)) for k, v in kwargs.items()))
-        if key in seen:
-            return
-        seen.add(key)
-        target.append(kwargs)
+    if spec_root:
+        for max_len in spec_max_lens:
+            for tp in tp_sizes:
+                for u in util_steps:
+                    spec_util = max(
+                        0.35, float(u) * float(VLLM_SPEC_DRAFT_GPU_UTIL_SCALE)
+                    )
+                    spec_cfg = dict(spec_root)
+                    spec_cfg["max_model_len"] = max_len
+                    spec_base = {
+                        "model": model_path,
+                        "trust_remote_code": True,
+                        "dtype": "auto",
+                        "max_model_len": max_len,
+                        "gpu_memory_utilization": spec_util,
+                        "tensor_parallel_size": tp,
+                        "speculative_config": spec_cfg,
+                    }
+                    _append_vllm_attempt_variants(
+                        spec_attempts,
+                        seen,
+                        spec_base,
+                        custom=custom,
+                        hf_overrides=hf_overrides,
+                        hf_extra=hf_extra,
+                    )
 
-    for max_len in max_lens:
+    for max_len in fallback_max_lens:
         for tp in tp_sizes:
             for u in util_steps:
                 base: Dict[str, Any] = {
@@ -2932,56 +2999,16 @@ def _build_vllm_attempts(
                     "gpu_memory_utilization": u,
                     "tensor_parallel_size": tp,
                 }
-                if spec_root:
-                    spec_util = max(
-                        0.35, float(u) * float(VLLM_SPEC_DRAFT_GPU_UTIL_SCALE)
-                    )
-                    spec_cfg = dict(spec_root)
-                    spec_cfg["max_model_len"] = max_len
-                    spec_base = {
-                        **base,
-                        "gpu_memory_utilization": spec_util,
-                        "speculative_config": spec_cfg,
-                    }
-                    if custom or hf_overrides or VLLM_ENFORCE_EAGER:
-                        _add(
-                            spec_attempts,
-                            **spec_base,
-                            runner=VLLM_RUNNER,
-                            enforce_eager=True,
-                            **hf_extra,
-                        )
-                    _add(
-                        spec_attempts,
-                        **spec_base,
-                        runner=VLLM_RUNNER,
-                        enforce_eager=VLLM_ENFORCE_EAGER,
-                        **hf_extra,
-                    )
-                    _add(
-                        spec_attempts,
-                        **spec_base,
-                        enforce_eager=True,
-                        **hf_extra,
-                    )
-                if custom or hf_overrides or VLLM_ENFORCE_EAGER:
-                    _add(
-                        fallback_attempts,
-                        **base,
-                        runner=VLLM_RUNNER,
-                        enforce_eager=True,
-                        **hf_extra,
-                    )
-                _add(
+                _append_vllm_attempt_variants(
                     fallback_attempts,
-                    **base,
-                    runner=VLLM_RUNNER,
-                    enforce_eager=VLLM_ENFORCE_EAGER,
-                    **hf_extra,
+                    seen,
+                    base,
+                    custom=custom,
+                    hf_overrides=hf_overrides,
+                    hf_extra=hf_extra,
                 )
-                _add(fallback_attempts, **base, enforce_eager=True, **hf_extra)
 
-    return spec_attempts + fallback_attempts
+    return spec_attempts, fallback_attempts
 
 
 @dataclass
@@ -3391,58 +3418,80 @@ def create_inference_engine(
             local_only=local_only,
         )
 
-    attempts = _build_vllm_attempts(
+    spec_attempts, fallback_attempts = _build_vllm_attempts(
         gen_path, gpu_mem, dflash_draft_path=draft_path
     )
+    want_spec = bool(draft_path and ENABLE_VLLM_SPECULATIVE_DECODING and spec_attempts)
+    phases: List[Tuple[str, List[Dict[str, Any]]]] = []
+    if spec_attempts:
+        phases.append(("speculative", spec_attempts))
+    if fallback_attempts:
+        phases.append(("base-only", fallback_attempts))
+    total_attempts = sum(len(batch) for _, batch in phases)
+
     last_err: Optional[BaseException] = None
     _release_cuda_cache()
-    for idx, kwargs in enumerate(attempts, start=1):
-        try:
-            spec_cfg = kwargs.get("speculative_config")
-            spec_tag = ""
-            if spec_cfg:
-                spec_tag = (
-                    f" spec={spec_cfg.get('method')}"
-                    f" n={spec_cfg.get('num_speculative_tokens')}"
-                )
+    attempt_idx = 0
+    for phase_name, batch in phases:
+        if phase_name == "base-only" and want_spec:
             print(
-                f"[LOAD] vLLM attempt {idx}/{len(attempts)}: "
-                f"max_model_len={kwargs.get('max_model_len')} "
-                f"gpu_util={kwargs.get('gpu_memory_utilization')} "
-                f"tp={kwargs.get('tensor_parallel_size', 1)}{spec_tag}"
+                "[LOAD] All speculative attempts failed — falling back to base-only "
+                "(decode will be slower; raise VLLM_GPU_MEMORY_UTILIZATION or lower "
+                "VLLM_SPEC_FIRST_MAX_MODEL_LEN if this persists)."
             )
-            llm = LLM(**kwargs)
-            ctx = int(kwargs.get("max_model_len", 4096))
-            setattr(llm, "max_model_len", ctx)
-            setattr(
-                llm,
-                "speculative_decoding_enabled",
-                bool(spec_cfg),
-            )
-            if spec_cfg:
-                setattr(llm, "speculative_config", spec_cfg)
-            print(
-                f"[LOAD] vLLM engine ready (max_model_len={ctx}; "
-                f"Qwen native context can be 150k+ but KV cache limits this on GPU)."
-            )
-            if draft_path:
-                setattr(llm, "dflash_draft_path", draft_path)
-            if spec_cfg:
+        for kwargs in batch:
+            attempt_idx += 1
+            try:
+                spec_cfg = kwargs.get("speculative_config")
+                spec_tag = ""
+                if spec_cfg:
+                    spec_tag = (
+                        f" spec={spec_cfg.get('method')}"
+                        f" n={spec_cfg.get('num_speculative_tokens')}"
+                    )
                 print(
-                    "[LOAD] vLLM speculative decoding ACTIVE "
-                    f"({spec_cfg.get('method')}, "
-                    f"n={spec_cfg.get('num_speculative_tokens')})"
+                    f"[LOAD] vLLM attempt {attempt_idx}/{total_attempts} "
+                    f"({phase_name}): "
+                    f"max_model_len={kwargs.get('max_model_len')} "
+                    f"gpu_util={kwargs.get('gpu_memory_utilization')} "
+                    f"tp={kwargs.get('tensor_parallel_size', 1)} "
+                    f"eager={kwargs.get('enforce_eager')}{spec_tag}"
                 )
-            elif draft_path and ENABLE_VLLM_SPECULATIVE_DECODING:
+                llm = LLM(**kwargs)
+                ctx = int(kwargs.get("max_model_len", 4096))
+                setattr(llm, "max_model_len", ctx)
+                setattr(
+                    llm,
+                    "speculative_decoding_enabled",
+                    bool(spec_cfg),
+                )
+                if spec_cfg:
+                    setattr(llm, "speculative_config", spec_cfg)
                 print(
-                    "[LOAD] [WARN] DFlash draft available but this attempt "
-                    "loaded WITHOUT speculative_config (VRAM fallback)."
+                    f"[LOAD] vLLM engine ready (max_model_len={ctx}; "
+                    f"Qwen native context can be 150k+ but KV cache limits this on GPU)."
                 )
-            return llm
-        except Exception as exc:
-            last_err = exc
-            print(f"[LOAD] vLLM attempt {idx} failed: {type(exc).__name__}: {exc}")
-            _release_cuda_cache()
+                if draft_path:
+                    setattr(llm, "dflash_draft_path", draft_path)
+                if spec_cfg:
+                    print(
+                        "[LOAD] vLLM speculative decoding ACTIVE "
+                        f"({spec_cfg.get('method')}, "
+                        f"n={spec_cfg.get('num_speculative_tokens')})"
+                    )
+                elif draft_path and ENABLE_VLLM_SPECULATIVE_DECODING:
+                    print(
+                        "[LOAD] [WARN] DFlash draft available but this attempt "
+                        "loaded WITHOUT speculative_config (VRAM fallback)."
+                    )
+                return llm
+            except Exception as exc:
+                last_err = exc
+                print(
+                    f"[LOAD] vLLM attempt {attempt_idx} failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                _release_cuda_cache()
 
     if VLLM_FALLBACK_TO_HF:
         print(
@@ -3486,7 +3535,17 @@ def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
         print(f"    generate : {gen_path}")
     if draft_path:
         print(f"    dflash   : {draft_path}")
-        print(f"    spec_dec : {_inference_speculative_status(llm)}")
+        spec_status = _inference_speculative_status(llm)
+        print(f"    spec_dec : {spec_status}")
+        if (
+            ENABLE_VLLM_SPECULATIVE_DECODING
+            and not isinstance(llm, HFGenerateEngine)
+            and not getattr(llm, "speculative_decoding_enabled", False)
+        ):
+            print(
+                "    [WARN] DFlash speculative INACTIVE — expect ~2-3x slower decode. "
+                "Restart kernel with more free VRAM or set VLLM_GPU_MEMORY_UTILIZATION=0.75."
+            )
     ctx = get_inference_max_context(llm)
     print(f"    max_ctx  : {ctx} tokens (vLLM max_model_len / HF cap; Qwen native >> this)")
     if isinstance(llm, HFGenerateEngine) and ARC_TRY_VLLM:
@@ -3547,6 +3606,26 @@ def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
         )
     except Exception as exc:
         print(f"    bench    : skipped ({type(exc).__name__}: {exc})")
+
+    if not isinstance(llm, HFGenerateEngine):
+        long_tokens = 64
+        long_prompt = "ARC final-pass decode probe. " + ("context " * 800)
+        long_sp = SamplingParams(temperature=0.0, max_tokens=long_tokens)
+        setattr(long_sp, "stream_label", "VERIFY-long-bench")
+        t1 = time.perf_counter()
+        try:
+            long_out = llm.generate([long_prompt], long_sp)[0]
+            long_elapsed = time.perf_counter() - t1
+            long_n = len(long_out.outputs[0].token_ids) if long_out.outputs else 0
+            long_tps = long_n / max(long_elapsed, 1e-6)
+            long_in = count_prompt_tokens(tokenizer, long_prompt)
+            print(
+                f"    long_bench: {long_n} tok in {long_elapsed:.2f}s "
+                f"({long_tps:.1f} tok/s, prompt~{long_in}tok) "
+                f"spec={getattr(llm, 'speculative_decoding_enabled', False)}"
+            )
+        except Exception as exc:
+            print(f"    long_bench: skipped ({type(exc).__name__}: {exc})")
 
 
 def load_models(model_name: str):
@@ -3941,7 +4020,12 @@ def arc_hypothesis_max_tokens(task: Dict[str, Any]) -> int:
         int(budget * ARC_FINAL_GRID_MIN_FRACTION),
     )
     hyp_pool = max(0, budget - final_reserve)
-    return max(64, hyp_pool // max(1, K))
+    per_slot = max(64, hyp_pool // max(1, K))
+    if ARC_HYPOTHESIS_ENABLE_THINKING and not ARC_DISABLE_THINKING:
+        think_cap = int(ARC_HYPOTHESIS_THINKING_TOKEN_CAP)
+        if think_cap > 0:
+            per_slot = min(per_slot, think_cap)
+    return per_slot
 
 
 def arc_mbr_final_output_budget(
@@ -6333,8 +6417,9 @@ def evaluate_arc_dataset(
         f"MBR mode: {'hypothesis slots + final grid' if ARC_SLOT_HYPOTHESIS_MODE else 'token speculative'} "
         f"| output_budget={ARC_MBR_OUTPUT_TOKEN_BUDGET} tok/test "
         f"| final_reserve>={int(ARC_MBR_OUTPUT_TOKEN_BUDGET * ARC_FINAL_GRID_MIN_FRACTION)} "
-        f"| hyp_thinking={ARC_HYPOTHESIS_ENABLE_THINKING} final_thinking={ARC_FINAL_ENABLE_THINKING} "
-        f"| vLLM ctx auto={arc_vllm_context_budget()}"
+        f"| hyp_thinking={ARC_HYPOTHESIS_ENABLE_THINKING}(cap={ARC_HYPOTHESIS_THINKING_TOKEN_CAP}) "
+        f"final_thinking={ARC_FINAL_ENABLE_THINKING} "
+        f"| vLLM ctx auto={arc_vllm_context_budget()} eager={VLLM_ENFORCE_EAGER}"
     )
     if multi_agent_pool is not None:
         print(
