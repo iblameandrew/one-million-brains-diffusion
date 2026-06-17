@@ -16,8 +16,8 @@ SOURCE = SCRIPT.read_text(encoding="utf-8")
 
 
 class TestSourceStructure(unittest.TestCase):
-    def test_version_is_diffusion_d(self):
-        self.assertIn('SCRIPT_VERSION = "2026-06-19-diffusion-d"', SOURCE)
+    def test_version_is_diffusion_e(self):
+        self.assertIn('SCRIPT_VERSION = "2026-06-19-diffusion-e"', SOURCE)
 
     def test_single_engine_arc_no_voter_pool(self):
         self.assertNotIn("ARC_MULTI_AGENT_REQUIRED", SOURCE)
@@ -28,11 +28,19 @@ class TestSourceStructure(unittest.TestCase):
     def test_hypothesis_thinking_disabled(self):
         self.assertIn("ARC_HYPOTHESIS_ENABLE_THINKING = False", SOURCE)
 
-    def test_phase1_uses_use_tqdm_false(self):
-        self.assertIn("outs = vllm_llm.generate(prompts, sp_list, use_tqdm=False)", SOURCE)
+    def test_phase1_uses_vllm_generate_arc(self):
+        self.assertIn("def _vllm_generate_arc(", SOURCE)
+        self.assertIn("use_tqdm=False", SOURCE)
+        self.assertIn("_arc_phase1_generate_slots(", SOURCE)
 
-    def test_phase2_uses_use_tqdm_false(self):
-        self.assertIn("out = vllm_llm.generate([prompt], sp, use_tqdm=False)[0]", SOURCE)
+    def test_phase2_uses_vllm_generate_arc(self):
+        self.assertIn("out = _vllm_generate_arc(vllm_llm, [prompt], [sp])[0]", SOURCE)
+
+    def test_phase1_parallelism_enabled(self):
+        self.assertIn("ARC_PHASE1_PROMPT_PARALLELISM = True", SOURCE)
+        self.assertGreaterEqual(
+            int(re.search(r"ARC_VLLM_MAX_NUM_SEQS = (\d+)", SOURCE).group(1)), 2
+        )
 
     def test_phase1_timing_logs(self):
         self.assertIn("[ARC-PHASE-1] Generate start:", SOURCE)

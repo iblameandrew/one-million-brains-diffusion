@@ -13,7 +13,7 @@ Kaggle: attach Models input google/diffusiongemma, run as script or notebook cel
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-19-diffusion-d"  # single-engine ARC (no voter pool)
+SCRIPT_VERSION = "2026-06-19-diffusion-e"  # batched Phase-1 + tokenization hot-path fixes
 # --- DiffusionGemma core (default engine) ---
 # Kaggle: Add Input -> Models -> google/diffusiongemma -> diffusiongemma-26b-a4b-it
 KAGGLE_DIFFUSIONGEMMA_DIR = (
@@ -128,8 +128,8 @@ ARC_FINAL_HYP_CHAR_CAPS = (360, 200, 120, 60, 0)  # shrink hypothesis text in fi
 ARC_HYPOTHESIS_ENABLE_THINKING = False  # False = fast text rules (True + thinking can stall tqdm at 0/N for minutes)
 ARC_HYPOTHESIS_THINKING_TOKEN_CAP = 512  # per-slot cap when hypothesis thinking is enabled
 ARC_FINAL_ENABLE_THINKING = False  # final grid: [[ prefill + greedy JSON (much faster than thinking pass)
-ARC_PHASE1_PROMPT_PARALLELISM = False  # False = 1 hypothesis slot per vLLM generate()
-ARC_VLLM_MAX_NUM_SEQS = 1  # max Phase-1 slots batched per vLLM call when parallelism on
+ARC_PHASE1_PROMPT_PARALLELISM = True  # batch K slots per vLLM generate() (use_tqdm=False avoids stall)
+ARC_VLLM_MAX_NUM_SEQS = 4  # Phase-1 batch size; raise to 8 on A100+ if VRAM allows
 ARC_CHAT_TEMPLATE_SLACK = 2048  # system + chat template overhead beyond raw task body
 ARC_SAVE_GRADE_IMAGES = True  # save PNG grade cards (arc_grades/ or /kaggle/working/arc_grades/)
 ARC_SHOW_TRAIN_EXAMPLES = True  # include train pair thumbnails on each grade card
@@ -151,7 +151,6 @@ import random
 import json
 import hashlib
 import traceback
-import re
 from pathlib import Path
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
@@ -1025,6 +1024,16 @@ def _hf_hub_snapshot_path(model_id: str) -> Optional[str]:
     return None
 
 
+def _arc_engine_max_num_seqs() -> int:
+    """Concurrent vLLM sequences needed for batched ARC Phase-1."""
+    if not ARC_SLOT_HYPOTHESIS_MODE or not ARC_PHASE1_PROMPT_PARALLELISM:
+        return int(DIFFUSION_MAX_NUM_SEQS)
+    return max(
+        int(DIFFUSION_MAX_NUM_SEQS),
+        arc_phase1_slot_batch_size(arc_hypothesis_k()),
+    )
+
+
 def _build_diffusiongemma_vllm_kwargs(
     model_path: str,
     *,
@@ -1037,7 +1046,7 @@ def _build_diffusiongemma_vllm_kwargs(
     diffusion_config + entropy_bound sampler + low max_num_seqs to avoid diffusion-state OOM.
     """
     ctx = int(max_model_len or DIFFUSION_MAX_MODEL_LEN)
-    seqs = int(max_num_seqs or DIFFUSION_MAX_NUM_SEQS)
+    seqs = int(max_num_seqs or _arc_engine_max_num_seqs())
     util = min(float(gpu_memory_utilization), float(DIFFUSION_GPU_UTIL))
     kwargs: Dict[str, Any] = {
         "model": model_path,
@@ -1226,7 +1235,7 @@ def million_brains_diffusion_denoise_generate(
             )
             draft_sampling.append(sp)
 
-        outs = vllm_llm.generate(conditioned_prompts, draft_sampling)
+        outs = vllm_llm.generate(conditioned_prompts, draft_sampling, use_tqdm=False)
         proposals: List[List[int]] = []
         draft_lps: List[List[float]] = []
         for slot_i, out in enumerate(outs):
@@ -1289,7 +1298,9 @@ def million_brains_diffusion_denoise_generate(
         setattr(verify_params, "stream_label", f"MBR-denoise-verify/step{step}")
         setattr(verify_params, "verify_only", True)
         setattr(verify_params, "verify_tail_tokens", block_size + 4)
-        verify_outs = vllm_llm.generate(candidates_for_verify, verify_params)
+        verify_outs = vllm_llm.generate(
+            candidates_for_verify, verify_params, use_tqdm=False
+        )
 
         target_lps_per_path: List[List[float]] = []
         for j, vout in enumerate(verify_outs):
@@ -1383,13 +1394,10 @@ def million_brains_diffusion_denoise_generate(
             reframe_events += 1
 
         if verbose or STREAM_ALL_OUTPUT:
-            gmask = GroupThinkMask(
-                k=k, block_size=block_size, phase="integration"
-            )
             stream_log(
                 f"    Denoise step {step:02d} | features={active_feature_names} | "
                 f"accepted={accepted_len}/{block_size} | λ={blend_lambda:.2f}"
-                f" | mask={gmask.describe()}"
+                f" | mask=GroupThinkMask(k={k}, block={block_size}, phase=integration)"
             )
 
         if len(generated_ids) >= max_new_tokens:
@@ -3322,10 +3330,11 @@ def resolve_arc_final_prompt_bundle(
                     assistant_prefill=assistant_prefill,
                 )
                 n_in = count_prompt_tokens(tokenizer, prompt)
+                body_tok = count_prompt_tokens(tokenizer, body)
                 if n_in < best[1]:
-                    best = (prompt, n_in, count_prompt_tokens(tokenizer, body), fmt)
+                    best = (prompt, n_in, body_tok, fmt)
                 if n_in <= max_input:
-                    return prompt, n_in, count_prompt_tokens(tokenizer, body), fmt
+                    return prompt, n_in, body_tok, fmt
 
     prompt, n_in, body_tok, fmt = best
     if n_in > max_input:
@@ -4098,6 +4107,7 @@ def collect_feature_slot_hypotheses(
     sp_list: List[Any] = []
     slot_meta: List[Tuple[int, str, Dict[str, Any]]] = []
     max_needed = 0
+    total_prompt_tok = 0
 
     if verbose or (STREAM_ALL_OUTPUT and not ARC_FAST_INFERENCE):
         stream_log(
@@ -4146,6 +4156,7 @@ def collect_feature_slot_hypotheses(
         sp_list.append(sp)
         slot_meta.append((slot_i, feat_name, params))
         n_in = count_prompt_tokens(tokenizer, prompt)
+        total_prompt_tok += n_in
         max_needed = max(max_needed, n_in + int(hyp_max_tokens))
 
     if max_needed > engine_ctx:
@@ -4158,7 +4169,6 @@ def collect_feature_slot_hypotheses(
             f"Qwen native context is 150k+; only GPU KV cache limits vLLM."
         )
 
-    total_prompt_tok = sum(count_prompt_tokens(tokenizer, p) for p in prompts)
     avg_prompt_tok = total_prompt_tok // max(1, k)
     slot_batch = arc_phase1_slot_batch_size(k)
     parallel_tag = (
@@ -4249,22 +4259,16 @@ def pixel_wise_majority_vote_grids(
         target_h = max(len(g) for g in eligible)
         target_w = max(len(g[0]) if g else 0 for g in eligible)
 
-    result: List[List[int]] = []
+    stacked = np.asarray(eligible, dtype=np.int32)
+    winners = np.zeros((target_h, target_w), dtype=np.int32)
     cell_votes: Dict[str, int] = {}
     for r in range(target_h):
-        row: List[int] = []
         for c in range(target_w):
-            votes: List[int] = []
-            for g in eligible:
-                if r < len(g) and c < len(g[r]):
-                    votes.append(int(g[r][c]))
-            if votes:
-                winner = Counter(votes).most_common(1)[0][0]
-                row.append(winner)
-                cell_votes[f"{r},{c}"] = len(votes)
-            else:
-                row.append(0)
-        result.append(row)
+            col = stacked[:, r, c]
+            vals, counts = np.unique(col, return_counts=True)
+            winners[r, c] = int(vals[int(counts.argmax())])
+            cell_votes[f"{r},{c}"] = int(col.shape[0])
+    result = winners.tolist()
 
     return result, {
         "method": "pixel_majority",
@@ -4338,6 +4342,9 @@ def collect_spatial_grid_hypotheses(
     for n_train in train_limits:
         task_for_prompt = _arc_task_with_train_limit(task, n_train)
         slot_max_tokens = arc_spatial_slot_max_tokens(task_for_prompt, test_index)
+        cached_body_key: Optional[Tuple[str, str]] = None
+        max_prompt_in = 0
+        total_prompt_tok = 0
         for _shrink in range(10):
             task_body, system_used, _probe_tok, body_fmt = (
                 resolve_arc_spatial_task_body(
@@ -4352,36 +4359,47 @@ def collect_spatial_grid_hypotheses(
                     enable_thinking=grid_thinking,
                 )
             )
-            prompts = []
+            body_key = (task_body, system_used)
+            if body_key != cached_body_key:
+                prompts = []
+                sp_list = []
+                slot_meta = []
+                max_prompt_in = 0
+                total_prompt_tok = 0
+                for slot_i in range(k):
+                    prim = (
+                        feature_names[slot_i]
+                        if slot_i < len(feature_names)
+                        else f"slot{slot_i}"
+                    )
+                    params = (
+                        feature_params[slot_i]
+                        if slot_i < len(feature_params)
+                        else FEATURE_PARAMS[SPATIAL_PRIMITIVES[0]]
+                    )
+                    user_content = build_spatial_grid_user_content(
+                        task_id,
+                        task_for_prompt,
+                        test_index,
+                        prim,
+                        task_body=task_body,
+                        compact=ARC_FAST_INFERENCE,
+                    )
+                    prompt = _wrap_arc_chat_prompt(
+                        tokenizer,
+                        user_content,
+                        system_content=system_used,
+                        enable_thinking=grid_thinking,
+                        assistant_prefill=ARC_ASSISTANT_PREFILL,
+                    )
+                    prompts.append(prompt)
+                    slot_meta.append((slot_i, prim, params))
+                    n_in = count_prompt_tokens(tokenizer, prompt)
+                    total_prompt_tok += n_in
+                    max_prompt_in = max(max_prompt_in, n_in)
+                cached_body_key = body_key
             sp_list = []
-            slot_meta = []
-            max_needed = 0
-            for slot_i in range(k):
-                prim = (
-                    feature_names[slot_i]
-                    if slot_i < len(feature_names)
-                    else f"slot{slot_i}"
-                )
-                params = (
-                    feature_params[slot_i]
-                    if slot_i < len(feature_params)
-                    else FEATURE_PARAMS[SPATIAL_PRIMITIVES[0]]
-                )
-                user_content = build_spatial_grid_user_content(
-                    task_id,
-                    task_for_prompt,
-                    test_index,
-                    prim,
-                    task_body=task_body,
-                    compact=ARC_FAST_INFERENCE,
-                )
-                prompt = _wrap_arc_chat_prompt(
-                    tokenizer,
-                    user_content,
-                    system_content=system_used,
-                    enable_thinking=grid_thinking,
-                    assistant_prefill=ARC_ASSISTANT_PREFILL,
-                )
+            for slot_i, prim, params in slot_meta:
                 sp = SamplingParams(
                     temperature=float(ARC_GENERATION_TEMPERATURE),
                     top_p=float(params.get("top_p", 1.0)),
@@ -4390,11 +4408,8 @@ def collect_spatial_grid_hypotheses(
                 )
                 sp = _apply_arc_guided_decoding(sp)
                 setattr(sp, "stream_label", f"ARC-spatial/slot{slot_i}/{prim}")
-                prompts.append(prompt)
                 sp_list.append(sp)
-                slot_meta.append((slot_i, prim, params))
-                n_in = count_prompt_tokens(tokenizer, prompt)
-                max_needed = max(max_needed, n_in + int(slot_max_tokens))
+            max_needed = max_prompt_in + int(slot_max_tokens)
             if max_needed <= engine_ctx:
                 fitted = True
                 if n_train < n_train_full:
@@ -4423,7 +4438,6 @@ def collect_spatial_grid_hypotheses(
             f"(need={max_needed}/{engine_ctx})"
         )
 
-    total_prompt_tok = sum(count_prompt_tokens(tokenizer, p) for p in prompts)
     slot_batch = arc_phase1_slot_batch_size(k)
     guided_on = _arc_guided_json_enabled()
     parallel_tag = (
@@ -4936,6 +4950,8 @@ def format_grid_json(grid: Optional[List[List[int]]]) -> str:
 
 def count_prompt_tokens(tokenizer: Any, prompt: str) -> int:
     """Token length of a prompt (for prefill-aware throughput reporting)."""
+    if hasattr(tokenizer, "encode"):
+        return len(tokenizer.encode(prompt, add_special_tokens=True))
     encoded = tokenizer(prompt, add_special_tokens=True, return_tensors="pt")
     return int(encoded["input_ids"].shape[1])
 
