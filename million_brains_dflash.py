@@ -180,7 +180,7 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-16u"  # bump when re-uploading to Kaggle to confirm latest script
+SCRIPT_VERSION = "2026-06-16v"  # bump when re-uploading to Kaggle to confirm latest script
 K = 4  # number of parallel drafter streams / feature-slots per super-block
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
 BLOCK_SIZE = 6  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
@@ -267,6 +267,8 @@ ARC_PRINT_FINAL_MATRICES = True  # one final ASCII summary per test (gold + pred
 ARC_ASSISTANT_PREFILL = "[["  # chat prefill anchors JSON grid (skipped when thinking is on)
 ARC_GENERATION_TEMPERATURE = 0.0  # greedy JSON for grid tasks
 EVAL_SMOKE_TASK_ID = None  # e.g. "0934a4d8" — run only this task (overrides max_tasks slice)
+ARC_FAST_INFERENCE = True  # ARC eval: no token streaming, slim prompts, model.generate() path
+ARC_TRY_VLLM = False  # True = attempt vLLM for eval (HF fallback if load fails)
 ARC_RUN_MBR_EVAL = True  # False = skip slow million-brains pass (classic-only smoke tests)
 ARC_SAVE_GRADE_IMAGES = True  # save PNG grade cards (arc_grades/ or /kaggle/working/arc_grades/)
 ARC_SHOW_TRAIN_EXAMPLES = True  # include train pair thumbnails on each grade card
@@ -2691,7 +2693,7 @@ def _guess_causal_lm_architecture(config: Dict[str, Any]) -> Optional[str]:
 
 def _should_skip_vllm(model_path: str) -> bool:
     """Qwen3.5 multimodal checkpoints routinely fail vLLM on Kaggle; prefer HF."""
-    if PREFER_HF_INFERENCE:
+    if PREFER_HF_INFERENCE and not ARC_TRY_VLLM:
         return True
     if not SKIP_VLLM_FOR_QWEN35:
         return False
@@ -3065,7 +3067,7 @@ class HFGenerateEngine:
         if input_ids.shape[1] == 0:
             raise ValueError("Refusing to generate from empty input_ids")
 
-        if STREAM_GENERATION and stream:
+        if STREAM_GENERATION and stream and not ARC_FAST_INFERENCE:
             return self._sample_ids_streaming(
                 input_ids,
                 max_tokens,
@@ -3139,6 +3141,7 @@ class HFGenerateEngine:
             input_ids = self._encode(prompt)
             if (
                 STREAM_ALL_OUTPUT
+                and not ARC_FAST_INFERENCE
                 and batch_idx == 0
                 and not verify_only
             ):
@@ -3146,7 +3149,7 @@ class HFGenerateEngine:
                 stream_log(
                     f"[HF] prompt tail ({len(prompt)} chars): ...{preview}"
                 )
-            elif verify_only and STREAM_ALL_OUTPUT and batch_idx == 0:
+            elif verify_only and STREAM_ALL_OUTPUT and not ARC_FAST_INFERENCE and batch_idx == 0:
                 stream_log(
                     f"[HF] verify-only pass (tail_logprobs={verify_tail or 'full'}, "
                     f"n_candidates={len(prompts)})"
@@ -3200,11 +3203,10 @@ def create_inference_engine(
     local_only = os.path.isdir(gen_path)
 
     if _should_skip_vllm(gen_path):
-        reason = (
-            "PREFER_HF_INFERENCE=True"
-            if PREFER_HF_INFERENCE
-            else "Qwen3.5 multimodal checkpoint"
-        )
+        if PREFER_HF_INFERENCE and not ARC_TRY_VLLM:
+            reason = "PREFER_HF_INFERENCE=True (set ARC_TRY_VLLM=True to attempt vLLM)"
+        else:
+            reason = "Qwen3.5 multimodal checkpoint"
         print(f"[LOAD] Skipping vLLM ({reason}); using HuggingFace generate engine.")
         return HFGenerateEngine(
             gen_path,
@@ -3294,6 +3296,23 @@ def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
             "[VERIFY] Engine returned zero new tokens on smoke prompt."
         )
     print(f"    smoke    : OK ({n_new} token generated)")
+
+    bench_prompt = "Decode throughput probe. Count to twenty: "
+    bench_tokens = 48
+    bench_sp = SamplingParams(temperature=0.0, max_tokens=bench_tokens)
+    setattr(bench_sp, "stream_label", "VERIFY-bench")
+    t0 = time.perf_counter()
+    try:
+        bench_out = llm.generate([bench_prompt], bench_sp)[0]
+        bench_elapsed = time.perf_counter() - t0
+        bench_n = len(bench_out.outputs[0].token_ids) if bench_out.outputs else 0
+        bench_tps = bench_n / max(bench_elapsed, 1e-6)
+        print(
+            f"    bench    : {bench_n} tok in {bench_elapsed:.2f}s "
+            f"({bench_tps:.1f} tok/s decode, short prompt)"
+        )
+    except Exception as exc:
+        print(f"    bench    : skipped ({type(exc).__name__}: {exc})")
 
 
 def load_models(model_name: str):
@@ -3654,21 +3673,31 @@ def format_arc_prompt(task_id: str, task: Dict[str, Any], test_index: int = 0) -
         )
     for i, example in enumerate(task.get("train", []), start=1):
         inp, out = example["input"], example["output"]
-        lines.append(f"Train {i} input ({len(inp)}x{len(inp[0]) if inp else 0}):")
-        lines.append(_format_grid_ascii_compact(inp))
-        lines.append(f"Train {i} input JSON: {json.dumps(inp)}")
-        lines.append(f"Train {i} output ({len(out)}x{len(out[0]) if out else 0}):")
-        lines.append(_format_grid_ascii_compact(out))
-        lines.append(f"Train {i} output JSON: {json.dumps(out)}")
+        in_shape = f"{len(inp)}x{len(inp[0]) if inp else 0}"
+        out_shape = f"{len(out)}x{len(out[0]) if out else 0}"
+        if ARC_FAST_INFERENCE:
+            lines.append(f"Train {i} input ({in_shape}): {json.dumps(inp)}")
+            lines.append(f"Train {i} output ({out_shape}): {json.dumps(out)}")
+        else:
+            lines.append(f"Train {i} input ({in_shape}):")
+            lines.append(_format_grid_ascii_compact(inp))
+            lines.append(f"Train {i} input JSON: {json.dumps(inp)}")
+            lines.append(f"Train {i} output ({out_shape}):")
+            lines.append(_format_grid_ascii_compact(out))
+            lines.append(f"Train {i} output JSON: {json.dumps(out)}")
     test_inputs = task.get("test", [])
     if test_index >= len(test_inputs):
         raise IndexError(
             f"Task {task_id} has {len(test_inputs)} test inputs; requested index {test_index}."
         )
     test_inp = test_inputs[test_index]["input"]
-    lines.append(f"Test input ({len(test_inp)}x{len(test_inp[0]) if test_inp else 0}):")
-    lines.append(_format_grid_ascii_compact(test_inp))
-    lines.append(f"Test input JSON: {json.dumps(test_inp)}")
+    test_shape = f"{len(test_inp)}x{len(test_inp[0]) if test_inp else 0}"
+    if ARC_FAST_INFERENCE:
+        lines.append(f"Test input ({test_shape}): {json.dumps(test_inp)}")
+    else:
+        lines.append(f"Test input ({test_shape}):")
+        lines.append(_format_grid_ascii_compact(test_inp))
+        lines.append(f"Test input JSON: {json.dumps(test_inp)}")
     lines.append("Test output JSON array:")
     return "\n".join(lines)
 
@@ -4110,10 +4139,12 @@ def arc_direct_generate(
         max_tokens=int(max_new_tokens),
     )
     setattr(sp, "stream_label", "ARC-CLASSIC")
-    if STREAM_ALL_OUTPUT:
+    prompt_tokens = count_prompt_tokens(tokenizer, prompt)
+    if STREAM_ALL_OUTPUT and not ARC_FAST_INFERENCE:
         stream_log(
             f"[ARC] direct generate begin (max_new_tokens={max_new_tokens}, "
-            f"temp={temperature}, thinking={STREAM_PRINT_THINKING})"
+            f"temp={temperature}, thinking={STREAM_PRINT_THINKING}, "
+            f"prompt_tokens={prompt_tokens})"
         )
     out = vllm_llm.generate([prompt], sp)[0]
     gen_ids: List[int] = []
@@ -4125,6 +4156,7 @@ def arc_direct_generate(
         "generated_text": generated_text,
         "generated_ids": gen_ids,
         "num_tokens": len(gen_ids),
+        "prompt_tokens": prompt_tokens,
         "num_superblocks": 1,
         "total_accepted": len(gen_ids),
         "avg_accepted_per_block": float(len(gen_ids)),
@@ -4351,21 +4383,51 @@ def format_grid_json(grid: Optional[List[List[int]]]) -> str:
     return json.dumps(grid, separators=(",", ":"))
 
 
-def generation_timing_stats(elapsed_s: float, num_tokens: int) -> Dict[str, Any]:
-    """Elapsed wall time + tokens/sec for one generation call."""
+def count_prompt_tokens(tokenizer: Any, prompt: str) -> int:
+    """Token length of a prompt (for prefill-aware throughput reporting)."""
+    encoded = tokenizer(prompt, add_special_tokens=True, return_tensors="pt")
+    return int(encoded["input_ids"].shape[1])
+
+
+def generation_timing_stats(
+    elapsed_s: float,
+    num_tokens: int,
+    *,
+    prompt_tokens: int = 0,
+) -> Dict[str, Any]:
+    """Elapsed wall time + output/effective tokens/sec for one generation call."""
     elapsed = max(0.0, float(elapsed_s))
     tokens = max(0, int(num_tokens or 0))
+    prompt_tok = max(0, int(prompt_tokens or 0))
+    total_tok = prompt_tok + tokens
+    decode_tps = tokens / max(elapsed, 1e-6)
+    effective_tps = total_tok / max(elapsed, 1e-6)
     return {
         "elapsed_s": elapsed,
         "num_tokens": tokens,
-        "tps": tokens / max(elapsed, 1e-6),
+        "prompt_tokens": prompt_tok,
+        "total_tokens": total_tok,
+        "tps": decode_tps,
+        "decode_tps": decode_tps,
+        "effective_tps": effective_tps,
     }
 
 
 def format_timing_line(timing: Dict[str, Any]) -> str:
     return (
-        f"{timing['num_tokens']} tokens in {timing['elapsed_s']:.2f}s "
-        f"({timing['tps']:.2f} tok/s)"
+        f"{timing['num_tokens']} out tok in {timing['elapsed_s']:.2f}s "
+        f"(decode {timing.get('decode_tps', timing['tps']):.1f} tok/s)"
+    )
+
+
+def format_timing_detail_line(timing: Dict[str, Any]) -> str:
+    """Full timing: prompt + output tokens and effective throughput."""
+    prompt_tok = timing.get("prompt_tokens", 0)
+    return (
+        f"{timing['num_tokens']} out + {prompt_tok} prompt tok in "
+        f"{timing['elapsed_s']:.2f}s | decode "
+        f"{timing.get('decode_tps', timing['tps']):.1f} tok/s | effective "
+        f"{timing.get('effective_tps', timing['tps']):.1f} tok/s"
     )
 
 
@@ -4483,8 +4545,14 @@ def print_arc_final_result(
     m_verdict = _grade_verdict_label(mbr_stats)
     c_icon = "PASS" if classic_stats["correct"] else "FAIL"
     m_icon = "PASS" if mbr_stats["correct"] else "FAIL"
-    c_time = format_timing_line(classic_timing) if classic_timing else "n/a"
-    m_time = format_timing_line(mbr_timing) if mbr_timing else "n/a"
+    c_time = (
+        format_timing_detail_line(classic_timing)
+        if classic_timing
+        else "n/a"
+    )
+    m_time = (
+        format_timing_detail_line(mbr_timing) if mbr_timing else "n/a"
+    )
     in_shape = _grid_shape_label(test_input)
 
     bar = "═" * 78
@@ -4550,7 +4618,7 @@ def print_arc_classic_interim(
     c_tag = _grade_verdict_label(classic_stats)
     arc_eval_log(
         f"\n[ARC] {task_idx + 1}/{num_tasks} {task_id} test#{test_index} "
-        f"— CLASSIC done [{c_tag}] | {format_timing_line(classic_timing)}"
+        f"— CLASSIC done [{c_tag}] | {format_timing_detail_line(classic_timing)}"
     )
     if not ARC_PRINT_FINAL_MATRICES:
         arc_eval_log(f"  GOLD    : {format_grid_json(gold)}")
@@ -4987,6 +5055,10 @@ def evaluate_arc_dataset(
         f"Structured thinking: {ARC_STRUCTURED_THINKING} | "
         f"step matrices: {ARC_PRINT_STEP_MATRICES} | final matrices: {ARC_PRINT_FINAL_MATRICES}"
     )
+    print(
+        f"Fast inference: {ARC_FAST_INFERENCE} | try vLLM: {ARC_TRY_VLLM} | "
+        f"engine pref: {'vLLM' if ARC_TRY_VLLM and not PREFER_HF_INFERENCE else 'HF'}"
+    )
     if EVAL_SMOKE_TASK_ID:
         print(f"Smoke task only: {EVAL_SMOKE_TASK_ID}")
     print(
@@ -5050,7 +5122,9 @@ def evaluate_arc_dataset(
             )
             classic_elapsed = time.perf_counter() - t0
             classic_timing = generation_timing_stats(
-                classic_elapsed, classic_res["num_tokens"]
+                classic_elapsed,
+                classic_res["num_tokens"],
+                prompt_tokens=classic_res.get("prompt_tokens", 0),
             )
             summary["classic"]["time"] += classic_elapsed
             summary["classic"]["tokens"] += classic_res["num_tokens"]
