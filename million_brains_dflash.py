@@ -180,7 +180,7 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-17p"  # bump when re-uploading to Kaggle to confirm latest script
+SCRIPT_VERSION = "2026-06-17q"  # bump when re-uploading to Kaggle to confirm latest script
 K = 4  # benchmark / token-speculative super-block width (not ARC hypothesis count)
 ARC_HYPOTHESIS_SLOTS = 8  # ARC eval: batched hypothesis proposals per engine (vLLM shows N/N)
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
@@ -295,8 +295,8 @@ ARC_FINAL_GRID_MIN_FRACTION = 0.50  # always reserve 50% of output budget for fi
 ARC_HYPOTHESIS_MAX_TOKENS = ARC_MBR_OUTPUT_TOKEN_BUDGET * 3 // 4 // 8  # legacy default; task-aware below
 ARC_FINAL_GRID_MAX_TOKENS = ARC_MBR_OUTPUT_TOKEN_BUDGET // 4  # legacy default; task-aware below
 ARC_FINAL_HYP_CHAR_CAPS = (360, 200, 120, 60, 0)  # shrink hypothesis text in final prompt if needed
-ARC_HYPOTHESIS_ENABLE_THINKING = True  # slots may emit </think> reasoning before TRANSFORMATION_HYPOTHESIS
-ARC_HYPOTHESIS_THINKING_TOKEN_CAP = 0  # 0 = no per-slot cap; shares ARC_MBR_OUTPUT_TOKEN_BUDGET (14k)
+ARC_HYPOTHESIS_ENABLE_THINKING = False  # False = fast text rules (True + thinking can stall tqdm at 0/N for minutes)
+ARC_HYPOTHESIS_THINKING_TOKEN_CAP = 512  # per-slot cap when hypothesis thinking is enabled
 ARC_FINAL_ENABLE_THINKING = False  # final grid: [[ prefill + greedy JSON (much faster than thinking pass)
 # Multi-agent layer: N independent Qwen instances (1 per GPU, round-robin) + plurality vote on final grid.
 ARC_MULTI_AGENT_ENABLED = True  # plurality vote across N independent Qwen workers
@@ -5269,8 +5269,13 @@ def collect_feature_slot_hypotheses(
             enable_thinking=hyp_thinking,
         )
 
+        slot_temp = (
+            float(ARC_GENERATION_TEMPERATURE)
+            if ARC_FAST_INFERENCE
+            else float(params.get("temperature", 0.7))
+        )
         sp = SamplingParams(
-            temperature=float(params.get("temperature", 0.7)),
+            temperature=slot_temp,
             top_p=float(params.get("top_p", 0.92)),
             max_tokens=int(hyp_max_tokens),
             repetition_penalty=float(params.get("repetition_penalty", 1.03)),
@@ -5292,11 +5297,23 @@ def collect_feature_slot_hypotheses(
             f"Qwen native context is 150k+; only GPU KV cache limits vLLM."
         )
 
+    total_prompt_tok = sum(count_prompt_tokens(tokenizer, p) for p in prompts)
+    avg_prompt_tok = total_prompt_tok // max(1, k)
     arc_eval_log(
         f"[ARC-PHASE-1] Hypothesis pool: batching {k} text proposals in one vLLM call "
-        f"(watch for 'Rendering prompts: {k}/{k}' — NOT the voter/agent count)"
+        f"(Rendering prompts: {k}/{k} = slot count, NOT voters)"
     )
-    outs = vllm_llm.generate(prompts, sp_list)
+    arc_eval_log(
+        f"[ARC-PHASE-1] Generate start: max_out={hyp_max_tokens}/slot | thinking={hyp_thinking} | "
+        f"prompt~{avg_prompt_tok}tok/slot ({total_prompt_tok} in total) | "
+        f"greedy={ARC_FAST_INFERENCE and ARC_GENERATION_TEMPERATURE == 0.0} — "
+        f"first slot may take 30-120s on L4; vLLM tqdm stays 0/{k} until one slot finishes"
+    )
+    t_gen = time.perf_counter()
+    outs = vllm_llm.generate(prompts, sp_list, use_tqdm=False)
+    arc_eval_log(
+        f"[ARC-PHASE-1] Generate done: {k}/{k} slots in {time.perf_counter() - t_gen:.1f}s"
+    )
     for out, (slot_i, feat_name, _params), prompt in zip(outs, slot_meta, prompts):
         gen_ids: List[int] = list(out.outputs[0].token_ids) if out.outputs else []
         raw_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
@@ -5489,7 +5506,7 @@ def arc_direct_generate(
             f"temp={temperature}, thinking={STREAM_PRINT_THINKING}, "
             f"prompt_tokens={prompt_tokens})"
         )
-    out = vllm_llm.generate([prompt], sp)[0]
+    out = vllm_llm.generate([prompt], sp, use_tqdm=False)[0]
     gen_ids: List[int] = []
     if out.outputs:
         gen_ids = list(out.outputs[0].token_ids)
@@ -6671,7 +6688,8 @@ def print_arc_pipeline_architecture(
         "                   vLLM shows: Rendering prompts: "
         f"{hyp_n}/{hyp_n}  (= proposal count, NOT voters)\n"
         "    [ARC-PHASE-2]  Final grid       -> 1 JSON grid synthesis\n"
-        "                   vLLM shows: Rendering prompts: 1/1"
+        "                   vLLM shows: Rendering prompts: 1/1\n"
+        "  Note: Phase-1 can look idle at 'Processed 0/N' until the first slot fully completes."
     )
     print("")
     if multi_agent_pool is not None:
