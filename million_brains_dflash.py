@@ -180,7 +180,7 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-16v"  # bump when re-uploading to Kaggle to confirm latest script
+SCRIPT_VERSION = "2026-06-16w"  # bump when re-uploading to Kaggle to confirm latest script
 K = 4  # number of parallel drafter streams / feature-slots per super-block
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
 BLOCK_SIZE = 6  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
@@ -269,6 +269,9 @@ ARC_GENERATION_TEMPERATURE = 0.0  # greedy JSON for grid tasks
 EVAL_SMOKE_TASK_ID = None  # e.g. "0934a4d8" — run only this task (overrides max_tasks slice)
 ARC_FAST_INFERENCE = True  # ARC eval: no token streaming, slim prompts, model.generate() path
 ARC_TRY_VLLM = False  # True = attempt vLLM for eval (HF fallback if load fails)
+ARC_SLOT_HYPOTHESIS_MODE = True  # MBR: slots propose transformation text; one final pass emits grid
+ARC_HYPOTHESIS_MAX_TOKENS = 256  # tokens per feature-slot hypothesis proposal
+ARC_FINAL_GRID_MAX_TOKENS = 512  # tokens for the single synthesis + grid pass
 ARC_RUN_MBR_EVAL = True  # False = skip slow million-brains pass (classic-only smoke tests)
 ARC_SAVE_GRADE_IMAGES = True  # save PNG grade cards (arc_grades/ or /kaggle/working/arc_grades/)
 ARC_SHOW_TRAIN_EXAMPLES = True  # include train pair thumbnails on each grade card
@@ -382,6 +385,58 @@ FEATURE_PARAMS: Dict[str, Dict[str, float]] = {
     },
     "Abstractor": {"temperature": 0.70, "top_p": 0.96, "repetition_penalty": 1.05},
     "MirrorReflector": {"temperature": 0.85, "top_p": 0.87, "repetition_penalty": 1.09},
+}
+
+# Per-slot lens for hypothesis phase (textual rules only — never emit a grid here).
+SLOT_HYPOTHESIS_LENSES: Dict[str, str] = {
+    "PreciseAnchor": (
+        "Describe the exact transformation: input/output shapes, which colors/regions map "
+        "where, and positional rules. Be concrete but do not print any grid array."
+    ),
+    "CreativeExplorer": (
+        "Propose 2-3 non-obvious pattern hypotheses that could explain all train pairs. "
+        "Favor structural surprises; no grid digits."
+    ),
+    "LogicalReasoner": (
+        "Give a numbered algorithm (step 1, step 2, ...) that transforms input to output. "
+        "Pseudocode style; no JSON grid."
+    ),
+    "SelfCritic": (
+        "List constraints the rule must satisfy across all train pairs; note ambiguities "
+        "and what would falsify each candidate rule. No grid."
+    ),
+    "Reframer": (
+        "Reframe the puzzle: what is the latent object being extracted, compressed, or tiled? "
+        "Describe the rule in plain language without arrays."
+    ),
+    "Synthesizer": (
+        "Synthesize a single unified rule that fits every train pair; reconcile shape changes. "
+        "Text only."
+    ),
+    "DevilAdvocate": (
+        "Attack the obvious rule families; explain which simple hypotheses fail on which train "
+        "pair and why. No grid."
+    ),
+    "PatternMatcher": (
+        "Focus on repetition, symmetry, component counts, color frequencies, and bounding "
+        "boxes. State the pattern rule textually."
+    ),
+    "EdgeCaseHunter": (
+        "Identify boundary cells, rare colors, and exceptions across train pairs; how should "
+        "the test case differ? Text only."
+    ),
+    "ContextGrounding": (
+        "Describe the transformation as operations (crop, mirror, fill, overlay, count, "
+        "filter-by-color) applied in order."
+    ),
+    "Abstractor": (
+        "Lift the puzzle to an invariant (e.g. 'each output row encodes one connected "
+        "component'). State the abstract rule without digit matrices."
+    ),
+    "MirrorReflector": (
+        "Meta-view: how would other analysts disagree? Merge the strongest shared insight "
+        "into one transformation story. No grid."
+    ),
 }
 
 assert len(PERSONALITY_FEATURES) == NUM_PERSONALITY_FEATURES, (
@@ -3648,29 +3703,14 @@ def _format_grid_ascii_compact(grid: List[List[int]]) -> str:
     return "\n".join(" ".join(str(c) for c in row) for row in grid)
 
 
-def format_arc_prompt(task_id: str, task: Dict[str, Any], test_index: int = 0) -> str:
-    """Turn one ARC task into a text prompt with train demos + one test input."""
+def format_arc_task_body(
+    task_id: str, task: Dict[str, Any], test_index: int = 0
+) -> str:
+    """Train + test input context shared by hypothesis slots and final grid pass."""
     lines = [
         f"ARC-AGI task {task_id}. Infer the grid transformation from the training pairs.",
         "Cell colors are integers 0-9. Output shape may differ from input shape.",
     ]
-    if ARC_STRUCTURED_THINKING and STREAM_PRINT_THINKING:
-        lines.extend(
-            [
-                "Inside <think>, reason in numbered steps. After each step emit exactly:",
-                "HYPOTHESIS_GRID: [[...]]  (partial or complete output grid; use best guess for unknown cells).",
-                "Update HYPOTHESIS_GRID every step as your rule hypothesis improves.",
-                "After </think>, output exactly one final JSON 2D array (no markdown, no extra text).",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                "Output format: a single JSON 2D array of integers (cell colors 0-9 only).",
-                "Example: [[0,1,2],[3,4,5]]",
-                "Do not include markdown fences, explanations, or any text before/after the array.",
-            ]
-        )
     for i, example in enumerate(task.get("train", []), start=1):
         inp, out = example["input"], example["output"]
         in_shape = f"{len(inp)}x{len(inp[0]) if inp else 0}"
@@ -3698,8 +3738,71 @@ def format_arc_prompt(task_id: str, task: Dict[str, Any], test_index: int = 0) -
         lines.append(f"Test input ({test_shape}):")
         lines.append(_format_grid_ascii_compact(test_inp))
         lines.append(f"Test input JSON: {json.dumps(test_inp)}")
+    return "\n".join(lines)
+
+
+def format_arc_prompt(task_id: str, task: Dict[str, Any], test_index: int = 0) -> str:
+    """Turn one ARC task into a text prompt with train demos + one test input."""
+    lines = [format_arc_task_body(task_id, task, test_index=test_index)]
+    if ARC_STRUCTURED_THINKING and STREAM_PRINT_THINKING:
+        lines.extend(
+            [
+                "Inside <think>, reason in numbered steps. After each step emit exactly:",
+                "HYPOTHESIS_GRID: [[...]]  (partial or complete output grid; use best guess for unknown cells).",
+                "Update HYPOTHESIS_GRID every step as your rule hypothesis improves.",
+                "After </think>, output exactly one final JSON 2D array (no markdown, no extra text).",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "Output format: a single JSON 2D array of integers (cell colors 0-9 only).",
+                "Example: [[0,1,2],[3,4,5]]",
+                "Do not include markdown fences, explanations, or any text before/after the array.",
+            ]
+        )
     lines.append("Test output JSON array:")
     return "\n".join(lines)
+
+
+def apply_arc_chat_prompt_custom(
+    tokenizer: Any,
+    user_content: str,
+    *,
+    system_content: str,
+    enable_thinking: Optional[bool] = None,
+    assistant_prefill: str = "",
+) -> str:
+    """Chat-wrap with explicit system/thinking/prefill (hypothesis vs final-grid passes)."""
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
+    template_kwargs: Dict[str, Any] = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+    }
+    if enable_thinking is not None:
+        template_kwargs["enable_thinking"] = bool(enable_thinking)
+    if assistant_prefill:
+        messages.append({"role": "assistant", "content": assistant_prefill})
+        template_kwargs["add_generation_prompt"] = False
+        template_kwargs["continue_final_message"] = True
+
+    if not hasattr(tokenizer, "apply_chat_template"):
+        return user_content
+
+    try:
+        return tokenizer.apply_chat_template(messages, **template_kwargs)
+    except TypeError:
+        template_kwargs.pop("enable_thinking", None)
+        try:
+            return tokenizer.apply_chat_template(messages, **template_kwargs)
+        except Exception as exc:
+            print(f"[ARC] chat template failed ({exc}); using raw prompt.")
+    except Exception as exc:
+        print(f"[ARC] chat template failed ({exc}); using raw prompt.")
+    return user_content
 
 
 def apply_arc_chat_prompt(tokenizer: Any, user_content: str) -> str:
@@ -3728,38 +3831,19 @@ def apply_arc_chat_prompt(tokenizer: Any, user_content: str) -> str:
             "You solve ARC-AGI grid puzzles. Reply with exactly one JSON 2D array "
             "of integers (values 0-9). No markdown, no explanation."
         )
-    messages: List[Dict[str, str]] = [
-        {"role": "system", "content": system_content},
-        {"role": "user", "content": user_content},
-    ]
-    template_kwargs: Dict[str, Any] = {
-        "tokenize": False,
-        "add_generation_prompt": True,
-    }
+    enable_thinking: Optional[bool] = None
     if ARC_DISABLE_THINKING:
-        template_kwargs["enable_thinking"] = False
+        enable_thinking = False
     elif STREAM_PRINT_THINKING:
-        template_kwargs["enable_thinking"] = True
+        enable_thinking = True
     prefill = ARC_ASSISTANT_PREFILL if not STREAM_PRINT_THINKING else ""
-    if prefill:
-        messages.append({"role": "assistant", "content": prefill})
-        template_kwargs["add_generation_prompt"] = False
-        template_kwargs["continue_final_message"] = True
-
-    if not hasattr(tokenizer, "apply_chat_template"):
-        return user_content
-
-    try:
-        return tokenizer.apply_chat_template(messages, **template_kwargs)
-    except TypeError:
-        template_kwargs.pop("enable_thinking", None)
-        try:
-            return tokenizer.apply_chat_template(messages, **template_kwargs)
-        except Exception as exc:
-            print(f"[ARC] chat template failed ({exc}); using raw prompt.")
-    except Exception as exc:
-        print(f"[ARC] chat template failed ({exc}); using raw prompt.")
-    return user_content
+    return apply_arc_chat_prompt_custom(
+        tokenizer,
+        user_content,
+        system_content=system_content,
+        enable_thinking=enable_thinking,
+        assistant_prefill=prefill,
+    )
 
 
 def build_arc_inference_prompt(
@@ -4117,6 +4201,246 @@ def extract_arc_generated_suffix(result: Dict[str, Any], prompt: str) -> str:
     if ARC_ASSISTANT_PREFILL and gen and not gen.lstrip().startswith("["):
         gen = ARC_ASSISTANT_PREFILL + gen
     return gen
+
+
+def _extract_transformation_hypothesis(text: str) -> str:
+    """Pull TRANSFORMATION_HYPOTHESIS block or return cleaned prose."""
+    if not text:
+        return ""
+    cleaned = _strip_model_artifacts(text)
+    match = re.search(
+        r"TRANSFORMATION_HYPOTHESIS\s*:\s*([\s\S]+)",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        body = match.group(1).strip()
+        body = re.split(r"\n(?:TRANSFORMATION_HYPOTHESIS|HYPOTHESIS_GRID)\s*:", body, flags=re.I)[0]
+        return body.strip()
+    return cleaned.strip()
+
+
+def build_slot_hypothesis_user_content(
+    task_id: str,
+    task: Dict[str, Any],
+    test_index: int,
+    feature_name: str,
+) -> str:
+    """User message for one feature-slot: analyze patterns, never output a grid."""
+    lens = SLOT_HYPOTHESIS_LENSES.get(
+        feature_name,
+        "Describe the transformation rule that maps each train input to its output.",
+    )
+    body = format_arc_task_body(task_id, task, test_index=test_index)
+    return "\n".join(
+        [
+            body,
+            "",
+            f"Feature-slot role: {feature_name}",
+            f"Your lens: {lens}",
+            "",
+            "Do NOT output any JSON grid or digit matrix.",
+            "Reply with a concise textual analysis using this exact header:",
+            "TRANSFORMATION_HYPOTHESIS:",
+            "then your rule/pattern/algorithm in plain text (under 200 words).",
+        ]
+    )
+
+
+def build_final_grid_user_content(
+    task_id: str,
+    task: Dict[str, Any],
+    test_index: int,
+    hypotheses: List[Dict[str, Any]],
+) -> str:
+    """User message for final pass: synthesize slot hypotheses into one output grid."""
+    body = format_arc_task_body(task_id, task, test_index=test_index)
+    hyp_lines = [
+        f"  [{h['slot']}] {h['feature']}: {h['text']}"
+        for h in hypotheses
+    ]
+    return "\n".join(
+        [
+            body,
+            "",
+            "Parallel transformation hypotheses from feature-slots (synthesize, do not copy blindly):",
+            *hyp_lines,
+            "",
+            "Using the train pairs and the hypotheses above, produce the test output grid.",
+            "Output exactly one JSON 2D array of integers (colors 0-9).",
+            "No markdown, no explanation before or after the array.",
+            "Test output JSON array:",
+        ]
+    )
+
+
+def collect_feature_slot_hypotheses(
+    vllm_llm: Any,
+    tokenizer: Any,
+    task_id: str,
+    task: Dict[str, Any],
+    test_index: int,
+    *,
+    k: int = K,
+    allocator: Optional[PermutationFeatureSlotAllocator] = None,
+    seed: int = 42,
+    verbose: bool = False,
+) -> List[Dict[str, Any]]:
+    """K parallel one-shot passes: each slot proposes a textual transformation rule."""
+    random.seed(seed)
+    if allocator is None:
+        allocator = PermutationFeatureSlotAllocator(
+            internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=k
+        )
+    pooled = make_pooled_state([], 0, tokenizer=tokenizer)
+    alloc_out = allocator(pooled, 0)
+    feature_indices = alloc_out["feature_indices"]
+    feature_names = alloc_out["feature_names"]
+    feature_params = allocator.get_feature_params(feature_indices)
+
+    system_content = (
+        "You are an ARC-AGI pattern analyst. Study grid transformations from train pairs. "
+        "Never output a JSON grid or digit matrix in this phase — only describe rules, "
+        "patterns, and algorithms in plain text."
+    )
+
+    hypotheses: List[Dict[str, Any]] = []
+    if verbose or STREAM_ALL_OUTPUT:
+        stream_log(
+            f"[MBR-HYP] collecting {k} slot hypotheses "
+            f"(max_tokens={ARC_HYPOTHESIS_MAX_TOKENS} each) features={feature_names}"
+        )
+
+    for slot_i in range(k):
+        feat_name = feature_names[slot_i] if slot_i < len(feature_names) else f"slot{slot_i}"
+        params = feature_params[slot_i] if slot_i < len(feature_params) else FEATURE_PARAMS["LogicalReasoner"]
+        user_content = build_slot_hypothesis_user_content(
+            task_id, task, test_index, feat_name
+        )
+        if ARC_USE_CHAT_TEMPLATE:
+            prompt = apply_arc_chat_prompt_custom(
+                tokenizer,
+                user_content,
+                system_content=system_content,
+                enable_thinking=True,
+            )
+        else:
+            prompt = user_content
+
+        sp = SamplingParams(
+            temperature=float(params.get("temperature", 0.7)),
+            top_p=float(params.get("top_p", 0.92)),
+            max_tokens=int(ARC_HYPOTHESIS_MAX_TOKENS),
+        )
+        setattr(sp, "stream_label", f"MBR-hypothesis/slot{slot_i}/{feat_name}")
+        out = vllm_llm.generate([prompt], sp)[0]
+        gen_ids: List[int] = list(out.outputs[0].token_ids) if out.outputs else []
+        raw_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+        hyp_text = _extract_transformation_hypothesis(raw_text)
+
+        rec = {
+            "slot": slot_i,
+            "feature": feat_name,
+            "feature_index": feature_indices[slot_i] if slot_i < len(feature_indices) else slot_i,
+            "text": hyp_text or raw_text.strip() or "(empty hypothesis)",
+            "raw_text": raw_text,
+            "num_tokens": len(gen_ids),
+            "prompt": prompt,
+        }
+        hypotheses.append(rec)
+        stream_log(
+            f"  [HYPOTHESIS slot {slot_i}] {feat_name} ({len(gen_ids)} tok):\n"
+            f"    {rec['text'][:500]}{'...' if len(rec['text']) > 500 else ''}"
+        )
+
+    return hypotheses
+
+
+def arc_mbr_hypothesis_pipeline(
+    vllm_llm: Any,
+    tokenizer: Any,
+    task_id: str,
+    task: Dict[str, Any],
+    test_index: int = 0,
+    *,
+    k: int = K,
+    allocator: Optional[PermutationFeatureSlotAllocator] = None,
+    seed: int = 42,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    """
+    Two-phase ARC MBR:
+      1) K feature-slots each propose textual transformation/pattern hypotheses.
+      2) One final pass synthesizes hypotheses into a single output grid.
+    """
+    hypotheses = collect_feature_slot_hypotheses(
+        vllm_llm,
+        tokenizer,
+        task_id,
+        task,
+        test_index,
+        k=k,
+        allocator=allocator,
+        seed=seed,
+        verbose=verbose,
+    )
+    hyp_token_total = sum(int(h.get("num_tokens", 0)) for h in hypotheses)
+
+    final_user = build_final_grid_user_content(
+        task_id, task, test_index, hypotheses
+    )
+    final_system = (
+        "You solve ARC-AGI grid puzzles. You are given parallel textual hypotheses from "
+        "specialist analysts. Synthesize the best rule, then output exactly one JSON 2D "
+        "array of integers (0-9). No markdown fences, no prose after the array."
+    )
+    if ARC_USE_CHAT_TEMPLATE:
+        final_prompt = apply_arc_chat_prompt_custom(
+            tokenizer,
+            final_user,
+            system_content=final_system,
+            enable_thinking=False,
+            assistant_prefill=ARC_ASSISTANT_PREFILL,
+        )
+    else:
+        final_prompt = final_user + "\n" + ARC_ASSISTANT_PREFILL
+
+    if verbose or STREAM_ALL_OUTPUT:
+        stream_log(
+            f"[MBR-FINAL] single grid synthesis pass "
+            f"(max_tokens={ARC_FINAL_GRID_MAX_TOKENS}, prefill={ARC_ASSISTANT_PREFILL!r})"
+        )
+
+    grid_res = arc_direct_generate(
+        vllm_llm,
+        tokenizer,
+        final_prompt,
+        max_new_tokens=ARC_FINAL_GRID_MAX_TOKENS,
+        temperature=ARC_GENERATION_TEMPERATURE,
+    )
+    grid_tokens = int(grid_res.get("num_tokens", 0))
+    final_prompt_tokens = int(grid_res.get("prompt_tokens", 0))
+
+    return {
+        "generation_mode": "hypothesis_slots+final_grid",
+        "hypotheses": hypotheses,
+        "final_prompt": final_prompt,
+        "final_text": grid_res.get("final_text", final_prompt),
+        "generated_text": grid_res.get("generated_text", ""),
+        "generated_ids": grid_res.get("generated_ids", []),
+        "parsed_grid": grid_res.get("parsed_grid"),
+        "num_tokens": hyp_token_total + grid_tokens,
+        "hypothesis_tokens": hyp_token_total,
+        "grid_tokens": grid_tokens,
+        "prompt_tokens": final_prompt_tokens,
+        "num_superblocks": 1 + k,
+        "total_accepted": grid_tokens,
+        "avg_accepted_per_block": float(grid_tokens),
+        "feature_reallocations": 0,
+        "acceptance_history": [1.0] if grid_tokens else [0.0],
+        "feature_history": [[h["feature"] for h in hypotheses]],
+        "reframe_events": 0,
+    }
 
 
 def arc_direct_generate(
@@ -5066,6 +5390,10 @@ def evaluate_arc_dataset(
         f"(chat_template={ARC_USE_CHAT_TEMPLATE}, temp={ARC_GENERATION_TEMPERATURE})"
     )
     print(f"ARC run MBR eval: {ARC_RUN_MBR_EVAL}")
+    print(
+        f"MBR mode: {'hypothesis slots + final grid' if ARC_SLOT_HYPOTHESIS_MODE else 'token speculative'} "
+        f"| hyp_tok={ARC_HYPOTHESIS_MAX_TOKENS} | final_grid_tok={ARC_FINAL_GRID_MAX_TOKENS}"
+    )
     if visual_grading and ARC_SAVE_GRADE_IMAGES:
         print(f"Grade images: {_arc_grade_output_dir()}/")
     print("-" * 80)
@@ -5160,33 +5488,59 @@ def evaluate_arc_dataset(
                 )
 
             if ARC_RUN_MBR_EVAL:
+                mbr_mode = (
+                    "hypothesis-slots+final-grid"
+                    if ARC_SLOT_HYPOTHESIS_MODE
+                    else "token-speculative"
+                )
                 arc_eval_log(
                     f"[ARC] >>> task {task_idx + 1}/{len(task_ids)} {task_id} "
-                    f"test#{test_index} — starting MILLION-BRAINS pass…"
+                    f"test#{test_index} — starting MBR pass ({mbr_mode})…"
                 )
                 t0 = time.perf_counter()
-                mbr_res = million_brains_dflash_generate(
-                    vllm_llm,
-                    tokenizer,
-                    prompt,
-                    max_new_tokens=max_new_tokens,
-                    k=k,
-                    block_size=block_size,
-                    allocator=allocator,
-                    enable_reallocation=enable_reallocation,
-                    seed=seed + test_index,
-                    verbose=ARC_EVAL_VERBOSE or STREAM_ALL_OUTPUT,
-                    arc_context={
-                        "task_id": task_id,
-                        "test_input": test_input,
-                        "gold": gold,
-                    },
-                )
+                if ARC_SLOT_HYPOTHESIS_MODE:
+                    mbr_res = arc_mbr_hypothesis_pipeline(
+                        vllm_llm,
+                        tokenizer,
+                        task_id,
+                        task,
+                        test_index=test_index,
+                        k=k,
+                        allocator=allocator,
+                        seed=seed + test_index,
+                        verbose=ARC_EVAL_VERBOSE or STREAM_ALL_OUTPUT,
+                    )
+                    mbr_prompt_for_extract = mbr_res.get("final_prompt", prompt)
+                else:
+                    mbr_res = million_brains_dflash_generate(
+                        vllm_llm,
+                        tokenizer,
+                        prompt,
+                        max_new_tokens=max_new_tokens,
+                        k=k,
+                        block_size=block_size,
+                        allocator=allocator,
+                        enable_reallocation=enable_reallocation,
+                        seed=seed + test_index,
+                        verbose=ARC_EVAL_VERBOSE or STREAM_ALL_OUTPUT,
+                        arc_context={
+                            "task_id": task_id,
+                            "test_input": test_input,
+                            "gold": gold,
+                        },
+                    )
+                    mbr_prompt_for_extract = prompt
                 mbr_elapsed = time.perf_counter() - t0
-                mbr_timing = generation_timing_stats(mbr_elapsed, mbr_res["num_tokens"])
+                mbr_timing = generation_timing_stats(
+                    mbr_elapsed,
+                    mbr_res["num_tokens"],
+                    prompt_tokens=mbr_res.get("prompt_tokens", 0),
+                )
                 summary["mbr"]["time"] += mbr_elapsed
                 summary["mbr"]["tokens"] += mbr_res["num_tokens"]
-                mbr_answer_text = extract_arc_generated_suffix(mbr_res, prompt)
+                mbr_answer_text = extract_arc_generated_suffix(
+                    mbr_res, mbr_prompt_for_extract
+                )
                 mbr_pred = parse_arc_answer_grid(mbr_answer_text)
                 arc_eval_log(
                     f"[ARC] <<< task {task_idx + 1}/{len(task_ids)} {task_id} "
