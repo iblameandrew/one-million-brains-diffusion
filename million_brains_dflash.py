@@ -7,7 +7,7 @@ million_brains_dflash.py - one-million-brains-dflash: Permutation-Gated Feature-
 This is a complete, self-contained, heavily commented Kaggle script.
 It installs vLLM, preemptively live-edits (monkey-patches + file fallback) the DFlash / vLLM draft mechanisms,
 injects the full one-million-brains-dflash combinatorial architecture (honoring the Fast Million Brains approach),
-then runs a rigorous benchmark comparing classic (single-path Para-DFlash style) vs. full one-million-brains-dflash
+then runs the full one-million-brains-dflash pipeline
 (K=4 dynamic feature-slot allocation).
 
 ===============================================================================
@@ -105,8 +105,8 @@ Kaggle rules followed strictly:
 - Immediate robust LIVE EDIT section (file overwrite fallback + runtime sys.modules + subclass)
 - Prints the exact " ONE-MILLION-BRAINS-FLASH INITIALIZED " banner.
 - Easy toggles at the very top after shebang/imports.
-- Ends with full head-to-head benchmark: tokens/sec, avg accepted tokens, feature-slot reallocation
-  count, allocator decisions, and side-by-side generated samples.
+- Ends with MBR benchmark: tokens/sec, avg accepted tokens, feature-slot reallocation
+  count, allocator decisions, and generated samples.
 
 Ready to paste into a Kaggle Python script kernel or notebook cell block.
 GPU: T4 / L4 / A10 / A100 all work (uses 1.5B-3B class models by default for headroom).
@@ -180,7 +180,7 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-16w"  # bump when re-uploading to Kaggle to confirm latest script
+SCRIPT_VERSION = "2026-06-17c"  # bump when re-uploading to Kaggle to confirm latest script
 K = 4  # number of parallel drafter streams / feature-slots per super-block
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
 BLOCK_SIZE = 6  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
@@ -223,8 +223,15 @@ DRAFT_BUNDLE_DIR_NAMES = frozenset({"qwen3.5-4b-dflash", "qwen3-5-4b-dflash"})
 VLLM_ENFORCE_EAGER = True  # required for custom architectures on vLLM v1
 VLLM_RUNNER = "generate"  # do not let vLLM pick pooling/embedding runner
 VLLM_FALLBACK_TO_HF = True  # HuggingFace wrapper if vLLM still cannot load the checkpoint
-PREFER_HF_INFERENCE = True  # Qwen3.5-4B is multimodal; HF is more reliable than vLLM on Kaggle T4
-SKIP_VLLM_FOR_QWEN35 = True  # skip vLLM attempts for qwen3_5 / ConditionalGeneration checkpoints
+VLLM_GPU_MEMORY_UTILIZATION = 0.55  # L4/Kaggle safe default (0.85 OOMs when ~8GiB already in use)
+VLLM_TENSOR_PARALLEL_SIZE = 0  # 0=auto (retry with tp=2 when 2+ GPUs visible)
+# vLLM native speculative decoding (DFlash draft + target base in one engine)
+ENABLE_VLLM_SPECULATIVE_DECODING = True
+VLLM_SPECULATIVE_METHOD = "dflash"  # "dflash" | "draft_model" | "auto"
+VLLM_NUM_SPECULATIVE_TOKENS = BLOCK_SIZE  # DFlash block width per speculation step
+VLLM_SPEC_DRAFT_GPU_UTIL_SCALE = 0.88  # shrink base util when loading target + draft
+PREFER_HF_INFERENCE = False  # L4/A10+: prefer vLLM fast kernels; HF only on load failure
+SKIP_VLLM_FOR_QWEN35 = False  # attempt vLLM for Qwen3.5-4B (set True on broken vLLM hosts)
 AUTO_PREFETCH_TO_WORKING = True  # when online, cache a small Qwen checkpoint into /kaggle/working
 PREFETCH_MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"  # safe default for T4/L4 (22 GB)
 KAGGLEHUB_MODEL_HANDLE = "qwen-lm/qwen2.5/transformers/1.5b-instruct"  # Kaggle Models (no huggingface.co DNS needed)
@@ -246,7 +253,7 @@ LOCAL_ARC_DATA_DIR = "data"
 EVAL_CHALLENGES_PATH = None
 EVAL_SOLUTIONS_PATH = None
 EVAL_MAX_TASKS = None  # cap tasks for smoke tests; None = all tasks in challenges file
-EVAL_MAX_NEW_TOKENS = 512  # per-task generation budget for ARC prompts
+EVAL_MAX_NEW_TOKENS = 512  # per-task budget for token-speculative ARC path
 ARC_VISUAL_GRADING = True  # print + display a grade card for every test case
 ARC_PRINT_ALL_ANSWERS = True  # print every prediction vs ground-truth JSON for every test case
 # Real-time streaming — prints every token and all model/MBR activity as it happens
@@ -256,9 +263,6 @@ STREAM_PRINT_THINKING = True  # Qwen3.5: enable + stream <think>...</think> reas
 STREAM_VERIFY_PASSES = False  # verify=logprob-only; never stream those tokens
 HF_FAST_VERIFY = True  # tail-only logprobs on draft suffix (not full 4k prompt)
 ARC_EVAL_VERBOSE = True  # MBR super-block internals (auto-on when STREAM_ALL_OUTPUT)
-# ARC generation: "direct" = one greedy/sampled generate (works on HF). "speculative" = classic dflash loop.
-# Speculative with the SAME model as draft+target + draft temp 0.7 vs greedy verify → mass rejection + garbage.
-ARC_EVAL_GENERATION_MODE = "direct"
 ARC_USE_CHAT_TEMPLATE = True  # Qwen3.5 expects chat_template.jinja wrapping
 ARC_DISABLE_THINKING = not STREAM_PRINT_THINKING  # False = model may emit <think> blocks
 ARC_STRUCTURED_THINKING = True  # require incremental HYPOTHESIS_GRID inside <think>
@@ -267,12 +271,22 @@ ARC_PRINT_FINAL_MATRICES = True  # one final ASCII summary per test (gold + pred
 ARC_ASSISTANT_PREFILL = "[["  # chat prefill anchors JSON grid (skipped when thinking is on)
 ARC_GENERATION_TEMPERATURE = 0.0  # greedy JSON for grid tasks
 EVAL_SMOKE_TASK_ID = None  # e.g. "0934a4d8" — run only this task (overrides max_tasks slice)
-ARC_FAST_INFERENCE = True  # ARC eval: no token streaming, slim prompts, model.generate() path
-ARC_TRY_VLLM = False  # True = attempt vLLM for eval (HF fallback if load fails)
+ARC_FAST_INFERENCE = True  # ARC eval: compact prompts, batched gen, no per-token streaming
+ARC_TRY_VLLM = True  # ARC eval requires vLLM for speed; HF fallback if load fails
+# Qwen3.5-4B native context is 150k+ (YaRN); vLLM max_model_len is a VRAM budget we set at load.
+# KV cache grows with max_model_len — 4k was only to fit L4 OOM; ARC 30x30 tasks need ~8k+.
+VLLM_MAX_MODEL_LEN = 0  # 0 = auto (ARC prompt + output budget); set e.g. 16384 if VRAM allows
+ARC_MAX_PROMPT_TOKENS = 8192  # target input budget for large ARC grids (30x30 train pairs)
 ARC_SLOT_HYPOTHESIS_MODE = True  # MBR: slots propose transformation text; one final pass emits grid
-ARC_HYPOTHESIS_MAX_TOKENS = 256  # tokens per feature-slot hypothesis proposal
-ARC_FINAL_GRID_MAX_TOKENS = 512  # tokens for the single synthesis + grid pass
-ARC_RUN_MBR_EVAL = True  # False = skip slow million-brains pass (classic-only smoke tests)
+ARC_MBR_OUTPUT_TOKEN_BUDGET = 8000  # total OUTPUT tokens per test (hyp slots + final grid combined)
+ARC_FINAL_GRID_MIN_TOKENS = 512  # floor for final JSON grid pass
+ARC_FINAL_GRID_MAX_FRACTION = 0.85  # final may use up to 85% of output budget for large grids
+ARC_FINAL_GRID_MIN_FRACTION = 0.50  # always reserve 50% of output budget for final grid synthesis
+ARC_HYPOTHESIS_MAX_TOKENS = ARC_MBR_OUTPUT_TOKEN_BUDGET * 3 // 4 // K  # legacy default; task-aware below
+ARC_FINAL_GRID_MAX_TOKENS = ARC_MBR_OUTPUT_TOKEN_BUDGET // 4  # legacy default; task-aware below
+ARC_FINAL_HYP_CHAR_CAPS = (600, 360, 200, 100, 0)  # shrink hypothesis text in final prompt if needed
+ARC_HYPOTHESIS_ENABLE_THINKING = False  # thinking burns budget; hyp phase is text-only rules
+ARC_CHAT_TEMPLATE_SLACK = 2048  # system + chat template overhead beyond raw task body
 ARC_SAVE_GRADE_IMAGES = True  # save PNG grade cards (arc_grades/ or /kaggle/working/arc_grades/)
 ARC_SHOW_TRAIN_EXAMPLES = True  # include train pair thumbnails on each grade card
 ARC_ANSWER_REPORT_PATH = None  # None = auto (/kaggle/working/arc_answer_report.json or arc_answer_report.json)
@@ -1223,7 +1237,7 @@ def million_brains_dflash_generate(
             stream_log(
                 "[MBR] HF-fallback: ~"
                 f"{(max_new_tokens // max(1, block_size) + 4) * (k + 1)} "
-                "verify forwards/task — set ARC_RUN_MBR_EVAL=False for classic-only"
+                "verify forwards/task"
             )
 
     for sb in range(max_blocks):
@@ -1574,106 +1588,6 @@ def million_brains_dflash_generate(
 
 
 # =============================================================================
-# CLASSIC PARA-DFLASH (K=1, no orchestrator, plain cumprod speculative)
-# =============================================================================
-def classic_dflash_generate(
-    vllm_llm: LLM,
-    tokenizer: Any,
-    prompt: str,
-    max_new_tokens: int = 128,
-    block_size: int = 8,
-    seed: int = 42,
-) -> Dict[str, Any]:
-    """
-    Baseline single-path Para-DFlash style speculative loop (educational K=1).
-    One drafter proposal of `block_size` tokens, one target verify, cumprod accept, repeat.
-    """
-    random.seed(seed)
-    current_text = prompt
-    generated_ids: List[int] = []
-    total_accepted = 0
-    total_blocks = 0
-    acceptance_history: List[float] = []
-
-    max_blocks = (max_new_tokens // max(1, block_size)) + 4
-
-    if STREAM_ALL_OUTPUT:
-        stream_log(
-            f"[CLASSIC-DFLASH] start block_size={block_size} max_new_tokens={max_new_tokens}"
-        )
-
-    for sb in range(max_blocks):
-        if len(generated_ids) >= max_new_tokens:
-            break
-        total_blocks += 1
-
-        # Drafter forward (single path)
-        sp = SamplingParams(
-            temperature=BASE_TEMPERATURE,
-            top_p=BASE_TOP_P,
-            max_tokens=block_size,
-            logprobs=1,
-        )
-        setattr(sp, "stream_label", f"CLASSIC-draft/sb{sb}")
-        out = vllm_llm.generate([current_text], sp)[0]
-        draft_ids = list(out.outputs[0].token_ids)[:block_size]
-        draft_lps = []
-        if out.outputs[0].logprobs:
-            for tid in draft_ids:
-                draft_lps.append(
-                    extract_logprob_for_token(out.outputs[0].logprobs, tid)
-                )
-        else:
-            draft_lps = [-0.75] * len(draft_ids)
-
-        # Target verification forward on the single extended candidate
-        candidate = current_text + tokenizer.decode(draft_ids, skip_special_tokens=True)
-        if STREAM_ALL_OUTPUT:
-            stream_log(
-                f"  [CLASSIC draft sb={sb}] {tokenizer.decode(draft_ids, skip_special_tokens=True)!r}"
-            )
-        verify_sp = make_target_verify_sampling_params()
-        setattr(verify_sp, "stream_label", f"CLASSIC-verify/sb{sb}")
-        setattr(verify_sp, "verify_only", True)
-        setattr(verify_sp, "verify_tail_tokens", block_size + 4)
-        vout = vllm_llm.generate([candidate], verify_sp)[0]
-        target_lps = extract_target_logprobs_for_draft(
-            vout.prompt_logprobs, draft_ids
-        )
-
-        acc, rate = compute_accepted_tokens(draft_ids, target_lps, draft_lps)
-        acceptance_history.append(rate)
-
-        if acc:
-            generated_ids.extend(acc)
-            commit_txt = tokenizer.decode(acc, skip_special_tokens=True)
-            current_text = current_text + commit_txt
-            total_accepted += len(acc)
-            if STREAM_ALL_OUTPUT:
-                stream_log(
-                    f"  [CLASSIC commit sb={sb} +{len(acc)}] rate={rate:.2f} text={commit_txt!r}"
-                )
-
-        if len(generated_ids) >= max_new_tokens:
-            break
-
-    final_text = current_text
-    tokens_per_block = total_accepted / max(1, total_blocks)
-    return {
-        "final_text": final_text,
-        "generated_ids": generated_ids,
-        "num_tokens": len(generated_ids),
-        "num_superblocks": total_blocks,
-        "total_accepted": total_accepted,
-        "avg_accepted_per_block": tokens_per_block,
-        "feature_reallocations": 0,
-        "acceptance_history": acceptance_history,
-        "feature_history": [["ClassicDFlash"]] * total_blocks,
-        "reframe_events": 0,
-    }
-
-
-# =============================================================================
 # ONEMILLIONBRAINSDFLASHDRAFTMODEL (module-level so patcher and file-injection can always see it)
 # =============================================================================
 class MillionBrainsDFlashDraftModel:
@@ -1777,7 +1691,6 @@ try:
     import million_brains_dflash as _pf
     PermutationFeatureSlotAllocator = _pf.PermutationFeatureSlotAllocator
     million_brains_dflash_generate = _pf.million_brains_dflash_generate
-    classic_dflash_generate = _pf.classic_dflash_generate
 except Exception:
     pass
 
@@ -1834,8 +1747,6 @@ class MillionBrainsDFlashDraftModel:  # type: ignore
         vllm_draft_module.million_brains_dflash_generate = (
             million_brains_dflash_generate
         )
-        vllm_draft_module.classic_dflash_generate = classic_dflash_generate
-
         # Subclass replacement (what user code importing DraftModel will see)
         try:
             OriginalDraft = getattr(vllm_draft_module, "DraftModel", None) or getattr(
@@ -2821,17 +2732,139 @@ def _needs_custom_vllm_handling(model_path: str) -> bool:
     return False
 
 
+def _cuda_vram_snapshot(device: int = 0) -> Dict[str, float]:
+    """Return total/free GiB on a CUDA device (0 if unavailable)."""
+    if not torch.cuda.is_available():
+        return {"total_gib": 0.0, "free_gib": 0.0, "allocated_gib": 0.0}
+    try:
+        free_b, total_b = torch.cuda.mem_get_info(device)
+    except Exception:
+        total_b = torch.cuda.get_device_properties(device).total_memory
+        free_b = total_b - torch.cuda.memory_allocated(device)
+    return {
+        "total_gib": total_b / (1024**3),
+        "free_gib": free_b / (1024**3),
+        "allocated_gib": (total_b - free_b) / (1024**3),
+    }
+
+
+def _adaptive_vllm_gpu_util(requested: float) -> float:
+    """
+    Cap gpu_memory_utilization so vLLM's requested slice fits in *free* VRAM.
+    vLLM checks: free >= utilization * total (not utilization * free).
+    """
+    snap = _cuda_vram_snapshot()
+    if snap["total_gib"] <= 0:
+        return requested
+    safe = (snap["free_gib"] / snap["total_gib"]) * 0.88
+    util = min(float(requested), safe)
+    util = max(0.38, min(0.88, util))
+    print(
+        f"[LOAD] VRAM cuda:0 "
+        f"free {snap['free_gib']:.2f}/{snap['total_gib']:.2f} GiB "
+        f"(allocated {snap['allocated_gib']:.2f}) "
+        f"-> gpu_memory_utilization={util:.2f}"
+    )
+    return util
+
+
+def _release_cuda_cache() -> None:
+    import gc
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+
+
+def _vllm_tensor_parallel_candidates() -> List[int]:
+    if int(VLLM_TENSOR_PARALLEL_SIZE) > 0:
+        return [int(VLLM_TENSOR_PARALLEL_SIZE)]
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if n_gpu >= 2:
+        return [1, 2]
+    return [1]
+
+
+def _resolve_vllm_speculative_method(draft_path: str) -> str:
+    method = str(VLLM_SPECULATIVE_METHOD).strip().lower()
+    if method != "auto":
+        return method
+    if is_dflash_draft_checkpoint(draft_path):
+        return "dflash"
+    return "draft_model"
+
+
+def _build_vllm_speculative_config(
+    draft_path: str,
+    *,
+    max_model_len: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    if not ENABLE_VLLM_SPECULATIVE_DECODING:
+        return None
+    resolved = resolve_checkpoint_dir(draft_path) or draft_path
+    if not resolved or not os.path.isdir(resolved):
+        return None
+    method = _resolve_vllm_speculative_method(resolved)
+    if method == "dflash" and not is_dflash_draft_checkpoint(resolved):
+        print(
+            f"[LOAD] {resolved} is not a DFlash draft checkpoint; "
+            "falling back to draft_model speculative method."
+        )
+        method = "draft_model"
+    cfg: Dict[str, Any] = {
+        "method": method,
+        "model": resolved,
+        "num_speculative_tokens": max(1, int(VLLM_NUM_SPECULATIVE_TOKENS)),
+    }
+    if max_model_len is not None:
+        cfg["max_model_len"] = int(max_model_len)
+    return cfg
+
+
+def _inference_speculative_status(llm: Any) -> str:
+    if isinstance(llm, HFGenerateEngine):
+        draft = getattr(llm, "dflash_draft_path", None)
+        if draft and ENABLE_VLLM_SPECULATIVE_DECODING:
+            return "unavailable (HF fallback — vLLM required)"
+        return "n/a"
+    if getattr(llm, "speculative_decoding_enabled", False):
+        sc = getattr(llm, "speculative_config", None) or {}
+        if isinstance(sc, dict):
+            method = sc.get("method", "?")
+            n = sc.get("num_speculative_tokens", "?")
+            draft = sc.get("model", getattr(llm, "dflash_draft_path", "?"))
+            return (
+                f"active ({method}, n={n}, "
+                f"draft={os.path.basename(str(draft))})"
+            )
+        return "active"
+    draft = getattr(llm, "dflash_draft_path", None)
+    if draft and ENABLE_VLLM_SPECULATIVE_DECODING:
+        return "inactive (draft present but engine loaded without speculative_config)"
+    return "off"
+
+
 def _build_vllm_attempts(
-    model_path: str, gpu_memory_utilization: float
+    model_path: str,
+    gpu_memory_utilization: float,
+    *,
+    dflash_draft_path: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     custom = _needs_custom_vllm_handling(model_path)
-    base: Dict[str, Any] = {
-        "model": model_path,
-        "trust_remote_code": True,
-        "dtype": "auto",
-        "max_model_len": 4096,
-        "gpu_memory_utilization": gpu_memory_utilization,
-    }
+    util = _adaptive_vllm_gpu_util(gpu_memory_utilization)
+    arc_need = arc_vllm_context_budget()
+    if int(VLLM_MAX_MODEL_LEN) > 0:
+        arc_need = min(arc_need, int(VLLM_MAX_MODEL_LEN))
+    # Try largest context first (ARC 30x30 needs it); fall back on VRAM OOM.
+    max_lens = sorted(
+        {arc_need, 12288, 11264, 10240, 8192, 6144, 4096},
+        reverse=True,
+    )
+    max_lens = [m for i, m in enumerate(max_lens) if m not in max_lens[:i]]
 
     hf_overrides: Dict[str, Any] = {}
     if os.path.isfile(os.path.join(model_path, "config.json")):
@@ -2849,26 +2882,96 @@ def _build_vllm_attempts(
         except Exception as exc:
             print(f"[LOAD] Could not inspect config.json: {exc}")
 
-    attempts: List[Dict[str, Any]] = []
-    if custom or hf_overrides or VLLM_ENFORCE_EAGER:
-        attempts.append(
-            {
-                **base,
-                "runner": VLLM_RUNNER,
-                "enforce_eager": True,
-                **({"hf_overrides": hf_overrides} if hf_overrides else {}),
-            }
-        )
-    attempts.append(
-        {
-            **base,
-            "runner": VLLM_RUNNER,
-            "enforce_eager": VLLM_ENFORCE_EAGER,
-            **({"hf_overrides": hf_overrides} if hf_overrides else {}),
-        }
+    hf_extra = {"hf_overrides": hf_overrides} if hf_overrides else {}
+    tp_sizes = _vllm_tensor_parallel_candidates()
+    util_steps = [util]
+    if util > 0.45:
+        util_steps.append(max(0.38, util - 0.10))
+
+    spec_root = (
+        _build_vllm_speculative_config(dflash_draft_path)
+        if dflash_draft_path
+        else None
     )
-    attempts.append({**base, "enforce_eager": True})
-    return attempts
+    if spec_root:
+        print(
+            f"[LOAD] vLLM speculative decoding: method={spec_root['method']} "
+            f"n_tokens={spec_root['num_speculative_tokens']} "
+            f"draft={spec_root['model']}"
+        )
+
+    spec_attempts: List[Dict[str, Any]] = []
+    fallback_attempts: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    def _add(target: List[Dict[str, Any]], **kwargs: Any) -> None:
+        key = tuple(sorted((k, repr(v)) for k, v in kwargs.items()))
+        if key in seen:
+            return
+        seen.add(key)
+        target.append(kwargs)
+
+    for max_len in max_lens:
+        for tp in tp_sizes:
+            for u in util_steps:
+                base: Dict[str, Any] = {
+                    "model": model_path,
+                    "trust_remote_code": True,
+                    "dtype": "auto",
+                    "max_model_len": max_len,
+                    "gpu_memory_utilization": u,
+                    "tensor_parallel_size": tp,
+                }
+                if spec_root:
+                    spec_util = max(
+                        0.35, float(u) * float(VLLM_SPEC_DRAFT_GPU_UTIL_SCALE)
+                    )
+                    spec_cfg = dict(spec_root)
+                    spec_cfg["max_model_len"] = max_len
+                    spec_base = {
+                        **base,
+                        "gpu_memory_utilization": spec_util,
+                        "speculative_config": spec_cfg,
+                    }
+                    if custom or hf_overrides or VLLM_ENFORCE_EAGER:
+                        _add(
+                            spec_attempts,
+                            **spec_base,
+                            runner=VLLM_RUNNER,
+                            enforce_eager=True,
+                            **hf_extra,
+                        )
+                    _add(
+                        spec_attempts,
+                        **spec_base,
+                        runner=VLLM_RUNNER,
+                        enforce_eager=VLLM_ENFORCE_EAGER,
+                        **hf_extra,
+                    )
+                    _add(
+                        spec_attempts,
+                        **spec_base,
+                        enforce_eager=True,
+                        **hf_extra,
+                    )
+                if custom or hf_overrides or VLLM_ENFORCE_EAGER:
+                    _add(
+                        fallback_attempts,
+                        **base,
+                        runner=VLLM_RUNNER,
+                        enforce_eager=True,
+                        **hf_extra,
+                    )
+                _add(
+                    fallback_attempts,
+                    **base,
+                    runner=VLLM_RUNNER,
+                    enforce_eager=VLLM_ENFORCE_EAGER,
+                    **hf_extra,
+                )
+                _add(fallback_attempts, **base, enforce_eager=True, **hf_extra)
+
+    return spec_attempts + fallback_attempts
 
 
 @dataclass
@@ -2968,7 +3071,10 @@ class HFGenerateEngine:
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         print(f"[LOAD][HF] Loading causal LM from {model_path} ...")
         if dflash_draft_path:
-            print(f"[LOAD][HF] (DFlash draft reserved for future speculative path: {dflash_draft_path})")
+            print(
+                f"[LOAD][HF] DFlash draft present ({dflash_draft_path}) but HF "
+                "fallback cannot run vLLM speculative decoding."
+            )
         self.tokenizer = tokenizer
         self.model_path = model_path
         self.dflash_draft_path = dflash_draft_path
@@ -2993,7 +3099,7 @@ class HFGenerateEngine:
             return_tensors="pt",
             add_special_tokens=True,
             truncation=True,
-            max_length=4096,
+            max_length=max(4096, arc_vllm_context_budget()),
         )
         input_ids = encoded["input_ids"].to(self.device)
         if input_ids.shape[1] == 0:
@@ -3249,13 +3355,18 @@ def create_inference_engine(
     model_path: str,
     tokenizer: Any,
     *,
-    gpu_memory_utilization: float = 0.88,
+    gpu_memory_utilization: Optional[float] = None,
     dflash_draft_path: Optional[str] = None,
 ) -> Any:
     """Create vLLM engine with custom-checkpoint safeguards; HF fallback on failure."""
     gen_path, auto_draft = resolve_generation_model_path(model_path)
     draft_path = dflash_draft_path or auto_draft
     local_only = os.path.isdir(gen_path)
+    gpu_mem = (
+        float(gpu_memory_utilization)
+        if gpu_memory_utilization is not None
+        else float(VLLM_GPU_MEMORY_UTILIZATION)
+    )
 
     if _should_skip_vllm(gen_path):
         if PREFER_HF_INFERENCE and not ARC_TRY_VLLM:
@@ -3270,20 +3381,58 @@ def create_inference_engine(
             local_only=local_only,
         )
 
-    attempts = _build_vllm_attempts(gen_path, gpu_memory_utilization)
+    attempts = _build_vllm_attempts(
+        gen_path, gpu_mem, dflash_draft_path=draft_path
+    )
     last_err: Optional[BaseException] = None
+    _release_cuda_cache()
     for idx, kwargs in enumerate(attempts, start=1):
         try:
-            if idx > 1:
-                print(f"[LOAD] vLLM retry {idx}/{len(attempts)}: {kwargs}")
+            spec_cfg = kwargs.get("speculative_config")
+            spec_tag = ""
+            if spec_cfg:
+                spec_tag = (
+                    f" spec={spec_cfg.get('method')}"
+                    f" n={spec_cfg.get('num_speculative_tokens')}"
+                )
+            print(
+                f"[LOAD] vLLM attempt {idx}/{len(attempts)}: "
+                f"max_model_len={kwargs.get('max_model_len')} "
+                f"gpu_util={kwargs.get('gpu_memory_utilization')} "
+                f"tp={kwargs.get('tensor_parallel_size', 1)}{spec_tag}"
+            )
             llm = LLM(**kwargs)
-            print("[LOAD] vLLM engine ready.")
+            ctx = int(kwargs.get("max_model_len", 4096))
+            setattr(llm, "max_model_len", ctx)
+            setattr(
+                llm,
+                "speculative_decoding_enabled",
+                bool(spec_cfg),
+            )
+            if spec_cfg:
+                setattr(llm, "speculative_config", spec_cfg)
+            print(
+                f"[LOAD] vLLM engine ready (max_model_len={ctx}; "
+                f"Qwen native context can be 150k+ but KV cache limits this on GPU)."
+            )
             if draft_path:
                 setattr(llm, "dflash_draft_path", draft_path)
+            if spec_cfg:
+                print(
+                    "[LOAD] vLLM speculative decoding ACTIVE "
+                    f"({spec_cfg.get('method')}, "
+                    f"n={spec_cfg.get('num_speculative_tokens')})"
+                )
+            elif draft_path and ENABLE_VLLM_SPECULATIVE_DECODING:
+                print(
+                    "[LOAD] [WARN] DFlash draft available but this attempt "
+                    "loaded WITHOUT speculative_config (VRAM fallback)."
+                )
             return llm
         except Exception as exc:
             last_err = exc
             print(f"[LOAD] vLLM attempt {idx} failed: {type(exc).__name__}: {exc}")
+            _release_cuda_cache()
 
     if VLLM_FALLBACK_TO_HF:
         print(
@@ -3317,10 +3466,30 @@ def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
     print("\n[VERIFY] Inference engine smoke test")
     print(f"    script   : {SCRIPT_VERSION}")
     print(f"    engine   : {engine_label}")
+    if torch.cuda.is_available():
+        snap = _cuda_vram_snapshot()
+        print(
+            f"    cuda     : {torch.cuda.device_count()} device(s), "
+            f"cuda:0 free {snap['free_gib']:.2f}/{snap['total_gib']:.2f} GiB"
+        )
     if gen_path:
         print(f"    generate : {gen_path}")
     if draft_path:
-        print(f"    dflash   : {draft_path} (draft only — not used for generation)")
+        print(f"    dflash   : {draft_path}")
+        print(f"    spec_dec : {_inference_speculative_status(llm)}")
+    ctx = get_inference_max_context(llm)
+    print(f"    max_ctx  : {ctx} tokens (vLLM max_model_len / HF cap; Qwen native >> this)")
+    if isinstance(llm, HFGenerateEngine) and ARC_TRY_VLLM:
+        print(
+            "    [WARN] HF fallback active — ARC eval will be ~10-50x slower than vLLM "
+            "and DFlash speculative decoding is NOT used. Fix vLLM load or set "
+            "ARC_TRY_VLLM=False if intentional."
+        )
+    if ctx < arc_vllm_context_budget():
+        print(
+            f"    [WARN] Engine context {ctx} < ARC budget {arc_vllm_context_budget()} — "
+            "30x30 tasks may fail. Restart kernel and let vLLM load with max_model_len>=8192."
+        )
 
     probe = "ARC smoke test."
     encoded = tokenizer(probe, return_tensors="pt", add_special_tokens=True)
@@ -3386,7 +3555,10 @@ def load_models(model_name: str):
         + ("" if local_only else " (this can take 30-120s on first download)...")
     )
     if draft_path:
-        print(f"[LOAD] DFlash draft reserved: {draft_path}")
+        print(
+            f"[LOAD] DFlash draft paired: {draft_path} "
+            f"(vLLM speculative={'on' if ENABLE_VLLM_SPECULATIVE_DECODING else 'off'})"
+        )
     tokenizer = AutoTokenizer.from_pretrained(
         gen_path,
         trust_remote_code=True,
@@ -3398,7 +3570,6 @@ def load_models(model_name: str):
     llm = create_inference_engine(
         gen_path,
         tokenizer,
-        gpu_memory_utilization=0.88,
         dflash_draft_path=draft_path,
     )
     if isinstance(llm, HFGenerateEngine):
@@ -3412,7 +3583,8 @@ def load_models(model_name: str):
         hf_model = llm.model
     else:
         try:
-            if torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory > 14 * (1024**3):
+            snap = _cuda_vram_snapshot()
+            if snap["free_gib"] >= 10.0:
                 hf_model = _load_hf_generation_model(
                     gen_path,
                     dtype=torch.bfloat16
@@ -3422,6 +3594,11 @@ def load_models(model_name: str):
                 ).eval()
                 print(
                     "[LOAD] Optional HF reference model also resident for hidden-state introspection."
+                )
+            else:
+                print(
+                    f"[LOAD] Skipping duplicate HF reference model "
+                    f"(only {snap['free_gib']:.1f} GiB free after vLLM)."
                 )
         except Exception:
             pass
@@ -3436,8 +3613,8 @@ def load_local_models() -> Tuple[LLM, Any, Optional[LLM], Optional[Any]]:
     """
     Load local checkpoints without network access.
 
-    DFlash draft checkpoints are NEVER used for generation directly.
-    A paired BASE causal LM must exist (LOCAL_BASE_DIR or sibling folder).
+    DFlash draft checkpoints are loaded as vLLM speculative_config draft models
+    (never as standalone causal LMs). A paired BASE causal LM must exist.
 
     Returns: (primary_llm, primary_tokenizer, optional_second_llm, optional_second_tokenizer)
     """
@@ -3482,7 +3659,11 @@ def load_local_models() -> Tuple[LLM, Any, Optional[LLM], Optional[Any]]:
         print(f"\n[LOCAL-LOAD] {label}")
         print(f"    generation: {gen_path}")
         if draft_path:
-            print(f"    dflash    : {draft_path} (draft — not used for token generation)")
+            print(
+                f"    dflash    : {draft_path} "
+                f"(vLLM speculative draft, "
+                f"method={VLLM_SPECULATIVE_METHOD})"
+            )
         tokenizer = AutoTokenizer.from_pretrained(
             gen_path, trust_remote_code=True, local_files_only=True
         )
@@ -3498,8 +3679,14 @@ def load_local_models() -> Tuple[LLM, Any, Optional[LLM], Optional[Any]]:
             setattr(llm, "model_path", gen_path)
         setattr(llm, "generation_model_path", gen_path)
         backend = "HF-fallback" if isinstance(llm, HFGenerateEngine) else "vLLM"
+        spec_line = (
+            f", {_inference_speculative_status(llm)}"
+            if draft_path or getattr(llm, "speculative_decoding_enabled", False)
+            else ""
+        )
         print(
-            f"[LOCAL-LOAD] {os.path.basename(gen_path)} engine ready ({backend})."
+            f"[LOCAL-LOAD] {os.path.basename(gen_path)} engine ready "
+            f"({backend}{spec_line})."
         )
         return llm, tokenizer
 
@@ -3519,7 +3706,7 @@ def load_local_models() -> Tuple[LLM, Any, Optional[LLM], Optional[Any]]:
         gen_llm, gen_tok = _load_generation_engine(
             base_path,
             label="Base Qwen3.5-4B (generation)",
-            gpu_util=0.85,
+            gpu_util=VLLM_GPU_MEMORY_UTILIZATION,
             draft_path=dflash_path if dflash_path and is_dflash_draft_checkpoint(dflash_path) else None,
         )
         if dflash_path:
@@ -3546,7 +3733,7 @@ def load_local_models() -> Tuple[LLM, Any, Optional[LLM], Optional[Any]]:
     llm, tok = _load_generation_engine(
         gen_path,
         label="Primary local checkpoint",
-        gpu_util=0.85,
+        gpu_util=VLLM_GPU_MEMORY_UTILIZATION,
         draft_path=draft_path,
     )
     return llm, tok, None, None
@@ -3703,10 +3890,128 @@ def _format_grid_ascii_compact(grid: List[List[int]]) -> str:
     return "\n".join(" ".join(str(c) for c in row) for row in grid)
 
 
+def _format_grid_minified_json(grid: List[List[int]]) -> str:
+    """Single-line JSON — fewer tokens than multiline ASCII for large grids."""
+    if not grid:
+        return "[]"
+    return json.dumps(grid, separators=(",", ":"))
+
+
+def _estimate_grid_json_tokens(grid: List[List[int]]) -> int:
+    """Rough token count for a minified JSON 2D grid."""
+    if not grid or not grid[0]:
+        return 64
+    rows = len(grid)
+    cols = len(grid[0])
+    cells = rows * cols
+    return max(64, int(cells * 2.8 + rows * 12 + 96))
+
+
+def arc_final_grid_max_tokens(task: Dict[str, Any]) -> int:
+    """
+    Final-pass output budget: scale with largest train output so 29x30 grids fit.
+    Stays within ARC_MBR_OUTPUT_TOKEN_BUDGET (hyp slots share the remainder).
+    """
+    budget = int(ARC_MBR_OUTPUT_TOKEN_BUDGET)
+    floor = max(int(ARC_FINAL_GRID_MIN_TOKENS), budget // 4)
+    ceiling = max(floor, int(budget * ARC_FINAL_GRID_MAX_FRACTION))
+    need = floor
+    for ex in task.get("train", []):
+        out = ex.get("output") or []
+        if out:
+            need = max(need, _estimate_grid_json_tokens(out))
+    return min(ceiling, max(floor, need))
+
+
+def arc_hypothesis_max_tokens(task: Dict[str, Any]) -> int:
+    """Per-slot hypothesis cap — never steal more than half the 8k output budget."""
+    budget = int(ARC_MBR_OUTPUT_TOKEN_BUDGET)
+    final_reserve = max(
+        arc_final_grid_max_tokens(task),
+        int(budget * ARC_FINAL_GRID_MIN_FRACTION),
+    )
+    hyp_pool = max(0, budget - final_reserve)
+    return max(64, hyp_pool // max(1, K))
+
+
+def arc_mbr_final_output_budget(
+    task: Dict[str, Any], hyp_tokens_used: int
+) -> int:
+    """
+    Output tokens for final grid pass = full 8k budget minus what slots already emitted.
+    Unused hypothesis budget flows to the final pass.
+    """
+    budget = int(ARC_MBR_OUTPUT_TOKEN_BUDGET)
+    used = max(0, int(hyp_tokens_used))
+    remaining = max(0, budget - used)
+    need = arc_final_grid_max_tokens(task)
+    ceiling = max(need, int(budget * ARC_FINAL_GRID_MAX_FRACTION))
+    return max(int(ARC_FINAL_GRID_MIN_TOKENS), min(ceiling, remaining))
+
+
+def arc_vllm_context_budget() -> int:
+    """Minimum vLLM max_model_len: ARC grids + generation + chat-template slack."""
+    raw = (
+        int(ARC_MAX_PROMPT_TOKENS)
+        + int(ARC_MBR_OUTPUT_TOKEN_BUDGET)
+        + int(ARC_CHAT_TEMPLATE_SLACK)
+    )
+    return int(math.ceil(raw / 256.0) * 256)
+
+
+def get_inference_max_context(llm: Any) -> int:
+    """Effective max context tokens for the loaded engine (vLLM max_model_len or HF cap)."""
+    stored = getattr(llm, "max_model_len", None)
+    if stored is not None:
+        return int(stored)
+    try:
+        engine = getattr(llm, "llm_engine", None) or getattr(
+            getattr(llm, "llm", None), "llm_engine", None
+        )
+        if engine is not None:
+            cfg = getattr(engine, "model_config", None)
+            if cfg is not None and hasattr(cfg, "max_model_len"):
+                return int(cfg.max_model_len)
+    except Exception:
+        pass
+    return max(4096, int(ARC_MAX_PROMPT_TOKENS))
+
+
 def format_arc_task_body(
-    task_id: str, task: Dict[str, Any], test_index: int = 0
+    task_id: str,
+    task: Dict[str, Any],
+    test_index: int = 0,
+    *,
+    grid_format: str = "auto",
 ) -> str:
     """Train + test input context shared by hypothesis slots and final grid pass."""
+    if grid_format == "auto":
+        grid_format = "minified" if ARC_FAST_INFERENCE else "ascii"
+
+    def _fmt_grid(grid: List[List[int]]) -> str:
+        if grid_format in ("minified", "terse"):
+            return _format_grid_minified_json(grid)
+        return _format_grid_ascii_compact(grid)
+
+    if grid_format == "terse":
+        lines = [f"ARC {task_id} colors0-9"]
+        for i, example in enumerate(task.get("train", []), start=1):
+            inp, out = example["input"], example["output"]
+            in_shape = f"{len(inp)}x{len(inp[0]) if inp else 0}"
+            out_shape = f"{len(out)}x{len(out[0]) if out else 0}"
+            lines.append(f"T{i}i{in_shape}:{_fmt_grid(inp)}")
+            lines.append(f"T{i}o{out_shape}:{_fmt_grid(out)}")
+        test_inputs = task.get("test", [])
+        if test_index >= len(test_inputs):
+            raise IndexError(
+                f"Task {task_id} has {len(test_inputs)} test inputs; "
+                f"requested index {test_index}."
+            )
+        test_inp = test_inputs[test_index]["input"]
+        test_shape = f"{len(test_inp)}x{len(test_inp[0]) if test_inp else 0}"
+        lines.append(f"Xi{test_shape}:{_fmt_grid(test_inp)}")
+        return "\n".join(lines)
+
     lines = [
         f"ARC-AGI task {task_id}. Infer the grid transformation from the training pairs.",
         "Cell colors are integers 0-9. Output shape may differ from input shape.",
@@ -3716,8 +4021,8 @@ def format_arc_task_body(
         in_shape = f"{len(inp)}x{len(inp[0]) if inp else 0}"
         out_shape = f"{len(out)}x{len(out[0]) if out else 0}"
         if ARC_FAST_INFERENCE:
-            lines.append(f"Train {i} input ({in_shape}): {json.dumps(inp)}")
-            lines.append(f"Train {i} output ({out_shape}): {json.dumps(out)}")
+            lines.append(f"Train {i} input ({in_shape}): {_fmt_grid(inp)}")
+            lines.append(f"Train {i} output ({out_shape}): {_fmt_grid(out)}")
         else:
             lines.append(f"Train {i} input ({in_shape}):")
             lines.append(_format_grid_ascii_compact(inp))
@@ -3733,12 +4038,185 @@ def format_arc_task_body(
     test_inp = test_inputs[test_index]["input"]
     test_shape = f"{len(test_inp)}x{len(test_inp[0]) if test_inp else 0}"
     if ARC_FAST_INFERENCE:
-        lines.append(f"Test input ({test_shape}): {json.dumps(test_inp)}")
+        lines.append(f"Test input ({test_shape}): {_fmt_grid(test_inp)}")
     else:
         lines.append(f"Test input ({test_shape}):")
         lines.append(_format_grid_ascii_compact(test_inp))
         lines.append(f"Test input JSON: {json.dumps(test_inp)}")
     return "\n".join(lines)
+
+
+def resolve_arc_task_body(
+    tokenizer: Any,
+    task_id: str,
+    task: Dict[str, Any],
+    test_index: int = 0,
+    *,
+    max_prompt_tokens: Optional[int] = None,
+) -> Tuple[str, int, str]:
+    """
+    Pick the most detailed grid encoding that fits max_prompt_tokens.
+    Returns (body_text, token_count, format_label).
+    """
+    formats = (
+        ("minified", "terse", "ascii")
+        if ARC_FAST_INFERENCE
+        else ("ascii", "minified", "terse")
+    )
+    best_body = ""
+    best_tok = 0
+    best_fmt = "minified"
+    for fmt in formats:
+        body = format_arc_task_body(
+            task_id, task, test_index=test_index, grid_format=fmt
+        )
+        n_tok = count_prompt_tokens(tokenizer, body)
+        best_body, best_tok, best_fmt = body, n_tok, fmt
+        if max_prompt_tokens is None or n_tok <= max_prompt_tokens:
+            return body, n_tok, fmt
+    return best_body, best_tok, best_fmt
+
+
+def _wrap_arc_chat_prompt(
+    tokenizer: Any,
+    user_content: str,
+    *,
+    system_content: str,
+    enable_thinking: Optional[bool] = None,
+    assistant_prefill: str = "",
+) -> str:
+    if ARC_USE_CHAT_TEMPLATE:
+        return apply_arc_chat_prompt_custom(
+            tokenizer,
+            user_content,
+            system_content=system_content,
+            enable_thinking=enable_thinking,
+            assistant_prefill=assistant_prefill,
+        )
+    return user_content
+
+
+def resolve_arc_hypothesis_bundle(
+    tokenizer: Any,
+    task_id: str,
+    task: Dict[str, Any],
+    test_index: int,
+    feature_name: str,
+    *,
+    system_content: str,
+    engine_ctx: int,
+    max_output_tokens: int,
+    enable_thinking: bool,
+) -> Tuple[str, str, int, str]:
+    """
+    Pick task-body encoding + system prompt so the full chat-wrapped hypothesis
+    prompt fits engine_ctx. Returns (task_body, system_used, prompt_tokens, fmt).
+    """
+    max_input = engine_ctx - int(max_output_tokens) - 32
+    formats = (
+        ("minified", "terse", "ascii")
+        if ARC_FAST_INFERENCE
+        else ("ascii", "minified", "terse")
+    )
+    systems = [system_content]
+    if ARC_FAST_INFERENCE:
+        systems.append(
+            "ARC analyst. Describe transformation rules in plain text only — no grids."
+        )
+
+    best: Tuple[str, str, int, str] = ("", system_content, 10**9, "minified")
+    for sys_msg in systems:
+        for fmt in formats:
+            body = format_arc_task_body(
+                task_id, task, test_index=test_index, grid_format=fmt
+            )
+            user_content = build_slot_hypothesis_user_content(
+                task_id,
+                task,
+                test_index,
+                feature_name,
+                task_body=body,
+                compact=ARC_FAST_INFERENCE,
+            )
+            prompt = _wrap_arc_chat_prompt(
+                tokenizer,
+                user_content,
+                system_content=sys_msg,
+                enable_thinking=enable_thinking,
+            )
+            n_tok = count_prompt_tokens(tokenizer, prompt)
+            if n_tok < best[2]:
+                best = (body, sys_msg, n_tok, fmt)
+            if n_tok <= max_input:
+                return body, sys_msg, n_tok, fmt
+    return best
+
+
+def resolve_arc_final_prompt_bundle(
+    tokenizer: Any,
+    task_id: str,
+    task: Dict[str, Any],
+    test_index: int,
+    hypotheses: List[Dict[str, Any]],
+    *,
+    system_content: str,
+    engine_ctx: int,
+    final_output_tokens: int,
+    assistant_prefill: str = ARC_ASSISTANT_PREFILL,
+) -> Tuple[str, int, int, str]:
+    """
+    Build final grid prompt so input+output fits engine_ctx while preserving
+    final_output_tokens from the 8k MBR output budget.
+    Shrinks hypothesis text and task-body encoding before touching output budget.
+    """
+    max_input = max(256, engine_ctx - int(final_output_tokens) - 32)
+    formats = (
+        ("terse", "minified", "ascii")
+        if ARC_FAST_INFERENCE
+        else ("minified", "terse", "ascii")
+    )
+    systems = [system_content]
+    if ARC_FAST_INFERENCE and system_content not in systems:
+        systems.append(
+            "ARC solver. Synthesize hypotheses, output one JSON 2D int array (0-9) only."
+        )
+
+    best: Tuple[str, int, int, str] = ("", 10**9, 0, "terse")
+    for sys_msg in systems:
+        for hyp_cap in ARC_FINAL_HYP_CHAR_CAPS:
+            for fmt in formats:
+                body = format_arc_task_body(
+                    task_id, task, test_index=test_index, grid_format=fmt
+                )
+                final_user = build_final_grid_user_content(
+                    task_id,
+                    task,
+                    test_index,
+                    hypotheses,
+                    task_body=body,
+                    hyp_char_cap=int(hyp_cap),
+                )
+                prompt = _wrap_arc_chat_prompt(
+                    tokenizer,
+                    final_user,
+                    system_content=sys_msg,
+                    enable_thinking=False,
+                    assistant_prefill=assistant_prefill,
+                )
+                n_in = count_prompt_tokens(tokenizer, prompt)
+                if n_in < best[1]:
+                    best = (prompt, n_in, count_prompt_tokens(tokenizer, body), fmt)
+                if n_in <= max_input:
+                    return prompt, n_in, count_prompt_tokens(tokenizer, body), fmt
+
+    prompt, n_in, body_tok, fmt = best
+    if n_in > max_input:
+        stream_log(
+            f"[MBR-WARN] final prompt {n_in}tok > input cap {max_input}tok "
+            f"(engine={engine_ctx}, output_reserved={final_output_tokens}). "
+            "Using tightest encoding; raise VLLM_MAX_MODEL_LEN if generation truncates."
+        )
+    return prompt, n_in, body_tok, fmt
 
 
 def format_arc_prompt(task_id: str, task: Dict[str, Any], test_index: int = 0) -> str:
@@ -3949,9 +4427,13 @@ def _grid_attempt_text_variants(text: str) -> List[str]:
 
 
 def _is_valid_arc_grid(parsed: Any) -> bool:
+    """True only for non-empty rectangular 2D grids with ARC colors 0-9."""
     if not isinstance(parsed, list) or not parsed:
         return False
-    if not all(isinstance(row, list) for row in parsed):
+    if not all(isinstance(row, list) and row for row in parsed):
+        return False
+    width = len(parsed[0])
+    if not all(len(row) == width for row in parsed):
         return False
     return all(
         isinstance(cell, int) and 0 <= cell <= 9
@@ -4225,13 +4707,26 @@ def build_slot_hypothesis_user_content(
     task: Dict[str, Any],
     test_index: int,
     feature_name: str,
+    *,
+    task_body: Optional[str] = None,
+    compact: bool = False,
 ) -> str:
     """User message for one feature-slot: analyze patterns, never output a grid."""
     lens = SLOT_HYPOTHESIS_LENSES.get(
         feature_name,
         "Describe the transformation rule that maps each train input to its output.",
     )
-    body = format_arc_task_body(task_id, task, test_index=test_index)
+    body = task_body or format_arc_task_body(task_id, task, test_index=test_index)
+    if compact:
+        return "\n".join(
+            [
+                body,
+                f"Role:{feature_name}",
+                f"Lens:{lens}",
+                "TRANSFORMATION_HYPOTHESIS:",
+                "(text rule, <120 words, no grid)",
+            ]
+        )
     return "\n".join(
         [
             body,
@@ -4242,7 +4737,7 @@ def build_slot_hypothesis_user_content(
             "Do NOT output any JSON grid or digit matrix.",
             "Reply with a concise textual analysis using this exact header:",
             "TRANSFORMATION_HYPOTHESIS:",
-            "then your rule/pattern/algorithm in plain text (under 200 words).",
+            "then your rule/pattern/algorithm in plain text (concise; under 120 words).",
         ]
     )
 
@@ -4252,13 +4747,20 @@ def build_final_grid_user_content(
     task: Dict[str, Any],
     test_index: int,
     hypotheses: List[Dict[str, Any]],
+    *,
+    task_body: Optional[str] = None,
+    hyp_char_cap: int = 600,
 ) -> str:
     """User message for final pass: synthesize slot hypotheses into one output grid."""
-    body = format_arc_task_body(task_id, task, test_index=test_index)
-    hyp_lines = [
-        f"  [{h['slot']}] {h['feature']}: {h['text']}"
-        for h in hypotheses
-    ]
+    body = task_body or format_arc_task_body(task_id, task, test_index=test_index)
+    hyp_lines = []
+    for h in hypotheses:
+        text = str(h.get("text", ""))
+        if hyp_char_cap <= 0:
+            text = "(see slot analysis)"
+        elif len(text) > hyp_char_cap:
+            text = text[: max(0, hyp_char_cap - 3)] + "..."
+        hyp_lines.append(f"  [{h['slot']}] {h['feature']}: {text}")
     return "\n".join(
         [
             body,
@@ -4305,35 +4807,80 @@ def collect_feature_slot_hypotheses(
     )
 
     hypotheses: List[Dict[str, Any]] = []
-    if verbose or STREAM_ALL_OUTPUT:
+    hyp_thinking = ARC_HYPOTHESIS_ENABLE_THINKING and not ARC_FAST_INFERENCE
+    engine_ctx = get_inference_max_context(vllm_llm)
+    hyp_max_tokens = arc_hypothesis_max_tokens(task)
+    probe_feat = max(
+        feature_names,
+        key=lambda n: len(SLOT_HYPOTHESIS_LENSES.get(n, n)),
+    )
+    task_body, system_used, probe_tok, body_fmt = resolve_arc_hypothesis_bundle(
+        tokenizer,
+        task_id,
+        task,
+        test_index,
+        probe_feat,
+        system_content=system_content,
+        engine_ctx=engine_ctx,
+        max_output_tokens=int(hyp_max_tokens),
+        enable_thinking=hyp_thinking,
+    )
+    prompts: List[str] = []
+    sp_list: List[Any] = []
+    slot_meta: List[Tuple[int, str, Dict[str, Any]]] = []
+    max_needed = 0
+
+    if verbose or (STREAM_ALL_OUTPUT and not ARC_FAST_INFERENCE):
         stream_log(
-            f"[MBR-HYP] collecting {k} slot hypotheses "
-            f"(max_tokens={ARC_HYPOTHESIS_MAX_TOKENS} each) features={feature_names}"
+            f"[MBR-HYP] batched {k} slot hypotheses "
+            f"(max_tokens={hyp_max_tokens}/slot, thinking={hyp_thinking}) "
+            f"engine_ctx={engine_ctx} prompt~{probe_tok}tok({body_fmt}) "
+            f"features={feature_names}"
         )
 
     for slot_i in range(k):
         feat_name = feature_names[slot_i] if slot_i < len(feature_names) else f"slot{slot_i}"
         params = feature_params[slot_i] if slot_i < len(feature_params) else FEATURE_PARAMS["LogicalReasoner"]
         user_content = build_slot_hypothesis_user_content(
-            task_id, task, test_index, feat_name
+            task_id,
+            task,
+            test_index,
+            feat_name,
+            task_body=task_body,
+            compact=ARC_FAST_INFERENCE,
         )
-        if ARC_USE_CHAT_TEMPLATE:
-            prompt = apply_arc_chat_prompt_custom(
-                tokenizer,
-                user_content,
-                system_content=system_content,
-                enable_thinking=True,
-            )
-        else:
-            prompt = user_content
+        prompt = _wrap_arc_chat_prompt(
+            tokenizer,
+            user_content,
+            system_content=system_used,
+            enable_thinking=hyp_thinking,
+        )
 
         sp = SamplingParams(
             temperature=float(params.get("temperature", 0.7)),
             top_p=float(params.get("top_p", 0.92)),
-            max_tokens=int(ARC_HYPOTHESIS_MAX_TOKENS),
+            max_tokens=int(hyp_max_tokens),
+            repetition_penalty=float(params.get("repetition_penalty", 1.03)),
         )
         setattr(sp, "stream_label", f"MBR-hypothesis/slot{slot_i}/{feat_name}")
-        out = vllm_llm.generate([prompt], sp)[0]
+        prompts.append(prompt)
+        sp_list.append(sp)
+        slot_meta.append((slot_i, feat_name, params))
+        n_in = count_prompt_tokens(tokenizer, prompt)
+        max_needed = max(max_needed, n_in + int(hyp_max_tokens))
+
+    if max_needed > engine_ctx:
+        need_ctx = int(math.ceil(max_needed / 256.0) * 256)
+        raise ValueError(
+            f"ARC hypothesis needs {max_needed} tokens (input+output) but vLLM "
+            f"max_model_len={engine_ctx}. Restart kernel and set "
+            f"VLLM_MAX_MODEL_LEN={need_ctx} at the top of the script "
+            f"(auto budget is {arc_vllm_context_budget()}). "
+            f"Qwen native context is 150k+; only GPU KV cache limits vLLM."
+        )
+
+    outs = vllm_llm.generate(prompts, sp_list)
+    for out, (slot_i, feat_name, _params), prompt in zip(outs, slot_meta, prompts):
         gen_ids: List[int] = list(out.outputs[0].token_ids) if out.outputs else []
         raw_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
         hyp_text = _extract_transformation_hypothesis(raw_text)
@@ -4348,10 +4895,11 @@ def collect_feature_slot_hypotheses(
             "prompt": prompt,
         }
         hypotheses.append(rec)
-        stream_log(
-            f"  [HYPOTHESIS slot {slot_i}] {feat_name} ({len(gen_ids)} tok):\n"
-            f"    {rec['text'][:500]}{'...' if len(rec['text']) > 500 else ''}"
-        )
+        if verbose or (STREAM_ALL_OUTPUT and not ARC_FAST_INFERENCE):
+            stream_log(
+                f"  [HYPOTHESIS slot {slot_i}] {feat_name} ({len(gen_ids)} tok):\n"
+                f"    {rec['text'][:500]}{'...' if len(rec['text']) > 500 else ''}"
+            )
 
     return hypotheses
 
@@ -4386,36 +4934,56 @@ def arc_mbr_hypothesis_pipeline(
     )
     hyp_token_total = sum(int(h.get("num_tokens", 0)) for h in hypotheses)
 
-    final_user = build_final_grid_user_content(
-        task_id, task, test_index, hypotheses
-    )
+    engine_ctx = get_inference_max_context(vllm_llm)
+    final_max_tokens = arc_mbr_final_output_budget(task, hyp_token_total)
     final_system = (
         "You solve ARC-AGI grid puzzles. You are given parallel textual hypotheses from "
         "specialist analysts. Synthesize the best rule, then output exactly one JSON 2D "
         "array of integers (0-9). No markdown fences, no prose after the array."
     )
-    if ARC_USE_CHAT_TEMPLATE:
-        final_prompt = apply_arc_chat_prompt_custom(
-            tokenizer,
-            final_user,
-            system_content=final_system,
-            enable_thinking=False,
-            assistant_prefill=ARC_ASSISTANT_PREFILL,
+    if ARC_FAST_INFERENCE:
+        final_system = (
+            "ARC solver. Synthesize hypotheses, output one JSON 2D int array (0-9) only."
         )
-    else:
-        final_prompt = final_user + "\n" + ARC_ASSISTANT_PREFILL
+
+    final_prompt, final_in, body_tok, body_fmt = resolve_arc_final_prompt_bundle(
+        tokenizer,
+        task_id,
+        task,
+        test_index,
+        hypotheses,
+        system_content=final_system,
+        engine_ctx=engine_ctx,
+        final_output_tokens=final_max_tokens,
+        assistant_prefill=ARC_ASSISTANT_PREFILL,
+    )
+
+    ctx_allows = max(64, engine_ctx - final_in - 32)
+    if final_max_tokens > ctx_allows:
+        stream_log(
+            f"[MBR-WARN] 8k output budget wants {final_max_tokens} tok for final grid "
+            f"but engine_ctx={engine_ctx} with prompt={final_in}tok only allows "
+            f"{ctx_allows}tok output. Increase VLLM_MAX_MODEL_LEN (auto={arc_vllm_context_budget()})."
+        )
+        final_max_tokens = ctx_allows
 
     if verbose or STREAM_ALL_OUTPUT:
         stream_log(
-            f"[MBR-FINAL] single grid synthesis pass "
-            f"(max_tokens={ARC_FINAL_GRID_MAX_TOKENS}, prefill={ARC_ASSISTANT_PREFILL!r})"
+            f"[MBR-BUDGET] output_cap={ARC_MBR_OUTPUT_TOKEN_BUDGET} "
+            f"hyp_used={hyp_token_total} final_allocated={final_max_tokens} "
+            f"(grid_need~{arc_final_grid_max_tokens(task)})"
+        )
+        stream_log(
+            f"[MBR-FINAL] grid synthesis "
+            f"(max_tokens={final_max_tokens}, prompt={final_in}tok, body={body_tok}tok({body_fmt}), "
+            f"engine_ctx={engine_ctx}, prefill={ARC_ASSISTANT_PREFILL!r})"
         )
 
     grid_res = arc_direct_generate(
         vllm_llm,
         tokenizer,
         final_prompt,
-        max_new_tokens=ARC_FINAL_GRID_MAX_TOKENS,
+        max_new_tokens=final_max_tokens,
         temperature=ARC_GENERATION_TEMPERATURE,
     )
     grid_tokens = int(grid_res.get("num_tokens", 0))
@@ -4432,6 +5000,8 @@ def arc_mbr_hypothesis_pipeline(
         "num_tokens": hyp_token_total + grid_tokens,
         "hypothesis_tokens": hyp_token_total,
         "grid_tokens": grid_tokens,
+        "final_output_budget": final_max_tokens,
+        "output_budget_cap": int(ARC_MBR_OUTPUT_TOKEN_BUDGET),
         "prompt_tokens": final_prompt_tokens,
         "num_superblocks": 1 + k,
         "total_accepted": grid_tokens,
@@ -4453,8 +5023,8 @@ def arc_direct_generate(
     seed: int = 42,
 ) -> Dict[str, Any]:
     """
-    Single-pass generation for ARC eval (recommended on HF fallback).
-    Avoids the classic speculative loop that rejects tokens when draft≠target sampling.
+    Single-pass generation for ARC eval.
+    When vLLM speculative decoding is active, DFlash draft+verify runs inside generate().
     """
     del seed  # temperature 0 is deterministic; seed reserved for API compatibility
     sp = SamplingParams(
@@ -4462,7 +5032,7 @@ def arc_direct_generate(
         top_p=1.0,
         max_tokens=int(max_new_tokens),
     )
-    setattr(sp, "stream_label", "ARC-CLASSIC")
+    setattr(sp, "stream_label", "MBR-FINAL-GRID")
     prompt_tokens = count_prompt_tokens(tokenizer, prompt)
     if STREAM_ALL_OUTPUT and not ARC_FAST_INFERENCE:
         stream_log(
@@ -4475,6 +5045,7 @@ def arc_direct_generate(
     if out.outputs:
         gen_ids = list(out.outputs[0].token_ids)
     generated_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+    spec_active = bool(getattr(vllm_llm, "speculative_decoding_enabled", False))
     result: Dict[str, Any] = {
         "final_text": prompt + generated_text,
         "generated_text": generated_text,
@@ -4488,7 +5059,8 @@ def arc_direct_generate(
         "acceptance_history": [1.0] if gen_ids else [0.0],
         "feature_history": [["DirectGenerate"]],
         "reframe_events": 0,
-        "generation_mode": "direct",
+        "generation_mode": "direct+speculative" if spec_active else "direct",
+        "speculative_decoding": spec_active,
     }
     gen_suffix = extract_arc_generated_suffix(result, prompt)
     parsed_grid = parse_arc_answer_grid(gen_suffix)
@@ -4496,33 +5068,6 @@ def arc_direct_generate(
         result["parsed_grid"] = parsed_grid
         result["generated_text"] = json.dumps(parsed_grid, separators=(",", ":"))
     return result
-
-
-def arc_classic_generate(
-    vllm_llm: Any,
-    tokenizer: Any,
-    prompt: str,
-    max_new_tokens: int = 128,
-    block_size: int = 8,
-    seed: int = 42,
-) -> Dict[str, Any]:
-    """Dispatch classic ARC generation: direct (default) or speculative dflash loop."""
-    if ARC_EVAL_GENERATION_MODE == "direct":
-        return arc_direct_generate(
-            vllm_llm, tokenizer, prompt, max_new_tokens=max_new_tokens, seed=seed
-        )
-    res = classic_dflash_generate(
-        vllm_llm,
-        tokenizer,
-        prompt,
-        max_new_tokens=max_new_tokens,
-        block_size=block_size,
-        seed=seed,
-    )
-    res["generation_mode"] = "speculative"
-    if "generated_text" not in res:
-        res["generated_text"] = extract_arc_generated_suffix(res, prompt)
-    return res
 
 
 def parse_grid_from_text(
@@ -4600,6 +5145,8 @@ def grid_cell_stats(
 ) -> Dict[str, Any]:
     """Compare pred vs gold; report match rate and shape mismatch."""
     gh, gw = len(gold), len(gold[0]) if gold else 0
+    if pred is not None and not _is_valid_arc_grid(pred):
+        pred = None
     if pred is None:
         return {
             "parsed": False,
@@ -4767,17 +5314,13 @@ def print_arc_answer_comparison(
     num_tasks: int,
     test_index: int,
     gold: List[List[int]],
-    classic_pred: Optional[List[List[int]]],
     mbr_pred: Optional[List[List[int]]],
-    classic_stats: Dict[str, Any],
     mbr_stats: Dict[str, Any],
-    classic_raw_text: Optional[str] = None,
     mbr_raw_text: Optional[str] = None,
-    classic_timing: Optional[Dict[str, Any]] = None,
     mbr_timing: Optional[Dict[str, Any]] = None,
     split: str = ARC_DATA_SPLIT,
 ) -> None:
-    """Print ground truth and both model answers side-by-side (JSON grids)."""
+    """Print ground truth and MBR answer side-by-side (JSON grids)."""
     bar = "=" * 80
     print(f"\n{bar}")
     print(
@@ -4788,21 +5331,6 @@ def print_arc_answer_comparison(
 
     print("\nGROUND TRUTH (gold labels):")
     print(format_grid_json(gold))
-
-    c_tag = _grade_verdict_label(classic_stats)
-    c_time = (
-        f"  |  {format_timing_line(classic_timing)}"
-        if classic_timing
-        else ""
-    )
-    print(f"\nCLASSIC PREDICTION [{c_tag}] "
-          f"({classic_stats['matching_cells']}/{classic_stats['gold_cells']} cells, "
-          f"{classic_stats['match_rate'] * 100:.1f}% match){c_time}:")
-    print(format_grid_json(classic_pred))
-    if classic_pred is None and classic_raw_text:
-        tail = classic_raw_text[-800:] if len(classic_raw_text) > 800 else classic_raw_text
-        print("CLASSIC raw model output (tail):")
-        print(tail)
 
     m_tag = _grade_verdict_label(mbr_stats)
     m_time = (
@@ -4819,21 +5347,8 @@ def print_arc_answer_comparison(
         print("MBR raw model output (tail):")
         print(tail)
 
-    if classic_pred and gold:
-        print("\nCELL-BY-CELL (classic vs gold) — XX=mismatch, ok=match:")
-        for r in range(len(gold)):
-            row_markers = []
-            for c in range(len(gold[r])):
-                if r >= len(classic_pred) or c >= len(classic_pred[r]):
-                    row_markers.append("??")
-                elif classic_pred[r][c] == gold[r][c]:
-                    row_markers.append("ok")
-                else:
-                    row_markers.append("XX")
-            print(f"  row {r}: " + " ".join(row_markers))
-
     if mbr_pred and gold:
-        print("\nCELL-BY-CELL (million-brains vs gold) — XX=mismatch, ok=match:")
+        print("\nCELL-BY-CELL (MBR vs gold) — XX=mismatch, ok=match:")
         for r in range(len(gold)):
             row_markers = []
             for c in range(len(gold[r])):
@@ -4856,24 +5371,14 @@ def print_arc_final_result(
     test_index: int,
     test_input: List[List[int]],
     gold: List[List[int]],
-    classic_pred: Optional[List[List[int]]],
     mbr_pred: Optional[List[List[int]]],
-    classic_stats: Dict[str, Any],
     mbr_stats: Dict[str, Any],
-    classic_timing: Optional[Dict[str, Any]] = None,
     mbr_timing: Optional[Dict[str, Any]] = None,
     split: str = ARC_DATA_SPLIT,
 ) -> None:
-    """Single end-of-test summary: verdict, timing, and final gold vs prediction grids."""
-    c_verdict = _grade_verdict_label(classic_stats)
+    """Single end-of-test summary: verdict, timing, and final gold vs MBR prediction."""
     m_verdict = _grade_verdict_label(mbr_stats)
-    c_icon = "PASS" if classic_stats["correct"] else "FAIL"
     m_icon = "PASS" if mbr_stats["correct"] else "FAIL"
-    c_time = (
-        format_timing_detail_line(classic_timing)
-        if classic_timing
-        else "n/a"
-    )
     m_time = (
         format_timing_detail_line(mbr_timing) if mbr_timing else "n/a"
     )
@@ -4886,11 +5391,7 @@ def print_arc_final_result(
         f"split={split}  test=#{test_index}  input={in_shape}"
     )
     print(
-        f"  CLASSIC [{c_icon}] {c_verdict:<12}  "
-        f"{classic_stats['matching_cells']}/{classic_stats['gold_cells']} cells  |  {c_time}"
-    )
-    print(
-        f"  MBR     [{m_icon}] {m_verdict:<12}  "
+        f"  MBR [{m_icon}] {m_verdict:<12}  "
         f"{mbr_stats['matching_cells']}/{mbr_stats['gold_cells']} cells  |  {m_time}"
     )
     print(bar)
@@ -4898,17 +5399,6 @@ def print_arc_final_result(
     blocks = [
         _render_grid_ascii(gold, title=f"GOLD ({_grid_shape_label(gold)})"),
     ]
-    if classic_pred:
-        blocks.append(
-            _render_grid_ascii(
-                classic_pred,
-                title=f"CLASSIC [{c_verdict}]",
-                diff_against=gold,
-                pred_for_diff=classic_pred,
-            )
-        )
-    else:
-        blocks.append(["CLASSIC [UNPARSED]", "  (no valid grid)"])
     if mbr_pred:
         blocks.append(
             _render_grid_ascii(
@@ -4925,84 +5415,36 @@ def print_arc_final_result(
     print(bar, flush=True)
 
 
-def print_arc_classic_interim(
-    *,
-    task_id: str,
-    task_idx: int,
-    num_tasks: int,
-    test_index: int,
-    gold: List[List[int]],
-    classic_pred: Optional[List[List[int]]],
-    classic_stats: Dict[str, Any],
-    classic_timing: Dict[str, Any],
-    classic_raw_tail: Optional[str] = None,
-    split: str = ARC_DATA_SPLIT,
-) -> None:
-    """Print classic result + timing immediately (before slow MBR pass finishes)."""
-    c_tag = _grade_verdict_label(classic_stats)
-    arc_eval_log(
-        f"\n[ARC] {task_idx + 1}/{num_tasks} {task_id} test#{test_index} "
-        f"— CLASSIC done [{c_tag}] | {format_timing_detail_line(classic_timing)}"
-    )
-    if not ARC_PRINT_FINAL_MATRICES:
-        arc_eval_log(f"  GOLD    : {format_grid_json(gold)}")
-        arc_eval_log(
-            f"  CLASSIC : {format_grid_json(classic_pred)} "
-            f"({classic_stats['matching_cells']}/{classic_stats['gold_cells']} cells)"
-        )
-        if classic_raw_tail and not classic_stats.get("parsed"):
-            last_anchor = classic_raw_tail.rfind("[[")
-            snippet = (
-                classic_raw_tail[last_anchor : last_anchor + 800]
-                if last_anchor >= 0
-                else classic_raw_tail[-800:]
-            )
-            arc_eval_log(f"  CLASSIC raw (unparsed, last [[ attempt): {snippet}")
-    if ARC_RUN_MBR_EVAL:
-        arc_eval_log("  (running million-brains pass next…)")
-
-
 def print_arc_full_answer_report(
     comparisons: List[Dict[str, Any]], split: str
 ) -> None:
-    """Final digest: every task's predictions vs ground truth."""
+    """Final digest: every task's MBR predictions vs ground truth."""
     bar = "=" * 80
     print(f"\n{bar}")
     print(f"ARC FULL ANSWER REPORT  ({split} split — all tasks vs ground truth)")
     print(bar)
     print(
-        f"{'Task':<14} {'Test':>4}  {'Classic':<10} {'MBR':<10}  "
-        f"{'Classic TPS':>12}  {'MBR TPS':>10}  Gold"
+        f"{'Task':<14} {'Test':>4}  {'MBR':<10}  {'MBR TPS':>12}  Gold"
     )
     print("-" * 80)
     for rec in comparisons:
         gold_s = rec.get("gold_json", "[]")
         if len(gold_s) > 36:
             gold_s = gold_s[:33] + "..."
-        c_timing = rec.get("classic_timing") or {}
         m_timing = rec.get("mbr_timing") or {}
-        c_tps = f"{c_timing.get('tps', 0.0):.2f} tok/s"
         m_tps = f"{m_timing.get('tps', 0.0):.2f} tok/s"
-        c_elapsed = f"{c_timing.get('elapsed_s', 0.0):.1f}s"
         m_elapsed = f"{m_timing.get('elapsed_s', 0.0):.1f}s"
         print(
             f"{rec['task_id']:<14} {rec['test_index']:>4}  "
-            f"{rec['classic_verdict']:<10} {rec['mbr_verdict']:<10}  "
-            f"{c_tps:>6} ({c_elapsed:>5})  {m_tps:>6} ({m_elapsed:>5})  {gold_s}"
+            f"{rec['mbr_verdict']:<10}  "
+            f"{m_tps:>6} ({m_elapsed:>5})  {gold_s}"
         )
-        classic_s = rec.get("classic_json", "(unparsed)")
         mbr_s = rec.get("mbr_json", "(unparsed)")
-        if len(classic_s) > 76:
-            classic_s = classic_s[:73] + "..."
         if len(mbr_s) > 76:
             mbr_s = mbr_s[:73] + "..."
-        print(f"    gold   : {rec.get('gold_json', '[]')}")
+        print(f"    gold: {rec.get('gold_json', '[]')}")
         print(
-            f"    classic: {classic_s}  "
-            f"[{format_timing_line(c_timing) if c_timing else 'n/a'}]"
-        )
-        print(
-            f"    mbr    : {mbr_s}  "
+            f"    mbr : {mbr_s}  "
             f"[{format_timing_line(m_timing) if m_timing else 'n/a'}]"
         )
         print("-" * 80)
@@ -5017,16 +5459,12 @@ def print_arc_grade_card(
     test_index: int,
     test_input: List[List[int]],
     gold: List[List[int]],
-    classic_pred: Optional[List[List[int]]],
     mbr_pred: Optional[List[List[int]]],
-    classic_stats: Dict[str, Any],
     mbr_stats: Dict[str, Any],
     split: str = ARC_DATA_SPLIT,
 ) -> None:
-    """Terminal grade card: test input vs gold answer key vs both predictions."""
-    c_verdict = _grade_verdict_label(classic_stats)
+    """Terminal grade card: test input vs gold answer key vs MBR prediction."""
     m_verdict = _grade_verdict_label(mbr_stats)
-    c_icon = "✓" if classic_stats["correct"] else "✗"
     m_icon = "✓" if mbr_stats["correct"] else "✗"
 
     bar = "═" * 78
@@ -5037,21 +5475,14 @@ def print_arc_grade_card(
         f"{' ' * max(0, 18 - len(task_id))}║"
     )
     print(
-        f"║  CLASSIC {c_icon} {c_verdict:<14}  |  "
-        f"MILLION-BRAINS {m_icon} {m_verdict:<14}"
-        f"{' ' * 22}║"
+        f"║  MILLION-BRAINS {m_icon} {m_verdict:<14}"
+        f"{' ' * 40}║"
     )
     print(f"╠{bar}╣")
 
     blocks = [
         _render_grid_ascii(test_input, title="TEST INPUT (challenge)"),
         _render_grid_ascii(gold, title="GOLD SOLUTION (test set labels)"),
-        _render_grid_ascii(
-            classic_pred if classic_pred else [[-1]],
-            title=f"CLASSIC PRED [{c_verdict}]",
-        )
-        if classic_pred
-        else ["CLASSIC PRED [UNPARSED]", "  (model output not a valid grid)"],
         _render_grid_ascii(
             mbr_pred if mbr_pred else [[-1]],
             title=f"MBR PRED [{m_verdict}]",
@@ -5064,28 +5495,16 @@ def print_arc_grade_card(
 
     print(f"╠{bar}╣")
     print(
-        f"║  CLASSIC match: {classic_stats['matching_cells']:>3}/{classic_stats['gold_cells']:<3} "
-        f"({classic_stats['match_rate'] * 100:5.1f}%)  "
-        f"shape {classic_stats['pred_shape'] or '—'} vs gold {classic_stats['gold_shape']}"
-        f"{' ' * 8}║"
-    )
-    print(
-        f"║  MBR match:     {mbr_stats['matching_cells']:>3}/{mbr_stats['gold_cells']:<3} "
+        f"║  MBR match: {mbr_stats['matching_cells']:>3}/{mbr_stats['gold_cells']:<3} "
         f"({mbr_stats['match_rate'] * 100:5.1f}%)  "
         f"shape {mbr_stats['pred_shape'] or '—'} vs gold {mbr_stats['gold_shape']}"
-        f"{' ' * 8}║"
+        f"{' ' * 12}║"
     )
     print(f"╚{bar}╝")
 
-    if classic_pred and classic_stats["shape_match"]:
+    if mbr_pred and mbr_stats["shape_match"]:
         diff_lines = _align_grid_columns(
             [
-                _render_grid_ascii(
-                    gold,
-                    title="DIFF vs GOLD (classic)",
-                    diff_against=gold,
-                    pred_for_diff=classic_pred,
-                ),
                 _render_grid_ascii(
                     gold,
                     title="DIFF vs GOLD (mbr)",
@@ -5101,6 +5520,22 @@ def print_arc_grade_card(
 
 def _draw_grid_matplotlib(ax, grid: List[List[int]], title: str) -> None:
     import numpy as np
+
+    if not _is_valid_arc_grid(grid):
+        ax.text(
+            0.5,
+            0.5,
+            "INVALID\nGRID",
+            ha="center",
+            va="center",
+            fontsize=10,
+            color="#666666",
+        )
+        ax.set_title(title, fontsize=9, fontweight="bold")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.axis("off")
+        return
 
     arr = np.array(grid, dtype=np.int32)
     cmap_colors = [
@@ -5147,22 +5582,19 @@ def save_arc_grade_image(
     test_index: int,
     test_input: List[List[int]],
     gold: List[List[int]],
-    classic_pred: Optional[List[List[int]]],
     mbr_pred: Optional[List[List[int]]],
-    classic_stats: Dict[str, Any],
     mbr_stats: Dict[str, Any],
     train_pairs: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
-    """Save a PNG grade card contrasting predictions against the test-set gold grid."""
+    """Save a PNG grade card showing MBR prediction against the test-set gold grid."""
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         return None
 
-    c_verdict = _grade_verdict_label(classic_stats)
     m_verdict = _grade_verdict_label(mbr_stats)
     n_train = min(len(train_pairs or []), 3) if ARC_SHOW_TRAIN_EXAMPLES else 0
-    ncols = 5 + n_train
+    ncols = 4 + n_train
     fig_w = max(10, 2.2 * ncols)
     fig, axes = plt.subplots(1, ncols, figsize=(fig_w, 3.2))
     if ncols == 1:
@@ -5183,15 +5615,14 @@ def save_arc_grade_image(
     col += 1
     _draw_grid_matplotlib(axes[col], gold, "GOLD (test labels)")
     col += 1
-    if classic_pred:
-        _draw_grid_matplotlib(axes[col], classic_pred, f"CLASSIC [{c_verdict}]")
-    else:
-        axes[col].text(0.5, 0.5, "UNPARSED", ha="center", va="center", fontsize=12)
-        axes[col].set_title(f"CLASSIC [{c_verdict}]")
-        axes[col].axis("off")
-    col += 1
-    if mbr_pred:
+    if mbr_pred and _is_valid_arc_grid(mbr_pred):
         _draw_grid_matplotlib(axes[col], mbr_pred, f"MBR [{m_verdict}]")
+    elif mbr_pred:
+        axes[col].text(
+            0.5, 0.5, "MALFORMED\nGRID", ha="center", va="center", fontsize=12
+        )
+        axes[col].set_title(f"MBR [{m_verdict}]")
+        axes[col].axis("off")
     else:
         axes[col].text(0.5, 0.5, "UNPARSED", ha="center", va="center", fontsize=12)
         axes[col].set_title(f"MBR [{m_verdict}]")
@@ -5199,16 +5630,14 @@ def save_arc_grade_image(
     col += 1
     _draw_diff_matplotlib(
         axes[col],
-        classic_pred,
+        mbr_pred,
         gold,
-        f"Classic diff ({classic_stats['match_rate'] * 100:.0f}%)",
+        f"MBR diff ({mbr_stats['match_rate'] * 100:.0f}%)",
     )
 
-    c_color = "#2ecc40" if classic_stats["correct"] else "#ff4136"
     m_color = "#2ecc40" if mbr_stats["correct"] else "#ff4136"
     fig.suptitle(
-        f"ARC {task_id} test #{test_index}  |  "
-        f"Classic: {c_verdict}  |  MBR: {m_verdict}",
+        f"ARC {task_id} test #{test_index}  |  MBR: {m_verdict}",
         fontsize=11,
         fontweight="bold",
         color="#222222",
@@ -5216,20 +5645,14 @@ def save_arc_grade_image(
     fig.text(
         0.5,
         0.02,
-        f"Classic {classic_stats['matching_cells']}/{classic_stats['gold_cells']} cells  "
-        f"|  MBR {mbr_stats['matching_cells']}/{mbr_stats['gold_cells']} cells",
+        f"MBR {mbr_stats['matching_cells']}/{mbr_stats['gold_cells']} cells",
         ha="center",
         fontsize=9,
     )
-    classic_ax_idx = n_train + 2
-    mbr_ax_idx = n_train + 3
-    for ax, color in (
-        (axes[classic_ax_idx], c_color),
-        (axes[mbr_ax_idx], m_color),
-    ):
-        for spine in ax.spines.values():
-            spine.set_edgecolor(color)
-            spine.set_linewidth(3)
+    mbr_ax_idx = n_train + 2
+    for spine in axes[mbr_ax_idx].spines.values():
+        spine.set_edgecolor(m_color)
+        spine.set_linewidth(3)
 
     plt.tight_layout(rect=[0, 0.05, 1, 0.92])
     out_path = os.path.join(
@@ -5260,13 +5683,11 @@ def grade_arc_test_case(
     test_index: int,
     test_input: List[List[int]],
     gold: List[List[int]],
-    classic_pred: Optional[List[List[int]]],
     mbr_pred: Optional[List[List[int]]],
     train_pairs: Optional[List[Dict[str, Any]]] = None,
     split: str = ARC_DATA_SPLIT,
 ) -> Dict[str, Any]:
     """Full visual grading for one test case: stats + terminal card + optional PNG."""
-    classic_stats = grid_cell_stats(classic_pred, gold)
     mbr_stats = grid_cell_stats(mbr_pred, gold)
 
     if ARC_VISUAL_GRADING and not ARC_PRINT_FINAL_MATRICES:
@@ -5277,9 +5698,7 @@ def grade_arc_test_case(
             test_index=test_index,
             test_input=test_input,
             gold=gold,
-            classic_pred=classic_pred,
             mbr_pred=mbr_pred,
-            classic_stats=classic_stats,
             mbr_stats=mbr_stats,
             split=split,
         )
@@ -5291,9 +5710,7 @@ def grade_arc_test_case(
             test_index=test_index,
             test_input=test_input,
             gold=gold,
-            classic_pred=classic_pred,
             mbr_pred=mbr_pred,
-            classic_stats=classic_stats,
             mbr_stats=mbr_stats,
             train_pairs=train_pairs,
         )
@@ -5301,7 +5718,6 @@ def grade_arc_test_case(
             display_arc_grade_image(image_path)
 
     return {
-        "classic_stats": classic_stats,
         "mbr_stats": mbr_stats,
         "image_path": image_path,
     }
@@ -5310,20 +5726,16 @@ def grade_arc_test_case(
 def print_arc_gradeboard(per_task: List[Dict[str, Any]], split: str) -> None:
     """Final at-a-glance scoreboard for every challenged task."""
     print("\n" + "━" * 78)
-    print(f"ARC GRADEBOARD  ({split} split — contrasted against test-set gold labels)")
+    print(f"ARC GRADEBOARD  ({split} split — MBR vs test-set gold labels)")
     print("━" * 78)
-    print(f"{'Task ID':<12} {'Tests':>5}  {'Classic':>16}  {'Million-Brains':>16}")
+    print(f"{'Task ID':<12} {'Tests':>5}  {'Million-Brains':>16}")
     print("-" * 78)
     for rec in per_task:
         tid = rec["task_id"]
-        tests = len(rec.get("classic", []))
-        c_pass = sum(1 for r in rec["classic"] if r.get("correct"))
+        tests = len(rec.get("mbr", []))
         m_pass = sum(1 for r in rec["mbr"] if r.get("correct"))
-        c_bar = "█" * c_pass + "░" * max(0, tests - c_pass)
         m_bar = "█" * m_pass + "░" * max(0, tests - m_pass)
-        print(
-            f"{tid:<12} {tests:>5}  {c_pass}/{tests} {c_bar:<8}  {m_pass}/{tests} {m_bar}"
-        )
+        print(f"{tid:<12} {tests:>5}  {m_pass}/{tests} {m_bar}")
     print("━" * 78)
 
 
@@ -5343,7 +5755,7 @@ def evaluate_arc_dataset(
     visual_grading: bool = ARC_VISUAL_GRADING,
 ) -> Dict[str, Any]:
     """
-    Run classic vs million-brains-dflash on an ARC-AGI split.
+    Run million-brains-dflash on an ARC-AGI split.
     Requires explicit challenges + solutions paths (typically under data/, gitignored).
     """
     dataset = load_arc_dataset(challenges_path, solutions_path)
@@ -5381,18 +5793,26 @@ def evaluate_arc_dataset(
     )
     print(
         f"Fast inference: {ARC_FAST_INFERENCE} | try vLLM: {ARC_TRY_VLLM} | "
+        f"max_prompt_tok: {ARC_MAX_PROMPT_TOKENS} | "
+        f"vllm_ctx_budget: {arc_vllm_context_budget()} | "
         f"engine pref: {'vLLM' if ARC_TRY_VLLM and not PREFER_HF_INFERENCE else 'HF'}"
     )
     if EVAL_SMOKE_TASK_ID:
         print(f"Smoke task only: {EVAL_SMOKE_TASK_ID}")
     print(
-        f"ARC generation mode: {ARC_EVAL_GENERATION_MODE} "
-        f"(chat_template={ARC_USE_CHAT_TEMPLATE}, temp={ARC_GENERATION_TEMPERATURE})"
+        f"ARC generation: chat_template={ARC_USE_CHAT_TEMPLATE}, "
+        f"temp={ARC_GENERATION_TEMPERATURE}"
     )
-    print(f"ARC run MBR eval: {ARC_RUN_MBR_EVAL}")
     print(
         f"MBR mode: {'hypothesis slots + final grid' if ARC_SLOT_HYPOTHESIS_MODE else 'token speculative'} "
-        f"| hyp_tok={ARC_HYPOTHESIS_MAX_TOKENS} | final_grid_tok={ARC_FINAL_GRID_MAX_TOKENS}"
+        f"| output_budget={ARC_MBR_OUTPUT_TOKEN_BUDGET} tok/test "
+        f"| final_reserve>={int(ARC_MBR_OUTPUT_TOKEN_BUDGET * ARC_FINAL_GRID_MIN_FRACTION)} "
+        f"| vLLM ctx auto={arc_vllm_context_budget()}"
+    )
+    print(
+        f"vLLM speculative: {_inference_speculative_status(vllm_llm)} "
+        f"(ENABLE_VLLM_SPECULATIVE_DECODING={ENABLE_VLLM_SPECULATIVE_DECODING}, "
+        f"method={VLLM_SPECULATIVE_METHOD}, n={VLLM_NUM_SPECULATIVE_TOKENS})"
     )
     if visual_grading and ARC_SAVE_GRADE_IMAGES:
         print(f"Grade images: {_arc_grade_output_dir()}/")
@@ -5406,7 +5826,6 @@ def evaluate_arc_dataset(
         "challenges_path": os.path.abspath(challenges_path),
         "solutions_path": os.path.abspath(solutions_path),
         "num_tasks": len(task_ids),
-        "classic": {"correct": 0, "parsed": 0, "tests": 0, "time": 0.0, "tokens": 0},
         "mbr": {"correct": 0, "parsed": 0, "tests": 0, "time": 0.0, "tokens": 0},
         "per_task": [],
         "answer_comparisons": [],
@@ -5423,7 +5842,6 @@ def evaluate_arc_dataset(
 
         task_record = {
             "task_id": task_id,
-            "classic": [],
             "mbr": [],
         }
 
@@ -5434,133 +5852,70 @@ def evaluate_arc_dataset(
             gold = gold_tests[test_index]
             test_input = task["test"][test_index]["input"]
 
+            mbr_mode = (
+                "hypothesis-slots+final-grid"
+                if ARC_SLOT_HYPOTHESIS_MODE
+                else "token-speculative"
+            )
             arc_eval_log(
                 f"\n[ARC] >>> task {task_idx + 1}/{len(task_ids)} {task_id} "
-                f"test#{test_index} — starting CLASSIC pass "
-                f"({ARC_EVAL_GENERATION_MODE})…"
+                f"test#{test_index} — starting MBR pass ({mbr_mode})…"
             )
             t0 = time.perf_counter()
-            classic_res = arc_classic_generate(
-                vllm_llm,
-                tokenizer,
-                prompt,
-                max_new_tokens=max_new_tokens,
-                block_size=max(6, block_size),
-                seed=seed + test_index,
-            )
-            classic_elapsed = time.perf_counter() - t0
-            classic_timing = generation_timing_stats(
-                classic_elapsed,
-                classic_res["num_tokens"],
-                prompt_tokens=classic_res.get("prompt_tokens", 0),
-            )
-            summary["classic"]["time"] += classic_elapsed
-            summary["classic"]["tokens"] += classic_res["num_tokens"]
-            summary["classic"]["tests"] += 1
-
-            classic_answer_text = extract_arc_generated_suffix(classic_res, prompt)
-            classic_pred = parse_arc_answer_grid(classic_answer_text)
-            classic_stats_early = grid_cell_stats(classic_pred, gold)
-            if ARC_PRINT_STEP_MATRICES:
-                print_mbr_slot_inference_state(
-                    sb=0,
-                    phase="classic",
-                    slot_i=None,
-                    feature_name="DirectGenerate",
-                    test_input=test_input,
-                    gold=gold,
-                    assistant_suffix=classic_answer_text,
-                    task_id=task_id,
-                )
-
-            if ARC_PRINT_ALL_ANSWERS:
-                print_arc_classic_interim(
-                    task_id=task_id,
-                    task_idx=task_idx,
-                    num_tasks=len(task_ids),
+            if ARC_SLOT_HYPOTHESIS_MODE:
+                mbr_res = arc_mbr_hypothesis_pipeline(
+                    vllm_llm,
+                    tokenizer,
+                    task_id,
+                    task,
                     test_index=test_index,
-                    gold=gold,
-                    classic_pred=classic_pred,
-                    classic_stats=classic_stats_early,
-                    classic_timing=classic_timing,
-                    classic_raw_tail=classic_answer_text,
-                    split=split,
+                    k=k,
+                    allocator=allocator,
+                    seed=seed + test_index,
+                    verbose=(ARC_EVAL_VERBOSE or STREAM_ALL_OUTPUT)
+                    and not ARC_FAST_INFERENCE,
                 )
-
-            if ARC_RUN_MBR_EVAL:
-                mbr_mode = (
-                    "hypothesis-slots+final-grid"
-                    if ARC_SLOT_HYPOTHESIS_MODE
-                    else "token-speculative"
-                )
-                arc_eval_log(
-                    f"[ARC] >>> task {task_idx + 1}/{len(task_ids)} {task_id} "
-                    f"test#{test_index} — starting MBR pass ({mbr_mode})…"
-                )
-                t0 = time.perf_counter()
-                if ARC_SLOT_HYPOTHESIS_MODE:
-                    mbr_res = arc_mbr_hypothesis_pipeline(
-                        vllm_llm,
-                        tokenizer,
-                        task_id,
-                        task,
-                        test_index=test_index,
-                        k=k,
-                        allocator=allocator,
-                        seed=seed + test_index,
-                        verbose=ARC_EVAL_VERBOSE or STREAM_ALL_OUTPUT,
-                    )
-                    mbr_prompt_for_extract = mbr_res.get("final_prompt", prompt)
-                else:
-                    mbr_res = million_brains_dflash_generate(
-                        vllm_llm,
-                        tokenizer,
-                        prompt,
-                        max_new_tokens=max_new_tokens,
-                        k=k,
-                        block_size=block_size,
-                        allocator=allocator,
-                        enable_reallocation=enable_reallocation,
-                        seed=seed + test_index,
-                        verbose=ARC_EVAL_VERBOSE or STREAM_ALL_OUTPUT,
-                        arc_context={
-                            "task_id": task_id,
-                            "test_input": test_input,
-                            "gold": gold,
-                        },
-                    )
-                    mbr_prompt_for_extract = prompt
-                mbr_elapsed = time.perf_counter() - t0
-                mbr_timing = generation_timing_stats(
-                    mbr_elapsed,
-                    mbr_res["num_tokens"],
-                    prompt_tokens=mbr_res.get("prompt_tokens", 0),
-                )
-                summary["mbr"]["time"] += mbr_elapsed
-                summary["mbr"]["tokens"] += mbr_res["num_tokens"]
-                mbr_answer_text = extract_arc_generated_suffix(
-                    mbr_res, mbr_prompt_for_extract
-                )
-                mbr_pred = parse_arc_answer_grid(mbr_answer_text)
-                arc_eval_log(
-                    f"[ARC] <<< task {task_idx + 1}/{len(task_ids)} {task_id} "
-                    f"test#{test_index} — MBR done | {format_timing_line(mbr_timing)}"
-                )
+                mbr_prompt_for_extract = mbr_res.get("final_prompt", prompt)
             else:
-                mbr_res = {
-                    "final_text": prompt,
-                    "generated_text": "",
-                    "num_tokens": 0,
-                    "generation_mode": "skipped",
-                }
-                mbr_timing = generation_timing_stats(0.0, 0)
-                mbr_answer_text = ""
-                mbr_pred = None
-                arc_eval_log(
-                    f"[ARC] --- task {task_idx + 1}/{len(task_ids)} {task_id} "
-                    f"test#{test_index} — MBR skipped (ARC_RUN_MBR_EVAL=False)"
+                mbr_res = million_brains_dflash_generate(
+                    vllm_llm,
+                    tokenizer,
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    k=k,
+                    block_size=block_size,
+                    allocator=allocator,
+                    enable_reallocation=enable_reallocation,
+                    seed=seed + test_index,
+                    verbose=ARC_EVAL_VERBOSE or STREAM_ALL_OUTPUT,
+                    arc_context={
+                        "task_id": task_id,
+                        "test_input": test_input,
+                        "gold": gold,
+                    },
                 )
+                mbr_prompt_for_extract = prompt
+            mbr_elapsed = time.perf_counter() - t0
+            mbr_timing = generation_timing_stats(
+                mbr_elapsed,
+                mbr_res["num_tokens"],
+                prompt_tokens=mbr_res.get("prompt_tokens", 0),
+            )
+            summary["mbr"]["time"] += mbr_elapsed
+            summary["mbr"]["tokens"] += mbr_res["num_tokens"]
             summary["mbr"]["tests"] += 1
+            mbr_answer_text = extract_arc_generated_suffix(
+                mbr_res, mbr_prompt_for_extract
+            )
+            mbr_pred = parse_arc_answer_grid(mbr_answer_text)
+            arc_eval_log(
+                f"[ARC] <<< task {task_idx + 1}/{len(task_ids)} {task_id} "
+                f"test#{test_index} — MBR done | {format_timing_line(mbr_timing)} | "
+                f"out_budget={mbr_res.get('output_budget_cap', ARC_MBR_OUTPUT_TOKEN_BUDGET)} "
+                f"hyp={mbr_res.get('hypothesis_tokens', 0)} "
+                f"final_cap={mbr_res.get('final_output_budget', '?')} "
+                f"grid_out={mbr_res.get('grid_tokens', 0)}"
+            )
 
             grade_info = grade_arc_test_case(
                 task_id=task_id,
@@ -5569,17 +5924,14 @@ def evaluate_arc_dataset(
                 test_index=test_index,
                 test_input=test_input,
                 gold=gold,
-                classic_pred=classic_pred,
                 mbr_pred=mbr_pred,
                 train_pairs=task.get("train") if ARC_SHOW_TRAIN_EXAMPLES else None,
                 split=split,
             ) if visual_grading else {
-                "classic_stats": grid_cell_stats(classic_pred, gold),
                 "mbr_stats": grid_cell_stats(mbr_pred, gold),
                 "image_path": None,
             }
 
-            classic_stats = grade_info["classic_stats"]
             mbr_stats = grade_info["mbr_stats"]
 
             if ARC_PRINT_FINAL_MATRICES:
@@ -5590,11 +5942,8 @@ def evaluate_arc_dataset(
                     test_index=test_index,
                     test_input=test_input,
                     gold=gold,
-                    classic_pred=classic_pred,
                     mbr_pred=mbr_pred,
-                    classic_stats=classic_stats,
                     mbr_stats=mbr_stats,
-                    classic_timing=classic_timing,
                     mbr_timing=mbr_timing,
                     split=split,
                 )
@@ -5606,19 +5955,12 @@ def evaluate_arc_dataset(
                 "split": split,
                 "gold": gold,
                 "gold_json": format_grid_json(gold),
-                "classic_pred": classic_pred,
-                "classic_json": format_grid_json(classic_pred),
                 "mbr_pred": mbr_pred,
                 "mbr_json": format_grid_json(mbr_pred),
-                "classic_verdict": _grade_verdict_label(classic_stats),
                 "mbr_verdict": _grade_verdict_label(mbr_stats),
-                "classic_correct": classic_stats["correct"],
                 "mbr_correct": mbr_stats["correct"],
-                "classic_match_rate": classic_stats["match_rate"],
                 "mbr_match_rate": mbr_stats["match_rate"],
-                "classic_timing": classic_timing,
                 "mbr_timing": mbr_timing,
-                "classic_mode": classic_res.get("generation_mode"),
                 "mbr_mode": mbr_res.get("generation_mode"),
             }
             summary["answer_comparisons"].append(comparison_rec)
@@ -5630,41 +5972,18 @@ def evaluate_arc_dataset(
                     num_tasks=len(task_ids),
                     test_index=test_index,
                     gold=gold,
-                    classic_pred=classic_pred,
                     mbr_pred=mbr_pred,
-                    classic_stats=classic_stats,
                     mbr_stats=mbr_stats,
-                    classic_raw_text=classic_answer_text,
                     mbr_raw_text=mbr_answer_text,
-                    classic_timing=classic_timing,
                     mbr_timing=mbr_timing,
                     split=split,
                 )
 
-            if classic_stats["parsed"]:
-                summary["classic"]["parsed"] += 1
-            if classic_stats["correct"]:
-                summary["classic"]["correct"] += 1
             if mbr_stats["parsed"]:
                 summary["mbr"]["parsed"] += 1
             if mbr_stats["correct"]:
                 summary["mbr"]["correct"] += 1
 
-            task_record["classic"].append(
-                {
-                    "test_index": test_index,
-                    "parsed": classic_stats["parsed"],
-                    "correct": classic_stats["correct"],
-                    "match_rate": classic_stats["match_rate"],
-                    "matching_cells": classic_stats["matching_cells"],
-                    "gold_cells": classic_stats["gold_cells"],
-                    "prediction": classic_pred,
-                    "gold": gold,
-                    "elapsed_s": classic_timing["elapsed_s"],
-                    "num_tokens": classic_timing["num_tokens"],
-                    "tps": classic_timing["tps"],
-                }
-            )
             task_record["mbr"].append(
                 {
                     "test_index": test_index,
@@ -5686,19 +6005,13 @@ def evaluate_arc_dataset(
                 )
 
         summary["per_task"].append(task_record)
-        c_ok = sum(1 for r in task_record["classic"] if r["correct"])
         m_ok = sum(1 for r in task_record["mbr"] if r["correct"])
-        c_task_tps = (
-            sum(r.get("num_tokens", 0) for r in task_record["classic"])
-            / max(1e-6, sum(r.get("elapsed_s", 0.0) for r in task_record["classic"]))
-        )
         m_task_tps = (
             sum(r.get("num_tokens", 0) for r in task_record["mbr"])
             / max(1e-6, sum(r.get("elapsed_s", 0.0) for r in task_record["mbr"]))
         )
         print(
             f"[ARC] {task_idx + 1:4d}/{len(task_ids)} {task_id} "
-            f"classic {c_ok}/{num_tests} ({c_task_tps:.2f} tok/s) | "
             f"mbr {m_ok}/{num_tests} ({m_task_tps:.2f} tok/s)"
         )
 
@@ -5710,7 +6023,6 @@ def evaluate_arc_dataset(
             "tps": bucket["tokens"] / max(1e-6, bucket["time"]),
         }
 
-    summary["classic"].update(_rates(summary["classic"]))
     summary["mbr"].update(_rates(summary["mbr"]))
     summary["split"] = split
 
@@ -5742,38 +6054,21 @@ def evaluate_arc_dataset(
             print(f"[ARC] Could not write answer report: {exc}")
 
     print("\n" + "=" * 80)
-    print("ARC-AGI RESULTS")
+    print("ARC-AGI RESULTS (Million-Brains)")
     print("=" * 80)
-    print(
-        f"{'Metric':<28} {'Classic':>14} {'Million-Brains':>18}"
-    )
-    print("-" * 62)
-    print(
-        f"{'Test cases':<28} {summary['classic']['tests']:>14} {summary['mbr']['tests']:>18}"
-    )
-    print(
-        f"{'Parsed outputs':<28} {summary['classic']['parsed']:>14} {summary['mbr']['parsed']:>18}"
-    )
-    print(
-        f"{'Exact matches':<28} {summary['classic']['correct']:>14} {summary['mbr']['correct']:>18}"
-    )
-    print(
-        f"{'Accuracy':<28} {summary['classic']['accuracy']:>13.2%} {summary['mbr']['accuracy']:>17.2%}"
-    )
-    print(
-        f"{'Parse rate':<28} {summary['classic']['parse_rate']:>13.2%} {summary['mbr']['parse_rate']:>17.2%}"
-    )
-    print(
-        f"{'Total elapsed (s)':<28} {summary['classic']['time']:>14.2f} {summary['mbr']['time']:>18.2f}"
-    )
+    print(f"{'Metric':<28} {'Value':>18}")
+    print("-" * 48)
+    print(f"{'Test cases':<28} {summary['mbr']['tests']:>18}")
+    print(f"{'Parsed outputs':<28} {summary['mbr']['parsed']:>18}")
+    print(f"{'Exact matches':<28} {summary['mbr']['correct']:>18}")
+    print(f"{'Accuracy':<28} {summary['mbr']['accuracy']:>17.2%}")
+    print(f"{'Parse rate':<28} {summary['mbr']['parse_rate']:>17.2%}")
+    print(f"{'Total elapsed (s)':<28} {summary['mbr']['time']:>18.2f}")
     print(
         f"{'Avg elapsed / test (s)':<28} "
-        f"{summary['classic']['time'] / max(1, summary['classic']['tests']):>14.2f} "
         f"{summary['mbr']['time'] / max(1, summary['mbr']['tests']):>18.2f}"
     )
-    print(
-        f"{'Tokens / sec':<28} {summary['classic']['tps']:>14.2f} {summary['mbr']['tps']:>18.2f}"
-    )
+    print(f"{'Tokens / sec':<28} {summary['mbr']['tps']:>18.2f}")
     print("=" * 80 + "\n")
     return summary
 
@@ -5855,40 +6150,22 @@ def benchmark(
     max_new: int = TARGET_MAX_TOKENS,
 ):
     """
-    Head-to-head:
-      - Classic Para-DFlash (K=1, plain cumprod speculative)
-      - one-million-brains-dflash (K=4, dynamic permutation-based feature-slot allocation - the Fast Million Brains approach)
+    Run one-million-brains-dflash (K=4, permutation-based feature-slot allocation).
     Reports tokens/sec, avg accepted tokens per block, feature reallocation count,
-    and sample text from both modes.
+    and sample text.
     """
     print("\n" + "=" * 80)
-    print(
-        "BENCHMARK: CLASSIC PARA-DFLASH vs MILLION-BRAINS-DFLASH (K=4, Fast Million Brains)"
-    )
+    print("BENCHMARK: MILLION-BRAINS-DFLASH (K=4, Fast Million Brains)")
     print("=" * 80)
     print(f"Prompt (first 180 chars): {prompt[:180]}...")
     print(
         f"Target generation length: {max_new} tokens | Block size: {BLOCK_SIZE} | K: {K}"
     )
+    print(f"vLLM speculative: {_inference_speculative_status(vllm_llm)}")
     print("-" * 80)
 
-    # --- CLASSIC ---
-    print("\n[CLASSIC] Running single-path Para-DFlash baseline ...")
-    t0 = time.perf_counter()
-    classic_res = classic_dflash_generate(
-        vllm_llm,
-        tokenizer,
-        prompt,
-        max_new_tokens=max_new,
-        block_size=max(6, BLOCK_SIZE),
-        seed=SEED,
-    )
-    t_classic = time.perf_counter() - t0
-    classic_tps = classic_res["num_tokens"] / max(1e-6, t_classic)
-
-    # --- MILLION-BRAINS ---
     print(
-        "\n[MILLION-BRAINS] Running full one-million-brains-dflash (permutation allocator + CTSB smoothing + cross-stream integration + adaptive reallocation) ..."
+        "\n[MBR] Running full one-million-brains-dflash (permutation allocator + CTSB smoothing + cross-stream integration + adaptive reallocation) ..."
     )
     t0 = time.perf_counter()
     allocator = PermutationFeatureSlotAllocator(
@@ -5908,67 +6185,46 @@ def benchmark(
     t_mbr = time.perf_counter() - t0
     mbr_tps = mbr_res["num_tokens"] / max(1e-6, t_mbr)
 
-    # --- REPORT ---
     print("\n" + "=" * 80)
     print("RESULTS")
     print("=" * 80)
-
+    print(f"\n{'Metric':<30} {'Value':>22}")
+    print("-" * 54)
+    print(f"{'Generated tokens':<30} {mbr_res['num_tokens']:>22}")
+    print(f"{'Wall time (s)':<30} {t_mbr:>22.2f}")
+    print(f"{'Tokens / sec':<30} {mbr_tps:>22.2f}")
+    print(f"{'Super-blocks executed':<30} {mbr_res['num_superblocks']:>22}")
     print(
-        f"\n{'Metric':<30} {'Classic (K=1)':>18} {'one-million-brains-dflash (K=4)':>22}"
-    )
-    print("-" * 72)
-    print(
-        f"{'Generated tokens':<30} {classic_res['num_tokens']:>18} {mbr_res['num_tokens']:>22}"
-    )
-    print(f"{'Wall time (s)':<30} {t_classic:>18.2f} {t_mbr:>22.2f}")
-    print(f"{'Tokens / sec':<30} {classic_tps:>18.2f} {mbr_tps:>22.2f}")
-    print(
-        f"{'Super-blocks executed':<30} {classic_res['num_superblocks']:>18} {mbr_res['num_superblocks']:>22}"
+        f"{'Avg accepted tokens / block':<30} {mbr_res['avg_accepted_per_block']:>22.2f}"
     )
     print(
-        f"{'Avg accepted tokens / block':<30} {classic_res['avg_accepted_per_block']:>18.2f} {mbr_res['avg_accepted_per_block']:>22.2f}"
+        f"{'Feature reallocations':<30} {mbr_res.get('feature_reallocations', 0):>22}"
     )
-    print(
-        f"{'Feature reallocations':<30} {classic_res.get('feature_reallocations', 0):>18} {mbr_res.get('feature_reallocations', 0):>22}"
-    )
-    print(
-        f"{'Divergence events':<30} {classic_res['reframe_events']:>18} {mbr_res['reframe_events']:>22}"
-    )
+    print(f"{'Divergence events':<30} {mbr_res['reframe_events']:>22}")
     if mbr_res.get("circuit_smoothing_enabled"):
         print(
-            f"{'Avg circuit blend λ':<30} {'n/a':>18} {mbr_res.get('avg_blend_lambda', 1.0):>22.3f}"
+            f"{'Avg circuit blend λ':<30} {mbr_res.get('avg_blend_lambda', 1.0):>22.3f}"
         )
 
-    print("\n--- Sample (Classic) ---")
-    print(
-        classic_res["final_text"][-600:]
-        if len(classic_res["final_text"]) > 600
-        else classic_res["final_text"]
-    )
-    print("\n--- Sample (one-million-brains-dflash) ---")
+    print("\n--- Sample output ---")
     print(
         mbr_res["final_text"][-600:]
         if len(mbr_res["final_text"]) > 600
         else mbr_res["final_text"]
     )
 
-    # Rich diagnostic
-    print("\n[MILLION-BRAINS] Feature allocation history (last 6 super-blocks):")
+    print("\n[MBR] Feature allocation history (last 6 super-blocks):")
     for i, feats in enumerate(mbr_res["feature_history"][-6:]):
         print(f"    SB {len(mbr_res['feature_history']) - 6 + i:02d}: {feats}")
 
-    print("\n[MILLION-BRAINS] Acceptance trajectory (per super-block):")
+    print("\n[MBR] Acceptance trajectory (per super-block):")
     print("   ", [round(a, 3) for a in mbr_res["acceptance_history"][-12:]])
 
     print("\n" + "=" * 80)
     print("BENCHMARK COMPLETE")
     print("=" * 80 + "\n")
 
-    # Return for further programmatic use if needed
-    return {
-        "classic": {**classic_res, "tps": classic_tps, "time": t_classic},
-        "mbr": {**mbr_res, "tps": mbr_tps, "time": t_mbr},
-    }
+    return {"mbr": {**mbr_res, "tps": mbr_tps, "time": t_mbr}}
 
 
 # =============================================================================
@@ -6046,9 +6302,8 @@ if __name__ == "__main__":
     if "demo" in results:
         demo = results["demo"]
         print(
-            "[FINAL][demo] Classic TPS: %.2f | MILLION-BRAINS TPS: %.2f | reallocs: %d | Avg accept: %.2f"
+            "[FINAL][demo] MILLION-BRAINS TPS: %.2f | reallocs: %d | Avg accept: %.2f"
             % (
-                demo["classic"]["tps"],
                 demo["mbr"]["tps"],
                 demo["mbr"].get("feature_reallocations", 0),
                 demo["mbr"]["avg_accepted_per_block"],
@@ -6057,11 +6312,10 @@ if __name__ == "__main__":
     if "arc" in results:
         arc = results["arc"]
         print(
-            "[FINAL][arc] Classic acc: %.2f%% | MBR acc: %.2f%% | tests: %d"
+            "[FINAL][arc] MBR acc: %.2f%% | tests: %d"
             % (
-                arc["classic"]["accuracy"] * 100,
                 arc["mbr"]["accuracy"] * 100,
-                arc["classic"]["tests"],
+                arc["mbr"]["tests"],
             )
         )
 
@@ -6079,16 +6333,9 @@ if __name__ == "__main__":
         }
         if "demo" in results:
             payload["demo"] = {
-                "classic": {
-                    k: v
-                    for k, v in results["demo"]["classic"].items()
-                    if k != "final_text"
-                },
-                "mbr": {
-                    k: v
-                    for k, v in results["demo"]["mbr"].items()
-                    if k != "final_text"
-                },
+                k: v
+                for k, v in results["demo"]["mbr"].items()
+                if k != "final_text"
             }
         if "arc" in results:
             arc_out = dict(results["arc"])
