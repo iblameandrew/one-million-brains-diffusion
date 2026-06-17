@@ -5,207 +5,16 @@ Permutation-Gated Feature-Slot Allocator hard-wired into DiffusionGemma canvas d
 
 Architecture: DiffusionGemma block-diffusion (256-token canvas, iterative denoising) with
 K parallel Million-Brains conditioned trajectories per denoise step — feature-slot allocation,
-CTSB smoothing, cross-stream integration (GroupThinkMask / Synthesizer), and adaptive
-reallocation run inside every denoising iteration (no separate draft model).
+CTSB smoothing, cross-stream integration, cumprod verification, and adaptive reallocation.
 
-Legacy Qwen/DFlash autoregressive + speculative paths remain behind USE_DIFFUSIONGEMMA=False.
-
-This is a complete, self-contained, heavily commented Kaggle script.
-It installs vLLM (DiffusionGemma / gemma runner), loads DiffusionGemma via native vLLM
-diffusion_config + entropy-bound sampler, then runs million_brains_diffusion_denoise_generate
-(K=4 dynamic feature-slot allocation per denoise step).
-
-===============================================================================
-MATHEMATICAL & ARCHITECTURAL OVERVIEW (read this first - educational)
-===============================================================================
-
-Base Para-DFlash Core (generalized speculative / block-parallel drafting):
-- Super-block size M = K * block_size. One "super-block" = K parallel reasoning streams,
-  each stream of length `block_size`.
-- Hierarchical attention inside drafter:
-    * Full (non-causal / bidirectional) attention permitted inside each stream's block.
-    * Causal / ancestor attention between blocks and across the main prefix.
-- One drafter forward (or batched equivalent) produces the entire horizon of M candidate tokens.
-- One target forward on the long candidate sequence(s) produces verification logits / logprobs.
-- Generalized cumprod acceptance: for each parallel candidate we walk left-to-right,
-  at position t compute accept_p = min(1, target_p(token_t) / draft_p(token_t)).
-  Draw u ~ Uniform(0,1). Accept while u < accept_p, else reject-and-stop (or resample).
-  We track a "rolling target hidden" conceptually and advance the main KV offset by the
-  number of accepted tokens (variable per super-block). This is exactly the multi-step
-  speculative acceptance generalized across K branches.
-
-one-million-brains-dflash Permutation-Gated Feature-Slot Allocator (Fast Million Brains approach):
-- This directly implements the Fast Million Brains approach: a compact bank of 12 high-signal
-  personality features is combinatorially permuted at every super-block into K parallel
-  "brains" (feature-slots). By rapidly re-allocating different thinking styles across many
-  simultaneous reasoning streams, we obtain the robustness, creativity, and error-resistance
-  of a million specialized reasoners while keeping the cost close to a single batched drafter
-  forward pass per horizon.
-- Fixed bank of 12 Personality Features (each feature is a direction in representation space
-  with associated sampling biases):
-    ["PreciseAnchor", "CreativeExplorer", "LogicalReasoner", "SelfCritic", "Reframer",
-     "Synthesizer", "DevilAdvocate", "PatternMatcher", "EdgeCaseHunter", "ContextGrounding",
-     "Abstractor", "MirrorReflector"]
-- Allocator: lightweight hash gate (plus optional tiny MLP) that ingests a pooled hidden state
-  from the *previous verification step*. It produces a deterministic permutation (ordered selection
-  without replacement) of K distinct features out of the 12 via combinatorial unranking over
-  the P(12, K) possible injections.
-- The K selected features are assigned to K **feature-slots**. Each parallel drafter stream
-  receives exactly one active feature for that super-block.
-- Injection points inside each super-block:
-    * feature_emb = nn.Embedding(12, hidden_size)       # fixed personality feature vectors
-    * segment_emb + stream_pos_emb (slot_id, local_pos) # Stream-specific positional offsets
-    * hidden = token_emb + segment_emb + feature_emb[feature_slot_ids]
-    * Per-feature gating vectors (elementwise scale/bias applied after cross-stream integration)
-    * Feature-specific temperature / top_p used during the block proposal phase for that slot.
-- Selection is a pure function of the hash of the pooled verification state => the exact same
-  history always yields the exact same sequence of feature-slot allocations.
-
-Token-Level Cross-Stream Integration & Native Parallelism:
-- Two-phase proposal strategy (educational - high-level sampling equivalent here):
-    Phase 1 (Independent Stream Draft): K streams generate their blocks using their currently
-           slotted personality feature (different feature embeddings + feature-specific
-           sampling hyperparameters).
-    Phase 2 (Cross-Stream Integration): After raw proposals exist, a lightweight fusion step
-           combines signals across streams (priority to "Synthesizer" feature if active,
-           otherwise token-wise majority / best under target). In a true kernel patch this
-           phase would run a second forward pass under a custom attention mask permitting
-           controlled information flow between the K feature-slotted streams before the
-           target verification.
-- Stream-specific positional offsets keep the K parallel streams distinguishable even when
-  sharing the same underlying weights.
-
-Circuit Transition Smoothing Block (CTSB, inter-super-block):
-- Discourse State Buffer (DSB): slow EMA of verification pooled state + step structure.
-- Geodesic slot step: at most CTSB_MAX_SLOT_SWAPS feature changes per super-block.
-- SPI/CBF: interpolate sampling params and feature embeddings toward the new circuit.
-- TAFK: stream-level commit selection with discourse coherence + style-jump penalties.
-
-Adaptive Feature Reallocation (Inter-Block):
-- After target verification we record per-slot acceptance rate (accepted_tokens / block_size)
-  for the K currently allocated features.
-- Reallocation: if a feature-slot's exponential-moving-average acceptance falls below threshold,
-  the allocator replaces the feature in that slot by drawing a fresh unused feature from the
-  remaining (12-K) pool on the next super-block. This is combinatorial adaptation driven by
-  measured utility of each personality feature in context.
-- Full super-block rejection: if zero tokens are accepted from the best path, temporarily boost
-  proposal diversity (higher temperatures) on the next block and record the event. In a low-level
-  implementation a control embedding could be added to force a different trajectory.
-
-Permutation Hashing (rigorous core):
-- Let n = NUM_PERSONALITY_FEATURES = 12, k = K = 4.
-- Number of possible ordered allocations = P(n, k) = n! / (n-k)! = 12*11*10*9 = 11880.
-- A 64-bit (or float-derived) seed s obtained from the pooled hidden state of the prior
-  verification step is mapped to a unique injection:
-      rank = s % P(n, k)
-  The rank is decoded via the factorial number system into an ordered K-tuple of distinct
-  feature indices. These indices are assigned to feature-slots 0..K-1 for the current super-block.
-- Because the mapping is deterministic and bijective (within the modulus), every possible
-  stable allocation of features to slots is reachable, the sequence of allocations is fully
-  determined by model state history, and no external randomness is required for the combinatorial
-  choice itself (only for the token sampling that happens inside the active features).
-
-Kaggle rules followed strictly:
-- Starts with !pip install -q vllm transformers accelerate flash-attn --upgrade
-- Immediate robust LIVE EDIT section (file overwrite fallback + runtime sys.modules + subclass)
-- Prints the exact " ONE-MILLION-BRAINS-FLASH INITIALIZED " banner.
-- Easy toggles at the very top after shebang/imports.
-- Ends with MBR benchmark: tokens/sec, avg accepted tokens, feature-slot reallocation
-  count, allocator decisions, and generated samples.
-
-Ready to paste into a Kaggle Python script kernel or notebook cell block.
-GPU: T4 / L4 / A10 / A100 all work (uses 1.5B-3B class models by default for headroom).
+Kaggle: attach Models input google/diffusiongemma, run as script or notebook cell.
 """
-
-# =============================================================================
-# KAGGLE INSTALL - must be the first executable line when pasted into notebook
-# The literal "!pip ..." line below is REQUIRED by the spec for notebook paste.
-# When this .py is executed directly (plain python / Kaggle script kernel),
-# the guard below performs the equivalent install so the file stays self-contained.
-# =============================================================================
-# !pip install -q "transformers>=4.57" safetensors accelerate vllm kagglehub huggingface_hub --upgrade
-import os
-import sys
-
-
-def _is_mbr_worker_subprocess() -> bool:
-    """True when spawned as a voter-pool worker (must keep stdout JSON-only)."""
-    return (
-        os.environ.get("MBR_AGENT_WORKER") == "1"
-        or "--mbr-agent-worker" in sys.argv
-    )
-
-
-_MBR_WORKER_SUBPROCESS = _is_mbr_worker_subprocess()
-if _MBR_WORKER_SUBPROCESS:
-    os.environ.setdefault("PYDEVD_DISABLE_FILE_VALIDATION", "1")
-    os.environ.setdefault("PYTHONWARNINGS", "ignore")
-    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-
-try:
-    import IPython
-
-    _in_notebook = IPython.get_ipython() is not None
-except Exception:
-    _in_notebook = False
-
-if not _in_notebook and not _MBR_WORKER_SUBPROCESS:
-    # Direct execution path (plain .py or Kaggle "Script" kernel): do real install
-    import subprocess, sys
-
-    try:
-        print("[INSTALL] Running pip via subprocess (plain-Python execution path)...")
-        subprocess.check_call(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "-q",
-                "transformers>=4.57",
-                "safetensors",
-                "accelerate",
-                "vllm",
-                "--upgrade",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as _inst_e:
-        print(
-            "[INSTALL] Subprocess pip skipped/failed (packages may already exist):",
-            _inst_e,
-        )
-elif not _MBR_WORKER_SUBPROCESS:
-    # Notebook path: pip is usually run via the !pip magic line, but also try subprocess so
-    # kagglehub is available for Kaggle-native model download when huggingface.co DNS fails.
-    import subprocess
-
-    try:
-        subprocess.check_call(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "-q",
-                "transformers>=4.57",
-                "safetensors",
-                "kagglehub",
-                "huggingface_hub",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        pass
 
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-19-diffusion-b"  # Kaggle Models path for DiffusionGemma
+SCRIPT_VERSION = "2026-06-19-diffusion-c"  # removed speculative/DFlash legacy
 # --- DiffusionGemma core (default engine) ---
-USE_DIFFUSIONGEMMA = True  # True = DiffusionGemma denoising + MBR conditioning (no DFlash draft)
 # Kaggle: Add Input -> Models -> google/diffusiongemma -> diffusiongemma-26b-a4b-it
 KAGGLE_DIFFUSIONGEMMA_DIR = (
     "/kaggle/input/models/google/diffusiongemma/transformers/diffusiongemma-26b-a4b-it/1"
@@ -222,13 +31,10 @@ DIFFUSION_DENOISE_CHUNK = 6  # tokens committed per denoise step (= legacy BLOCK
 K = 4  # Million-Brains parallel trajectories per denoise step (not ARC hypothesis count)
 ARC_HYPOTHESIS_SLOTS = 8  # ARC eval: batched hypothesis proposals per engine (vLLM shows N/N)
 NUM_PERSONALITY_FEATURES = 12  # personality / spatial primitive bank for allocator
-# --- DFlash / speculative decoding: PERMANENTLY DISABLED (DiffusionGemma replaces draft path) ---
-ENABLE_DFLASH_LIVE_PATCH = False  # never enable — DFlash monkey-patches removed from hot path
-ENABLE_VLLM_SPECULATIVE_DECODING = False  # never enable — no draft_model / DFlash spec
 ARC_FORCE_ENABLE_THINKING = False  # Step 2: never emit Qwen3.5 </think> chains in ARC
 ARC_GUIDED_JSON_DECODING = True  # Step 3: vLLM guided JSON for grid outputs
 ARC_SPATIAL_GRID_ENSEMBLE = True  # Step 4: Phase1=8 grid hypotheses, Phase2=pixel majority vote
-BLOCK_SIZE = DIFFUSION_DENOISE_CHUNK if USE_DIFFUSIONGEMMA else 6  # tokens per denoise step / super-block
+BLOCK_SIZE = DIFFUSION_DENOISE_CHUNK  # tokens committed per denoise step / super-block
 MAX_SUPERBLOCKS = 32  # safety cap on super-blocks
 ENABLE_FEATURE_REALLOCATION = True  # master switch for adaptive reallocation of features into slots based on acceptance
 ACCEPTANCE_THRESHOLD = 0.28  # below this a feature-slot is considered underperforming and eligible for reallocation
@@ -257,36 +63,19 @@ CTSB_COHERENCE_KAPPA = 0.12  # TAFK bonus for features continuing from previous 
 ANCHOR_SLOT = 0  # slot 0 receives extra smoothing inertia (stable chain scribe)
 # Local/offline model paths (Kaggle: attach a HF dataset or pre-download to /kaggle/working)
 PREFER_LOCAL_MODELS = True  # try /kaggle/input + /kaggle/working before any HuggingFace request
-# Kaggle notebook input root (Add Input -> Notebooks -> godelcomplete/qwen3-5-4b-dflash)
-KAGGLE_QWEN_BUNDLE_ROOT = "/kaggle/input/notebooks/godelcomplete/qwen3-5-4b-dflash"
-LOCAL_MODEL_PATH = KAGGLE_QWEN_BUNDLE_ROOT
-LOCAL_BASE_DIR = f"{KAGGLE_QWEN_BUNDLE_ROOT}/Qwen3.5-4B"  # BASE Qwen — generation target (NOT draft)
-LOCAL_DFLASH_DIR = f"{KAGGLE_QWEN_BUNDLE_ROOT}/Qwen3.5-4B-DFlash"  # DFlash draft only
-BASE_BUNDLE_DIR_NAMES = frozenset({"qwen3.5-4b", "qwen3-5-4b"})
-DRAFT_BUNDLE_DIR_NAMES = frozenset({"qwen3.5-4b-dflash", "qwen3-5-4b-dflash"})
-# vLLM load safety for custom DFlash / Qwen3.5 checkpoints (avoid pooling + torch.compile crash)
+# Local model path override (optional; DiffusionGemma resolved via KAGGLE_DIFFUSIONGEMMA_DIR)
+LOCAL_MODEL_PATH = KAGGLE_DIFFUSIONGEMMA_DIR
 VLLM_ENFORCE_EAGER = False  # prefer CUDA graphs; load loop retries enforce_eager=True on failure
 VLLM_RUNNER = "generate"  # do not let vLLM pick pooling/embedding runner
 VLLM_FALLBACK_TO_HF = True  # HuggingFace wrapper if vLLM still cannot load the checkpoint
-VLLM_GPU_MEMORY_UTILIZATION = 0.88  # base-only fallback; spec uses VLLM_SPEC_GPU_MEMORY_UTILIZATION
+VLLM_GPU_MEMORY_UTILIZATION = 0.88  # HF fallback only; DiffusionGemma uses DIFFUSION_GPU_UTIL
 VLLM_TENSOR_PARALLEL_SIZE = 0  # 0=auto (retry with tp=2 when 2+ GPUs visible)
-# Legacy speculative knobs (inactive when USE_DIFFUSIONGEMMA=True; kept for API compat only)
-VLLM_REQUIRE_SPECULATIVE = False  # must stay False on Kaggle — spec attempts loop-crash the kernel
-VLLM_SINGLE_ENGINE_SPECULATIVE = False  # only skips multi-agent when native vLLM spec is ON
-VLLM_LANGUAGE_MODEL_ONLY = True  # Qwen3.5 text-only: skip vision encoder; required for draft_model spec on stock vLLM
-VLLM_SPECULATIVE_METHOD = "auto"  # auto: dflash if vLLM supports it, else draft_model (stock Kaggle vLLM)
-VLLM_NUM_SPECULATIVE_TOKENS = BLOCK_SIZE  # DFlash block width per speculation step
-VLLM_SPEC_GPU_MEMORY_UTILIZATION = 0.90  # draft+target needs ~90% of 22GB L4 (0.70 left no room for draft)
-VLLM_SPEC_DRAFT_GPU_UTIL_SCALE = 1.0  # do not shrink util for target+draft
-VLLM_SPEC_MAX_MODEL_LEN = 16384  # cap KV for spec load (prompt resolver shrinks; 22272 OOMs with draft on L4)
-VLLM_SPEC_PREFER_TENSOR_PARALLEL = 1  # tp=1 first (tp=2 spawns NCCL workers that spam logs on Kaggle)
-VLLM_SPEC_TRY_SMALLEST_CONTEXT_FIRST = True  # 8192→16384 ascending; fits draft+target before huge KV reserve
 PREFER_HF_INFERENCE = False  # L4/A10+: prefer vLLM fast kernels; HF only on load failure
 SKIP_VLLM_FOR_QWEN35 = False  # attempt vLLM for Qwen3.5-4B (set True on broken vLLM hosts)
-AUTO_PREFETCH_TO_WORKING = True  # when online, cache a small Qwen checkpoint into /kaggle/working
-PREFETCH_MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"  # safe default for T4/L4 (22 GB)
-KAGGLEHUB_MODEL_HANDLE = "qwen-lm/qwen2.5/transformers/1.5b-instruct"  # Kaggle Models (no huggingface.co DNS needed)
-KAGGLE_DATASET_HANDLE = "ragnar123/qwen2-5-1-5b"  # optional dataset fallback on Kaggle
+AUTO_PREFETCH_TO_WORKING = True  # when online, try to cache DiffusionGemma into /kaggle/working
+PREFETCH_MODEL_ID = DIFFUSIONGEMMA_MODEL_PRIMARY
+KAGGLEHUB_MODEL_HANDLE = ""  # set if you publish DiffusionGemma on Kaggle Models
+KAGGLE_DATASET_HANDLE = ""  # optional dataset fallback on Kaggle
 # ---------------------------------------------------------------------------
 # ARC DATA — copy-paste into Kaggle:
 #   1) Add competition input "arc-prize-2026-arc-agi-2"
@@ -304,7 +93,7 @@ LOCAL_ARC_DATA_DIR = "data"
 EVAL_CHALLENGES_PATH = None
 EVAL_SOLUTIONS_PATH = None
 EVAL_MAX_TASKS = None  # cap tasks for smoke tests; None = all tasks in challenges file
-EVAL_MAX_NEW_TOKENS = 512  # per-task budget for token-speculative ARC path
+EVAL_MAX_NEW_TOKENS = 512  # per-task generation budget for ARC eval
 ARC_VISUAL_GRADING = True  # print + display a grade card for every test case
 ARC_PRINT_ALL_ANSWERS = True  # print every prediction vs ground-truth JSON for every test case
 # Real-time streaming — prints every token and all model/MBR activity as it happens
@@ -339,11 +128,10 @@ ARC_FINAL_HYP_CHAR_CAPS = (360, 200, 120, 60, 0)  # shrink hypothesis text in fi
 ARC_HYPOTHESIS_ENABLE_THINKING = False  # False = fast text rules (True + thinking can stall tqdm at 0/N for minutes)
 ARC_HYPOTHESIS_THINKING_TOKEN_CAP = 512  # per-slot cap when hypothesis thinking is enabled
 ARC_FINAL_ENABLE_THINKING = False  # final grid: [[ prefill + greedy JSON (much faster than thinking pass)
-# Multi-agent layer: N independent Qwen instances (1 per GPU, round-robin) + plurality vote on final grid.
-ARC_MULTI_AGENT_ENABLED = True  # plurality vote across N independent Qwen workers
+# Multi-agent layer: N independent DiffusionGemma workers (1 per GPU) + plurality vote on final grid.
+ARC_MULTI_AGENT_ENABLED = True  # plurality vote across N independent voter workers
 ARC_MULTI_AGENT_REQUIRED = True  # ARC eval: never silently fall back to single engine
 ARC_MULTI_AGENT_N = 4  # 1/GPU on 4x L4 (5+ shares VRAM → KV OOM); raise only with 18i worker caps
-ARC_MULTI_AGENT_DISABLE_SPECULATIVE = True  # base-only per agent — spec+draft OOMs at 2 engines/GPU
 ARC_MULTI_AGENT_GPU_UTIL = 0.0  # 0 = auto (~0.88 / ceil(N / num_gpus)) per engine
 ARC_WORKER_VLLM_MAX_MODEL_LEN = 10240  # 30x30 terse prompts need ~9600 tok (8192 too small)
 ARC_WORKER_VLLM_GPU_UTIL_CAP = 0.70  # headroom for KV at 8k ctx (0.88 OOMs)
@@ -420,46 +208,6 @@ _suppress_noisy_third_party_logs()
 # Heavy libraries (installed above)
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from vllm import LLM, SamplingParams
-
-
-def _resolve_vllm_draft_module():
-    """
-    Locate vLLM's draft/spec-decode module across API versions.
-
-    Legacy vLLM (<=0.6): vllm.spec_decode.draft_model (DraftModel)
-    Current vLLM (v1 engine): vllm.v1.spec_decode.draft_model (DraftModelProposer)
-    """
-    import importlib
-    import types
-
-    candidates = (
-        "vllm.spec_decode.draft_model",
-        "vllm.v1.spec_decode.draft_model",
-        "vllm.v1.spec_decode",
-    )
-    for mod_path in candidates:
-        try:
-            return importlib.import_module(mod_path)
-        except ModuleNotFoundError:
-            continue
-
-    if not _MBR_WORKER_SUBPROCESS:
-        print(
-            "[IMPORT] vLLM draft module not found (tried "
-            + ", ".join(candidates)
-            + "); using in-process stub for live-edit fallback."
-        )
-    stub = types.ModuleType("vllm_draft_stub")
-    sys.modules.setdefault("vllm.spec_decode.draft_model", stub)
-    return stub
-
-
-if ENABLE_DFLASH_LIVE_PATCH:
-    vllm_draft_module = _resolve_vllm_draft_module()  # for live patching target
-else:
-    import types as _types
-
-    vllm_draft_module = _types.ModuleType("vllm_draft_stub_disabled")
 
 # =============================================================================
 # FIXED BANK OF 12 PERSONALITY FEATURES
@@ -1068,7 +816,7 @@ class CircuitTransitionSmoother:
 @dataclass
 class GroupThinkMask:
     """
-    In a real kernel patch (inside DFlashDraftModel or a custom attention forward)
+    In a future kernel integration (custom attention forward inside the denoiser)
     we would build a 4-D mask (or use a custom FlashAttention kernel) with:
         - Phase 1 (draft): block-diagonal + causal prefix. Each of the K agents
           sees its own history + its own block with full (non-causal) attention.
@@ -1104,7 +852,7 @@ class GroupThinkMask:
 
 
 # =============================================================================
-# CUMPROD ACCEPTANCE (core speculative primitive, generalized to K paths)
+# CUMPROD ACCEPTANCE (MBR verification primitive for K parallel trajectories)
 # =============================================================================
 def compute_accepted_tokens(
     draft_token_ids: List[int],
@@ -1113,7 +861,7 @@ def compute_accepted_tokens(
     min_accept: float = 1e-6,
 ) -> Tuple[List[int], float]:
     """
-    Walk the proposed block left-to-right performing the classic speculative test.
+    Walk the proposed block left-to-right performing cumprod acceptance vs target logprobs.
 
     accept_p = min( 1.0 , target_p / max(draft_p, eps) )
     u ~ uniform
@@ -1142,7 +890,7 @@ def compute_accepted_tokens(
         if u < accept_p:
             accepted.append(tid)
         else:
-            # In full speculative we would draw a new token from (target - draft) here.
+            # Resample-from-adjusted-distribution step omitted in this orchestration layer.
             # For the benchmark we simply stop the block (conservative, easy to measure).
             break
     rate = len(accepted) / max(1, len(draft_token_ids))
@@ -1690,6 +1438,9 @@ def million_brains_diffusion_denoise_generate(
 # =============================================================================
 # ONE-MILLION-BRAINS GENERATE (compat wrapper + legacy autoregressive path)
 # =============================================================================
+# =============================================================================
+# ONE-MILLION-BRAINS GENERATE (public API — DiffusionGemma conditioned denoising)
+# =============================================================================
 def million_brains_dflash_generate(
     vllm_llm: LLM,
     tokenizer: Any,
@@ -1704,36 +1455,8 @@ def million_brains_dflash_generate(
     verbose: bool = STREAM_ALL_OUTPUT,
     arc_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    Full one-million-brains-dflash loop (permutation-driven feature-slot allocation).
-
-    - Uses vLLM for fast batched proposal across K feature-slotted streams
-      (the "drafter forward" for the entire super-block horizon).
-    - Uses vLLM prompt_logprobs for the target verification forward on the K candidate sequences.
-    - The PermutationFeatureSlotAllocator selects a fresh K-permutation of personality features
-      for every super-block based on the pooled state of the previous verification.
-    - CircuitTransitionSmoother (CTSB) interpolates circuit handoffs for semantic coherence.
-    - Adaptive reallocation: under-performing feature-slots have their personality feature
-      replaced from the unused pool on subsequent blocks.
-    - This realizes the Fast Million Brains approach at inference time.
-    - Returns rich stats + final text.
-    """
-    if USE_DIFFUSIONGEMMA:
-        return million_brains_diffusion_denoise_generate(
-            vllm_llm,
-            tokenizer,
-            prompt,
-            max_new_tokens=max_new_tokens,
-            k=k,
-            block_size=block_size,
-            allocator=allocator,
-            enable_reallocation=enable_reallocation,
-            enable_smoothing=enable_smoothing,
-            seed=seed,
-            verbose=verbose,
-            arc_context=arc_context,
-        )
-    return _million_brains_autoregressive_generate(
+    """Million-Brains conditioned DiffusionGemma denoising (compat entry point)."""
+    return million_brains_diffusion_denoise_generate(
         vllm_llm,
         tokenizer,
         prompt,
@@ -1749,707 +1472,6 @@ def million_brains_dflash_generate(
     )
 
 
-def _million_brains_autoregressive_generate(
-    vllm_llm: LLM,
-    tokenizer: Any,
-    prompt: str,
-    max_new_tokens: int = 128,
-    k: int = 4,
-    block_size: int = 6,
-    allocator: Optional[PermutationFeatureSlotAllocator] = None,
-    enable_reallocation: bool = True,
-    enable_smoothing: bool = ENABLE_CIRCUIT_SMOOTHING,
-    seed: int = 42,
-    verbose: bool = STREAM_ALL_OUTPUT,
-    arc_context: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Legacy Qwen autoregressive + cumprod acceptance (USE_DIFFUSIONGEMMA=False)."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    if allocator is None:
-        allocator = PermutationFeatureSlotAllocator(
-            internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=k
-        )
-
-    smoother = (
-        CircuitTransitionSmoother(k=k, allocator=allocator)
-        if enable_smoothing
-        else None
-    )
-
-    # State
-    current_text = prompt
-    generated_ids: List[int] = []
-    total_accepted = 0
-    total_blocks = 0
-    feature_reallocations = 0
-    acceptance_history: List[float] = []
-    feature_history: List[List[str]] = []
-    reframe_events = 0
-    prev_acceptance_rate = 0.5
-    prev_accepted_len = 0
-
-    # Per-slot EMA acceptance (used to decide when to re-allocate a different personality feature)
-    ema_accept = [0.5] * k
-    # Bootstrap: initial allocation is simply the first K features (will be overridden by the allocator immediately)
-    active_feature_indices: List[int] = list(range(k))
-
-    max_blocks = (max_new_tokens // max(1, block_size)) + 4
-    arc_test_input = (arc_context or {}).get("test_input")
-    arc_gold = (arc_context or {}).get("gold")
-    arc_task_id = str((arc_context or {}).get("task_id") or "")
-
-    if verbose or STREAM_ALL_OUTPUT:
-        stream_log(
-            f"[MBR] start k={k} block_size={block_size} max_new_tokens={max_new_tokens} "
-            f"smoothing={enable_smoothing}"
-        )
-        if isinstance(vllm_llm, HFGenerateEngine):
-            stream_log(
-                "[MBR] HF-fallback: ~"
-                f"{(max_new_tokens // max(1, block_size) + 4) * (k + 1)} "
-                "verify forwards/task"
-            )
-
-    for sb in range(max_blocks):
-        if len(generated_ids) >= max_new_tokens:
-            break
-        total_blocks += 1
-
-        # 1) Allocator decision (permutation of personality features into feature-slots)
-        pooled = make_pooled_state(generated_ids, sb, tokenizer=tokenizer)
-        alloc_out = allocator(pooled, sb)
-        target_feature_indices = alloc_out["feature_indices"]
-        target_feature_names = alloc_out["feature_names"]
-        feature_history.append(target_feature_names)
-
-        # 1b) CTSB: geodesic slot step + SPI/CBF smoothing before drafting
-        blend_lambda = 1.0
-        if smoother is not None:
-            full_rejection = prev_accepted_len == 0 and sb > 0
-            (
-                active_feature_indices,
-                feature_params,
-                blend_lambda,
-                _smoothed_vecs,
-            ) = smoother.prepare_block(
-                allocator,
-                pooled,
-                target_feature_indices,
-                prev_acceptance_rate,
-                prev_accepted_len,
-                full_rejection,
-            )
-            active_feature_names = [
-                PERSONALITY_FEATURES[i] for i in active_feature_indices
-            ]
-        else:
-            active_feature_indices = target_feature_indices
-            active_feature_names = target_feature_names
-            feature_params = allocator.get_feature_params(active_feature_indices)
-
-        # 2) Independent Draft phase (K parallel proposals via vLLM batch)
-        #    One batched "drafter forward" for the whole super-block horizon, each stream
-        #    conditioned on its currently allocated personality feature.
-        draft_sampling = []
-        for i in range(k):
-            p = feature_params[i]
-            sp = SamplingParams(
-                temperature=p["temperature"]
-                + (
-                    REFRAME_TEMP_BOOST
-                    if reframe_events > 0 and sb == total_blocks - 1
-                    else 0.0
-                ),
-                top_p=p["top_p"],
-                max_tokens=block_size,
-                logprobs=1,
-                stop_token_ids=None,
-            )
-            setattr(sp, "stream_label", f"MBR-draft/slot{i}/{active_feature_names[i]}")
-            draft_sampling.append(sp)
-
-        # vLLM handles the heterogeneous batched drafting efficiently.
-        outs = vllm_llm.generate([current_text] * k, draft_sampling)
-        proposals: List[List[int]] = []
-        draft_lps: List[List[float]] = []
-        for slot_i, out in enumerate(outs):
-            if not out.outputs:
-                proposals.append([])
-                draft_lps.append([])
-                continue
-            completion = out.outputs[0]
-            tok_ids = list(completion.token_ids)[:block_size]
-            lps = []
-            if completion.logprobs:
-                for tid in tok_ids:
-                    lp = extract_logprob_for_token(
-                        completion.logprobs[-len(tok_ids) :], tid
-                    )
-                    lps.append(lp)
-            else:
-                lps = [-0.7] * len(tok_ids)
-            proposals.append(tok_ids)
-            draft_lps.append(lps)
-            if verbose or STREAM_ALL_OUTPUT:
-                draft_txt = tokenizer.decode(tok_ids, skip_special_tokens=True)
-                feat_name = (
-                    active_feature_names[slot_i]
-                    if slot_i < len(active_feature_names)
-                    else f"slot{slot_i}"
-                )
-                stream_log(
-                    f"  [DRAFT slot {slot_i}] {feat_name}: {draft_txt!r}"
-                )
-                if arc_context and ARC_PRINT_STEP_MATRICES:
-                    draft_full = current_text + draft_txt
-                    print_mbr_slot_inference_state(
-                        sb=sb,
-                        phase="draft",
-                        slot_i=slot_i,
-                        feature_name=feat_name,
-                        test_input=arc_test_input,
-                        gold=arc_gold,
-                        assistant_suffix=_assistant_suffix(draft_full, prompt),
-                        task_id=arc_task_id,
-                    )
-
-        # 3) Cross-stream integration / fusion phase (the high-level "Group Think")
-        #    CTSB enabled: anchor-stream fused candidate (coherent, no per-token splicing).
-        #    Legacy: Synthesizer priority or position-wise majority vote.
-        fused_proposal: List[int] = []
-        if smoother is not None:
-            anchor = min(ANCHOR_SLOT, len(proposals) - 1)
-            fused_proposal = list(proposals[anchor][:block_size])
-        else:
-            synth_idx = None
-            for idx, name in enumerate(active_feature_names):
-                if name == "Synthesizer":
-                    synth_idx = idx
-                    break
-            for pos in range(block_size):
-                cands = [pr[pos] for pr in proposals if len(pr) > pos]
-                if not cands:
-                    break
-                if synth_idx is not None and len(proposals[synth_idx]) > pos:
-                    fused_proposal.append(proposals[synth_idx][pos])
-                else:
-                    cnt = Counter(cands)
-                    fused_proposal.append(cnt.most_common(1)[0][0])
-            if len(fused_proposal) < block_size:
-                fused_proposal += proposals[0][len(fused_proposal) : block_size]
-
-        # 4) Target verification forward on the K candidate sequences (+ fused)
-        #    Single batched call giving us the target's view of every drafted token.
-        candidates_for_verify = []
-        base = current_text
-        for pr in proposals:
-            append_text = tokenizer.decode(pr, skip_special_tokens=True)
-            candidates_for_verify.append(base + append_text)
-        fused_text = tokenizer.decode(fused_proposal, skip_special_tokens=True)
-        candidates_for_verify.append(base + fused_text)
-
-        verify_params = make_target_verify_sampling_params()
-        setattr(verify_params, "stream_label", f"MBR-verify/sb{sb}")
-        setattr(verify_params, "verify_only", True)
-        setattr(verify_params, "verify_tail_tokens", block_size + 4)
-        verify_outs = vllm_llm.generate(candidates_for_verify, verify_params)
-
-        # Extract target logprobs for the drafted region of each candidate
-        target_lps_per_path: List[List[float]] = []
-        for j, vout in enumerate(verify_outs):
-            target_ids = proposals[j] if j < len(proposals) else fused_proposal
-            drafted_lps = extract_target_logprobs_for_draft(
-                vout.prompt_logprobs, target_ids
-            )
-            target_lps_per_path.append(drafted_lps)
-
-        # 5) Run generalized cumprod acceptance on every path
-        best_accepted: List[int] = []
-        best_rate = -1.0
-        path_rates: List[float] = []
-        accepted_per_path: List[List[int]] = []
-
-        for j in range(k):
-            acc, rate = compute_accepted_tokens(
-                proposals[j],
-                target_lps_per_path[j],
-                draft_lps[j],
-            )
-            path_rates.append(rate)
-            accepted_per_path.append(acc)
-            if smoother is None and rate > best_rate:
-                best_rate = rate
-                best_accepted = acc
-
-        # Also test the fused candidate
-        acc_f, rate_f = compute_accepted_tokens(
-            fused_proposal,
-            target_lps_per_path[-1],
-            draft_lps[0],
-        )
-
-        if smoother is not None:
-            path_idx, _, _, path_kind = smoother.select_commit_path(
-                proposals,
-                path_rates,
-                active_feature_indices,
-                fused_proposal,
-                rate_f,
-                ema_accept,
-            )
-            if path_kind == "fused":
-                best_accepted = acc_f
-                best_rate = rate_f
-            else:
-                best_accepted = accepted_per_path[path_idx]
-                best_rate = path_rates[path_idx]
-        elif rate_f > best_rate:
-            best_accepted = acc_f
-            best_rate = rate_f
-
-        # 6) Commit accepted tokens, update main sequence + rolling offset
-        accepted_len = len(best_accepted)
-        if accepted_len > 0:
-            new_ids = best_accepted
-            append_text = tokenizer.decode(new_ids, skip_special_tokens=True)
-            if is_degenerate_arc_token_run(append_text):
-                if verbose or STREAM_ALL_OUTPUT:
-                    stream_log(
-                        f"  [MBR-SKIP] sb={sb:02d} degenerate commit: {append_text!r}"
-                    )
-                accepted_len = 0
-            else:
-                generated_ids.extend(new_ids)
-                current_text = current_text + append_text
-                total_accepted += accepted_len
-                if verbose or STREAM_ALL_OUTPUT:
-                    stream_log(
-                        f"  [COMMIT sb={sb:02d} +{accepted_len} tok] {append_text!r}"
-                    )
-                    for tid in new_ids:
-                        stream_emit(
-                            tokenizer.decode([tid], skip_special_tokens=False)
-                        )
-                    print(flush=True)
-                if arc_context and ARC_PRINT_STEP_MATRICES:
-                    print_mbr_slot_inference_state(
-                        sb=sb,
-                        phase="commit",
-                        slot_i=None,
-                        feature_name="committed",
-                        test_input=arc_test_input,
-                        gold=arc_gold,
-                        assistant_suffix=_assistant_suffix(current_text, prompt),
-                        task_id=arc_task_id,
-                    )
-        acceptance_history.append(best_rate)
-        prev_acceptance_rate = best_rate
-        prev_accepted_len = accepted_len
-
-        if smoother is not None:
-            smoother.update_discourse(
-                pooled, generated_ids, best_accepted, current_text
-            )
-            smoother.post_block_update(
-                active_feature_indices,
-                feature_params,
-                best_accepted,
-                generated_ids,
-            )
-
-        # 7) Adaptive feature reallocation (the "Mirror" mechanism, stripped of astrology)
-        if enable_reallocation:
-            for i in range(k):
-                ema_accept[i] = 0.7 * ema_accept[i] + 0.3 * path_rates[i]
-
-            for i in range(k):
-                if ema_accept[i] < ACCEPTANCE_THRESHOLD:
-                    # Draw a replacement from the currently unused personality features.
-                    unused = [
-                        r
-                        for r in range(NUM_PERSONALITY_FEATURES)
-                        if r not in active_feature_indices
-                    ]
-                    if unused:
-                        new_feat = unused[(sb * 31 + i) % len(unused)]
-                        old_name = PERSONALITY_FEATURES[active_feature_indices[i]]
-                        active_feature_indices[i] = new_feat
-                        feature_reallocations += 1
-                        ema_accept[i] = 0.55
-                        if verbose:
-                            print(
-                                f"  [REALLOC] Slot {i} feature {old_name} -> "
-                                f"{PERSONALITY_FEATURES[new_feat]} (EMA accept {ema_accept[i]:.3f})"
-                            )
-
-        # 8) Full rejection handling (equivalent to "Reframe")
-        if accepted_len == 0 and enable_reallocation:
-            reframe_events += 1
-            if verbose:
-                print(
-                    f"  [DIVERGENCE] Super-block {sb} produced zero accepted tokens. "
-                    "Boosting proposal diversity for next block."
-                )
-
-        # 9) Diagnostic logging (feature-slot view)
-        if verbose or STREAM_ALL_OUTPUT:
-            gmask = GroupThinkMask(
-                k=k,
-                block_size=block_size,
-                phase="integration" if accepted_len > 0 else "draft",
-            )
-            smooth_note = (
-                f" | λ={blend_lambda:.2f}"
-                if smoother is not None
-                else ""
-            )
-            stream_log(
-                f"    Super-block {sb:02d} | features={active_feature_names} | "
-                f"accepted={accepted_len}/{block_size} | rates={[f'{r:.2f}' for r in path_rates]}"
-                f"{smooth_note} | fused_rate={rate_f:.2f} | mask={gmask.describe()}"
-            )
-
-        if arc_gold and ARC_STRUCTURED_THINKING:
-            hyp, _, _ = parse_hypothesis_grid_from_thinking(
-                _assistant_suffix(current_text, prompt)
-            )
-            if hyp is not None:
-                gh, gw = len(arc_gold), len(arc_gold[0]) if arc_gold else 0
-                if len(hyp) == gh and (hyp[0] if hyp else []) and len(hyp[0]) == gw:
-                    if all(
-                        isinstance(cell, int)
-                        for row in hyp
-                        for cell in row
-                    ):
-                        if verbose or STREAM_ALL_OUTPUT:
-                            stream_log(
-                                f"  [MBR-DONE] sb={sb:02d} complete hypothesis "
-                                f"{_grid_shape_label(hyp)} — stopping early"
-                            )
-                        break
-
-        if len(generated_ids) >= max_new_tokens:
-            break
-
-    final_text = current_text
-    tokens_per_block = total_accepted / max(1, total_blocks)
-
-    return {
-        "final_text": final_text,
-        "generated_ids": generated_ids,
-        "num_tokens": len(generated_ids),
-        "num_superblocks": total_blocks,
-        "total_accepted": total_accepted,
-        "avg_accepted_per_block": tokens_per_block,
-        "feature_reallocations": feature_reallocations,
-        "acceptance_history": acceptance_history,
-        "feature_history": feature_history,
-        "reframe_events": reframe_events,
-        "circuit_smoothing_enabled": enable_smoothing,
-        "avg_blend_lambda": (
-            float(np.mean(smoother.state.lambda_history))
-            if smoother and smoother.state.lambda_history
-            else 1.0
-        ),
-        "effective_feature_history": (
-            smoother.state.effective_feature_history if smoother else feature_history
-        ),
-    }
-
-
-# =============================================================================
-# ONEMILLIONBRAINSDFLASHDRAFTMODEL (module-level so patcher and file-injection can always see it)
-# =============================================================================
-class MillionBrainsDFlashDraftModel:
-    """
-    DEPRECATED — retained for import compat only.
-    DiffusionGemma path uses million_brains_diffusion_denoise_generate(); DFlash draft
-    monkey-patches are permanently disabled (ENABLE_DFLASH_LIVE_PATCH=False).
-    """
-
-    def __init__(self, *args, **kwargs):
-        self.k = K
-        self.block_size = BLOCK_SIZE
-        self.enable_reallocation = ENABLE_FEATURE_REALLOCATION
-        self.feature_allocator = None  # filled by _live_edit_dflash
-        print(
-            "[MillionBrainsDFlashDraftModel] Stand-in initialized (full feature-slot allocator injected at runtime)"
-        )
-
-    def propose_with_allocator(self, pooled_state, step):
-        if self.feature_allocator is not None:
-            return self.feature_allocator(pooled_state, step)
-        return list(range(min(self.k, NUM_PERSONALITY_FEATURES)))
-
-
-# =============================================================================
-# LIVE EDIT / MONKEY-PATCH SECTION (the "preemptive" DFlash injection)
-# This must run immediately after the pip install and before heavy model loading.
-# Strategy:
-#   1. Attempt to locate vllm.spec_decode / vllm.v1.spec_decode draft_model on disk and surgically
-#      overwrite key classes / methods with one-million-brains-dflash versions (file fallback).
-#   2. Always perform runtime monkey-patching via subclass + module replacement.
-#   3. Inject a global "MILLION_BRAINS_DFLASH" symbol so user code can detect the patch.
-#   4. Emit the exact "ONE-MILLION-BRAINS-FLASH INITIALIZED" banner on success.
-# =============================================================================
-def _live_edit_dflash() -> bool:
-    """
-    Robust live-edit routine. Returns True if any patch (file or runtime) succeeded.
-    Performs the one-million-brains-dflash injection into vLLM's draft mechanisms.
-    """
-    patched = False
-    print(
-        "\n[PREEMPTIVE DFLASH LIVE-EDIT] Scanning for DFlashDraftModel / vLLM draft components (one-million-brains-dflash injection)..."
-    )
-
-    # --- Step 1: File-level overwrite (fallback when source is writable) ---
-    try:
-        import vllm
-
-        vllm_dir = os.path.dirname(vllm.__file__)
-        candidate_files = []
-        for root, _, files in os.walk(vllm_dir):
-            for f in files:
-                if "draft" in f.lower() and f.endswith(".py"):
-                    candidate_files.append(os.path.join(root, f))
-                if "spec_decode" in root and f.endswith(".py"):
-                    candidate_files.append(os.path.join(root, f))
-
-        # De-duplicate while preserving order
-        seen = set()
-        candidate_files = [x for x in candidate_files if not (x in seen or seen.add(x))]
-
-        target_file = None
-        for cf in candidate_files:
-            try:
-                with open(cf, "r", encoding="utf-8", errors="ignore") as fh:
-                    content = fh.read()
-                if "class DraftModel" in content or "DraftModel" in content:
-                    target_file = cf
-                    break
-            except Exception:
-                continue
-
-        if target_file:
-            print(f"    Found candidate DFlash source: {target_file}")
-            with open(target_file, "r", encoding="utf-8", errors="ignore") as fh:
-                original = fh.read()
-
-            # We do not brutally rewrite the whole file (fragile across vLLM versions).
-            # Instead we append a large one-million-brains-dflash injection comment block + a small
-            # "MillionBrainsDFlashDraftModel" subclass at the bottom, then try to swap at runtime.
-            injection = f"""
-# =============================================================================
-# MILLION-BRAINS-DFLASH INJECTION (auto-inserted by million_brains_dflash.py at {time.strftime("%Y-%m-%d %H:%M:%S")})
-# This file was live-edited to support the full PermutationFeatureSlotAllocator,
-# 12 personality features, cross-stream integration, and adaptive feature reallocation.
-# (Fast Million Brains approach)
-# The real algorithmic work happens in the Python-level million_brains_dflash_generate.
-# The symbols below are here so that vLLM's speculative path can see them.
-# =============================================================================
-
-MILLION_BRAINS_DFLASH_PATCHED = True
-MILLION_BRAINS_PERSONALITY_FEATURES = {PERSONALITY_FEATURES!r}
-MILLION_BRAINS_K = {K}
-MILLION_BRAINS_BLOCK_SIZE = {BLOCK_SIZE}
-
-# The real heavy lifting (permutation allocator, cumprod acceptance, feature reallocation)
-# lives in the million_brains_dflash.py that you ran.
-try:
-    import million_brains_dflash as _pf
-    PermutationFeatureSlotAllocator = _pf.PermutationFeatureSlotAllocator
-    million_brains_dflash_generate = _pf.million_brains_dflash_generate
-except Exception:
-    pass
-
-# Local lightweight stand-in
-class MillionBrainsDFlashDraftModel:  # type: ignore
-    \"\"\"
-    File-injected stand-in for DFlashDraftModel.
-    The full one-million-brains-dflash (PermutationFeatureSlotAllocator + 12 personality features
-    + cross-stream integration + adaptive feature reallocation, the Fast Million Brains
-    approach) lives in the calling million_brains_dflash.py. This object carries the
-    feature-slot allocation hook.
-    \"\"\"
-    def __init__(self, *args, **kwargs):
-        self.k = {K}
-        self.block_size = {BLOCK_SIZE}
-        self.enable_reallocation = {ENABLE_FEATURE_REALLOCATION}
-        self.feature_allocator = None
-        print("[MillionBrainsDFlashDraftModel] File-injected stand-in ready")
-
-    def propose_with_allocator(self, pooled_state, step):
-        if self.feature_allocator is not None:
-            return self.feature_allocator(pooled_state, step)
-        return list(range(min(self.k, 12)))
-
-# End of one-million-brains-dflash injection
-"""
-            if "MILLION-BRAINS-DFLASH INJECTION" not in original:
-                try:
-                    with open(target_file, "a", encoding="utf-8") as fh:
-                        fh.write("\n" + injection)
-                    print(
-                        f"    [FILE PATCH] Appended one-million-brains-dflash injection to {target_file}"
-                    )
-                    patched = True
-                except Exception as e:
-                    print(
-                        f"    [FILE PATCH] Could not append (likely read-only FS): {e}"
-                    )
-            else:
-                patched = True
-    except Exception as e:
-        print(f"    [FILE SCAN] Skipped or failed: {e}")
-
-    # --- Step 2: Always do runtime monkey-patch (the reliable path) ---
-    try:
-        # Inject symbols directly into the vllm draft module namespace
-        vllm_draft_module.MILLION_BRAINS_DFLASH_PATCHED = True
-        vllm_draft_module.MILLION_BRAINS_PERSONALITY_FEATURES = PERSONALITY_FEATURES
-        vllm_draft_module.MILLION_BRAINS_K = K
-        vllm_draft_module.MILLION_BRAINS_BLOCK_SIZE = BLOCK_SIZE
-        vllm_draft_module.PermutationFeatureSlotAllocator = (
-            PermutationFeatureSlotAllocator
-        )
-        vllm_draft_module.million_brains_dflash_generate = (
-            million_brains_dflash_generate
-        )
-        # Subclass replacement (what user code importing DraftModel will see)
-        try:
-            OriginalDraft = getattr(vllm_draft_module, "DraftModel", None) or getattr(
-                vllm_draft_module, "DraftModelProposer", None
-            )
-            if OriginalDraft is not None:
-
-                class PatchedDraftModel(OriginalDraft):  # type: ignore
-                    def __init__(self, *a, **kw):
-                        super().__init__(*a, **kw)
-                        self.feature_allocator = PermutationFeatureSlotAllocator(
-                            internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=K
-                        )
-                        self.k = K
-                        self.block_size = BLOCK_SIZE
-                        print(
-                            "[PatchedDraftModel] Runtime subclass active - one-million-brains-dflash ready"
-                        )
-
-                draft_cls_name = getattr(OriginalDraft, "__name__", "DraftModel")
-                if hasattr(vllm_draft_module, "DraftModel"):
-                    vllm_draft_module.DraftModel = PatchedDraftModel
-                if hasattr(vllm_draft_module, "DraftModelProposer"):
-                    vllm_draft_module.DraftModelProposer = PatchedDraftModel
-                sys.modules.setdefault("dflash", type(sys)("dflash"))
-                sys.modules["dflash"].DraftModel = PatchedDraftModel
-                sys.modules["dflash"].MILLION_BRAINS_DFLASH_PATCHED = True
-                print(
-                    f"    [RUNTIME PATCH] {vllm_draft_module.__name__}.{draft_cls_name} replaced with one-million-brains-dflash feature-slot aware subclass"
-                )
-            else:
-                # No original DraftModel - still expose our allocator
-                sys.modules.setdefault("dflash", type(sys)("dflash"))
-                ndm = MillionBrainsDFlashDraftModel()
-                ndm.feature_allocator = PermutationFeatureSlotAllocator(
-                    internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=K
-                )
-                sys.modules["dflash"].DraftModel = type(ndm)
-                sys.modules["dflash"].MillionBrainsDFlashDraftModel = type(ndm)
-                print(
-                    "    [RUNTIME PATCH] No original DraftModel found - pure MillionBrainsDFlashDraftModel exposed under 'dflash'"
-                )
-            patched = True
-        except Exception as sub_e:
-            print(f"    [RUNTIME SUBCLASS] {sub_e}")
-
-    except Exception as rt_e:
-        print(f"    [RUNTIME PATCH] Failed: {rt_e}")
-
-    return patched
-
-
-# Step 1: live-edit is opt-in — stock vLLM by default (avoids seq_len/head tensor mismatches)
-if ENABLE_DFLASH_LIVE_PATCH and not _MBR_WORKER_SUBPROCESS:
-    _LIVE_PATCH_SUCCESS = _live_edit_dflash()
-else:
-    _LIVE_PATCH_SUCCESS = not ENABLE_DFLASH_LIVE_PATCH
-    if not _MBR_WORKER_SUBPROCESS:
-        if USE_DIFFUSIONGEMMA:
-            print(
-                "[CONFIG] DiffusionGemma + Million-Brains conditioned denoising "
-                f"(model={DIFFUSIONGEMMA_MODEL_PRIMARY}; no DFlash draft)",
-                flush=True,
-            )
-        else:
-            print(
-                "[CONFIG] ENABLE_DFLASH_LIVE_PATCH=False — stock vLLM generation "
-                "(no DFlash draft monkey-patches)",
-                flush=True,
-            )
-
-
-# =============================================================================
-# REQUIRED BANNER (exact string required by the spec)
-# =============================================================================
-def print_one_million_brains_banner(success: bool = True):
-    banner = r"""
-================================================================================
- ██████╗ ███╗   ██╗███████╗    ███╗   ███╗██╗██╗     ██╗     ██╗ ██████╗ ███╗   ██╗    ██████╗ ██████╗  █████╗ ██╗███╗   ██╗███████╗    ███████╗██╗      █████╗ ███████╗██╗  ██╗
-██╔═══██╗████╗  ██║██╔════╝    ████╗ ████║██║██║     ██║     ██║██╔═══██╗████╗  ██║    ██╔══██╗██╔══██╗██╔══██╗██║████╗  ██║██╔════╝    ██╔════╝██║     ██╔══██╗██╔════╝██║  ██║
-██║   ██║██╔██╗ ██║█████╗      ██╔████╔██║██║██║     ██║     ██║██║   ██║██╔██╗ ██║    ██████╔╝██████╔╝███████║██║██╔██╗ ██║███████╗    █████╗  ██║     ███████║███████╗███████║
-██║   ██║██║╚██╗██║██╔══╝      ██║╚██╔╝██║██║██║     ██║     ██║██║   ██║██║╚██╗██║    ██╔══██╗██╔══██╗██╔══██║██║██║╚██╗██║╚════██║    ██╔══╝  ██║     ██╔══██║╚════██║██╔══██║
-╚██████╔╝██║ ╚████║███████╗    ██║ ╚═╝ ██║██║███████╗███████╗██║╚██████╔╝██║ ╚████║    ██████╔╝██║  ██║██║  ██║██║██║ ╚████║███████║    ██║     ███████╗██║  ██║███████║██║  ██║
- ╚═════╝ ╚═╝  ╚═══╝╚══════╝    ╚═╝     ╚═╝╚═╝╚══════╝╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝    ╚═╝     ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝
-================================================================================
-"""
-    print(banner)
-    if success:
-        if USE_DIFFUSIONGEMMA:
-            print(
-                " ONE-MILLION-BRAINS-DIFFUSIONGEMMA INITIALIZED  |  "
-                "CANVAS=%d  |  DENOISE_K=%d  |  FEATURES=%d  |  REALLOCATION=%s"
-                % (
-                    DIFFUSION_CANVAS_LENGTH,
-                    K,
-                    NUM_PERSONALITY_FEATURES,
-                    str(ENABLE_FEATURE_REALLOCATION).upper(),
-                )
-            )
-            print(
-                " Engine: DiffusionGemma block-diffusion + hard-wired MBR conditioned "
-                "denoising (no draft model)"
-            )
-        else:
-            print(
-                " ONE-MILLION-BRAINS-FLASH INITIALIZED  |  "
-                "ARC_HYP_SLOTS=%d  |  BENCHMARK_K=%d  |  FEATURES=%d  |  REALLOCATION=%s"
-                % (
-                    ARC_HYPOTHESIS_SLOTS,
-                    K,
-                    NUM_PERSONALITY_FEATURES,
-                    str(ENABLE_FEATURE_REALLOCATION).upper(),
-                )
-            )
-            print(" Patch status: DISABLED (legacy autoregressive path)")
-        print(f" Script version: {SCRIPT_VERSION}")
-    else:
-        print(
-            " ONE-MILLION-BRAINS-FLASH INITIALIZED (DEGRADED - patch encountered errors, pure-Python fallback active)"
-        )
-    print(
-        "================================================================================\n"
-    )
-
-
-if not _MBR_WORKER_SUBPROCESS:
-    print_one_million_brains_banner(_LIVE_PATCH_SUCCESS)
-
-
-# =============================================================================
-# MODEL LOADING WITH FALLBACK (local/offline first, then HuggingFace when online)
-# =============================================================================
 def _on_kaggle() -> bool:
     return os.path.isdir("/kaggle/working")
 
@@ -2510,9 +1532,9 @@ def resolve_checkpoint_dir(path: str, max_depth: int = 3) -> Optional[str]:
 
 
 def _resolve_checkpoint_priority(path: str) -> Tuple[int, int, int, str]:
-    """When a mount nests BASE + DFlash, prefer the full causal-LM checkpoint."""
+    """Prefer full causal-LM checkpoints when multiple mounts exist."""
     name = os.path.basename(path).lower()
-    draft_rank = 1 if is_dflash_draft_checkpoint(path) else 0
+    draft_rank = 0
     size_rank = 0
     if "4b" in name or "4-b" in name:
         size_rank -= 10
@@ -2526,11 +1548,9 @@ def _resolve_checkpoint_priority(path: str) -> Tuple[int, int, int, str]:
 
 
 def _checkpoint_priority(path: str) -> Tuple[int, int, str]:
-    """Lower tuple sorts earlier: prefer DFlash-tuned, then larger Qwen, then lexicographic."""
+    """Lower tuple sorts earlier: prefer larger models, then lexicographic."""
     name = os.path.basename(path).lower()
     score = 0
-    if "dflash" in name:
-        score -= 100
     if "qwen" in name:
         score -= 20
     if "1.5b" in name or "1_5b" in name:
@@ -2617,40 +1637,26 @@ def discover_local_checkpoints(
 
 
 def resolve_local_model_path(prefer_generation: bool = True) -> Optional[str]:
-    """Pick the best available on-disk checkpoint without touching the network."""
-    explicit = [p for p in (LOCAL_BASE_DIR, LOCAL_DFLASH_DIR, LOCAL_MODEL_PATH) if p]
-    resolved_list: List[str] = []
-    seen: set = set()
-    for path in explicit:
-        resolved = resolve_checkpoint_dir(path)
-        if resolved and resolved not in seen:
-            seen.add(resolved)
-            if resolved != os.path.abspath(path):
-                print(f"[LOCAL-LOAD] Resolved nested checkpoint: {path} -> {resolved}")
-            resolved_list.append(resolved)
-
-    if prefer_generation:
-        for resolved in resolved_list:
-            if is_full_causal_lm_checkpoint(resolved):
-                return resolved
-    if resolved_list:
-        return resolved_list[0]
-
+    """Pick DiffusionGemma from explicit paths or Kaggle/HF cache."""
+    explicit = [
+        resolve_checkpoint_dir(KAGGLE_DIFFUSIONGEMMA_DIR),
+        resolve_checkpoint_dir(LOCAL_DIFFUSIONGEMMA_DIR),
+        resolve_checkpoint_dir(LOCAL_MODEL_PATH),
+    ]
+    for resolved in explicit:
+        if resolved and local_dir_exists(resolved):
+            return resolved
     discovered = discover_local_checkpoints()
     if discovered:
-        print(f"[LOCAL-LOAD] Auto-discovered {len(discovered)} local checkpoint(s):")
         for p in discovered:
-            role = "FULL" if is_full_causal_lm_checkpoint(p) else (
-                "DRAFT" if is_dflash_draft_checkpoint(p) else "UNKNOWN"
-            )
-            print(f"    - {p} [{role}]")
+            if "diffusiongemma" in p.lower():
+                return p
         if prefer_generation:
             for p in discovered:
                 if is_full_causal_lm_checkpoint(p):
                     return p
         return discovered[0]
     return None
-
 
 def _prefetch_target_dir() -> str:
     short = PREFETCH_MODEL_ID.split("/")[-1]
@@ -2765,69 +1771,9 @@ def maybe_prefetch_model_to_working() -> Optional[str]:
 
 
 def pick_model_name() -> Tuple[str, str]:
-    """
-    VRAM-aware model selection.
-    DiffusionGemma path (default): NVFP4 primary, google fallback.
-    Legacy path: Qwen local bundle / HF instruct models.
-    """
-    if USE_DIFFUSIONGEMMA:
-        path = resolve_diffusiongemma_model_path()
-        return path, "vllm-diffusion"
-
-    gpu_mem_gb = 0.0
-    if torch.cuda.is_available():
-        props = torch.cuda.get_device_properties(0)
-        gpu_mem_gb = props.total_memory / (1024**3)
-        print(f"[GPU] Detected {props.name} with {gpu_mem_gb:.1f} GB VRAM")
-
-    if PREFER_LOCAL_MODELS:
-        local_path = resolve_local_model_path()
-        if local_path:
-            print(f"[MODEL] Using local checkpoint (no HuggingFace HEAD requests): {local_path}")
-            return local_path, "vllm"
-
-    ensure_model_available()
-    local_path = resolve_local_model_path()
-    if local_path:
-        print(f"[MODEL] Using local checkpoint after prefetch: {local_path}")
-        return local_path, "vllm"
-
-    if not any_download_channel_available():
-        raise RuntimeError(
-            "[MODEL] No local checkpoint found and no download channel is reachable.\n"
-            "  Fix (pick one):\n"
-            "    1. Kaggle Settings -> Internet -> ON, restart kernel, re-run ALL cells from the top.\n"
-            "    2. Add dataset 'ragnar123/qwen2-5-1-5b' (or any HF model dataset) as notebook Input.\n"
-            "    3. Set LOCAL_MODEL_PATH = '/kaggle/input/<your-dataset>/<model-folder>' at the top.\n"
-            "    4. Run this once with Internet ON:\n"
-            "         import kagglehub\n"
-            f"         kagglehub.model_download('{KAGGLEHUB_MODEL_HANDLE}', output_dir='/kaggle/working/Qwen2.5-1.5B-Instruct')"
-        )
-
-    candidates = [
-        "z-lab/Qwen3.5-4B-DFlash",  # the requested fictional/special model
-        "Qwen/Qwen2.5-3B-Instruct",
-        "Qwen/Qwen2.5-1.5B-Instruct",
-    ]
-    if gpu_mem_gb > 38:
-        candidates.insert(1, "Qwen/Qwen2.5-7B-Instruct")
-    if gpu_mem_gb > 70:
-        candidates.insert(1, "Qwen/Qwen2.5-14B-Instruct")
-
-    for name in candidates:
-        print(f"[MODEL] Trying to load: {name}")
-        try:
-            # Quick tokenizer probe is cheap; the real load happens in load_models()
-            tok = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
-            print(f"[MODEL] Tokenizer OK for {name}")
-            return name, "vllm"
-        except Exception as e:
-            print(
-                f"    ... {name} not available or tokenizer failed ({type(e).__name__}). Trying next..."
-            )
-    # Absolute last resort (should never happen)
-    return "Qwen/Qwen2.5-1.5B-Instruct", "vllm"
-
+    """Resolve DiffusionGemma checkpoint."""
+    path = resolve_diffusiongemma_model_path()
+    return path, "vllm-diffusion"
 
 def _read_hf_config(model_path: str) -> Dict[str, Any]:
     cfg_path = os.path.join(model_path, "config.json")
@@ -2922,20 +1868,13 @@ def _checkpoint_model_info(model_path: str) -> Dict[str, Any]:
 
 
 def bundle_folder_role(model_path: str) -> Optional[str]:
-    """
-    Trust Kaggle bundle folder names over weight heuristics.
-    Qwen3.5-4B = base Qwen for generation. Qwen3.5-4B-DFlash = draft only.
-    """
+    """Classify checkpoint folder role (DiffusionGemma = base generation)."""
     if not model_path:
         return None
-    name = os.path.basename(os.path.abspath(model_path)).lower()
-    if name in DRAFT_BUNDLE_DIR_NAMES or name.endswith("-dflash"):
-        return "draft"
-    if "dflash" in name and "qwen" in name:
-        return "draft"
-    if name in BASE_BUNDLE_DIR_NAMES:
+    name = os.path.basename(model_path).lower()
+    if "diffusiongemma" in name or "diffusion" in name:
         return "base"
-    if "qwen" in name and "4b" in name and "dflash" not in name:
+    if is_full_causal_lm_checkpoint(model_path):
         return "base"
     return None
 
@@ -2984,272 +1923,21 @@ def is_full_causal_lm_checkpoint(model_path: str) -> bool:
     return False
 
 
-def is_dflash_draft_checkpoint(model_path: str) -> bool:
-    """
-    DFlash draft weights ship fc/hidden_norm but not embed_tokens.
-    Folder-name rules take priority: Qwen3.5-4B is NEVER a draft.
-    """
-    if not local_dir_exists(model_path):
-        return False
-
-    role = bundle_folder_role(model_path)
-    if role == "base":
-        return False
-    if role == "draft":
-        return True
-
-    if is_full_causal_lm_checkpoint(model_path):
-        return False
-
-    name_l = os.path.basename(model_path).lower()
-    if "dflash" in name_l:
-        return True
-
-    keys = _list_checkpoint_weight_keys(model_path)
-    if keys:
-        has_fc = any(".fc.weight" in k or k.endswith("fc.weight") for k in keys)
-        has_hidden_norm = any("hidden_norm" in k for k in keys)
-        if has_fc or has_hidden_norm:
-            return True
-
-    try:
-        cfg = _read_hf_config(model_path)
-        archs = [str(a) for a in (cfg.get("architectures") or [])]
-        if any("dflash" in a.lower() or "draft" in a.lower() for a in archs):
-            return True
-    except Exception:
-        pass
-
-    return False
 
 
-def discover_qwen_dflash_bundle_paths() -> Tuple[Optional[str], Optional[str]]:
-    """
-    Resolve BASE + DFLASH folders for the qwen3.5-4b-dflash Kaggle bundle.
-    Checks KAGGLE_QWEN_BUNDLE_ROOT first, then scans /kaggle/input.
-    """
-    base_candidates: List[str] = []
-    draft_candidates: List[str] = []
-
-    bundle_root = KAGGLE_QWEN_BUNDLE_ROOT
-    if bundle_root and os.path.isdir(bundle_root):
-        base_candidate = os.path.join(bundle_root, "Qwen3.5-4B")
-        draft_candidate = os.path.join(bundle_root, "Qwen3.5-4B-DFlash")
-        if local_dir_exists(base_candidate):
-            base_candidates.append(os.path.abspath(base_candidate))
-        if local_dir_exists(draft_candidate):
-            draft_candidates.append(os.path.abspath(draft_candidate))
-
-    for raw, bucket in (
-        (LOCAL_BASE_DIR, base_candidates),
-        (LOCAL_DFLASH_DIR, draft_candidates),
-        (LOCAL_MODEL_PATH, base_candidates),
-    ):
-        if not raw:
-            continue
-        resolved = resolve_checkpoint_dir(raw)
-        if not resolved:
-            continue
-        if is_dflash_draft_checkpoint(resolved):
-            draft_candidates.append(resolved)
-        elif is_full_causal_lm_checkpoint(resolved):
-            base_candidates.append(resolved)
-
-    if os.path.isdir("/kaggle/input"):
-        found: List[str] = []
-
-        def _walk(base: str, depth: int) -> None:
-            if depth > 6 or not os.path.isdir(base):
-                return
-            if local_dir_exists(base):
-                found.append(os.path.abspath(base))
-                return
-            try:
-                entries = sorted(os.listdir(base))
-            except OSError:
-                return
-            for entry in entries:
-                if entry.startswith("."):
-                    continue
-                _walk(os.path.join(base, entry), depth + 1)
-
-        _walk("/kaggle/input", 0)
-        for path in found:
-            name = os.path.basename(path).lower()
-            if "dflash" in name and is_dflash_draft_checkpoint(path):
-                draft_candidates.append(path)
-            elif is_full_causal_lm_checkpoint(path) and "dflash" not in name:
-                base_candidates.append(path)
-
-    def _uniq(paths: List[str]) -> List[str]:
-        out: List[str] = []
-        seen: set = set()
-        for p in paths:
-            if p and p not in seen:
-                seen.add(p)
-                out.append(p)
-        return out
-
-    base_candidates = _uniq(base_candidates)
-    draft_candidates = _uniq(draft_candidates)
-
-    def _base_rank(path: str) -> Tuple[int, int, str]:
-        name = os.path.basename(path).lower()
-        score = 0
-        if "dflash" in name:
-            score += 1000
-        if name in ("qwen3.5-4b", "qwen3-5-4b"):
-            score -= 50
-        if "4b" in name:
-            score -= 10
-        if "qwen" in name:
-            score -= 5
-        return (score, -len(name), path)
-
-    def _draft_rank(path: str) -> Tuple[int, str]:
-        name = os.path.basename(path).lower()
-        score = 0 if "dflash" in name else 1
-        return (score, path)
-
-    base = sorted(base_candidates, key=_base_rank)[0] if base_candidates else None
-    draft = sorted(draft_candidates, key=_draft_rank)[0] if draft_candidates else None
-    return base, draft
 
 
-def find_paired_dflash_draft(base_path: str) -> Optional[str]:
-    """Locate a DFlash draft sibling for a full base checkpoint."""
-    candidates: List[str] = []
-
-    explicit = resolve_checkpoint_dir(LOCAL_DFLASH_DIR)
-    if explicit and is_dflash_draft_checkpoint(explicit):
-        candidates.append(explicit)
-
-    search_roots: List[str] = []
-    for root in (base_path, os.path.dirname(base_path), LOCAL_MODEL_PATH):
-        if root and os.path.isdir(root) and root not in search_roots:
-            search_roots.append(root)
-
-    for search_root in search_roots:
-        try:
-            for entry in sorted(os.listdir(search_root)):
-                if "dflash" not in entry.lower():
-                    continue
-                resolved = resolve_checkpoint_dir(os.path.join(search_root, entry))
-                if resolved and is_dflash_draft_checkpoint(resolved):
-                    candidates.append(resolved)
-        except OSError:
-            pass
-
-    def _draft_priority(path: str) -> Tuple[int, str]:
-        name = os.path.basename(path).lower()
-        score = 0 if "dflash" in name else 1
-        return (score, path)
-
-    ranked = sorted(set(candidates), key=_draft_priority)
-    return ranked[0] if ranked else None
 
 
-def find_paired_base_checkpoint(dflash_path: str) -> Optional[str]:
-    """Locate a full causal-LM checkpoint to pair with a DFlash draft directory."""
-    candidates: List[str] = []
-
-    explicit = resolve_checkpoint_dir(LOCAL_BASE_DIR)
-    if explicit and is_full_causal_lm_checkpoint(explicit):
-        candidates.append(explicit)
-
-    parent = os.path.dirname(dflash_path)
-    if os.path.isdir(parent):
-        try:
-            for entry in sorted(os.listdir(parent)):
-                sibling = os.path.join(parent, entry)
-                resolved = resolve_checkpoint_dir(sibling)
-                if (
-                    resolved
-                    and resolved != dflash_path
-                    and is_full_causal_lm_checkpoint(resolved)
-                ):
-                    candidates.append(resolved)
-        except OSError:
-            pass
-
-    for discovered in discover_local_checkpoints():
-        if discovered != dflash_path and is_full_causal_lm_checkpoint(discovered):
-            candidates.append(discovered)
-
-    def _base_priority(path: str) -> Tuple[int, int, str]:
-        name = os.path.basename(path).lower()
-        score = 0
-        if "dflash" in name:
-            score += 1000
-        if "qwen" in name:
-            score -= 10
-        if "4b" in name:
-            score -= 8
-        if "base" in name or "instruct" in name:
-            score -= 6
-        return (score, -len(name), path)
-
-    ranked = sorted(set(candidates), key=_base_priority)
-    if ranked:
-        return ranked[0]
-
-    print("[LOAD] No paired BASE model found for DFlash draft. Checked:")
-    print(f"    LOCAL_BASE_DIR -> {resolve_checkpoint_dir(LOCAL_BASE_DIR) or 'MISSING'}")
-    parent = os.path.dirname(dflash_path)
-    if os.path.isdir(parent):
-        try:
-            for entry in sorted(os.listdir(parent)):
-                print(f"    sibling: {os.path.join(parent, entry)}")
-        except OSError:
-            pass
-    return None
 
 
-def resolve_generation_model_path(requested_path: str) -> Tuple[str, Optional[str]]:
-    """
-    Return (generation_path, optional_dflash_draft_path).
-    DiffusionGemma: no draft sibling. Legacy: DFlash draft paired to base LM.
-    """
-    if USE_DIFFUSIONGEMMA:
-        resolved = resolve_checkpoint_dir(requested_path) or requested_path
-        if not local_dir_exists(resolved):
-            resolved = resolve_diffusiongemma_model_path()
-        print(f"[LOAD] DiffusionGemma checkpoint: {resolved}")
-        return resolved, None
-
+def resolve_generation_model_path(requested_path: str) -> str:
+    """Resolve DiffusionGemma checkpoint path."""
     resolved = resolve_checkpoint_dir(requested_path) or requested_path
     if not local_dir_exists(resolved):
-        return requested_path, None
-
-    role = bundle_folder_role(resolved)
-    if role == "base":
-        draft = find_paired_dflash_draft(resolved)
-        print(f"[LOAD] Base Qwen checkpoint: {resolved}")
-        if draft:
-            print(f"[LOAD] Paired DFlash draft: {draft}")
-        return resolved, draft
-
-    if is_full_causal_lm_checkpoint(resolved):
-        draft = find_paired_dflash_draft(resolved)
-        return resolved, draft
-
-    if not is_dflash_draft_checkpoint(resolved):
-        return resolved, None
-
-    base = find_paired_base_checkpoint(resolved)
-    if base:
-        print(f"[LOAD] DFlash DRAFT checkpoint: {resolved}")
-        print(f"[LOAD] Generation will use paired BASE model: {base}")
-        return base, resolved
-
-    raise RuntimeError(
-        "[LOAD] Found a DFlash draft checkpoint but no paired base model.\n"
-        f"  Draft: {resolved}\n"
-        "  DFlash drafts lack embed_tokens / lm_head and cannot generate text alone.\n"
-        "  Fix: place the base Qwen checkpoint beside the draft (e.g. .../Qwen3.5-4B)\n"
-        f"  or set LOCAL_BASE_DIR (currently {LOCAL_BASE_DIR!r})."
-    )
-
+        resolved = resolve_diffusiongemma_model_path()
+    print(f"[LOAD] DiffusionGemma checkpoint: {resolved}")
+    return resolved
 
 def _guess_causal_lm_architecture(config: Dict[str, Any]) -> Optional[str]:
     model_type = str(config.get("model_type", "")).lower()
@@ -3334,7 +2022,7 @@ def _load_hf_generation_model(
 
 def _needs_custom_vllm_handling(model_path: str) -> bool:
     path_l = model_path.lower()
-    if any(tag in path_l for tag in ("dflash", "qwen3", "custom")):
+    if any(tag in path_l for tag in ("diffusiongemma", "qwen3", "custom")):
         return True
     try:
         cfg = _read_hf_config(model_path)
@@ -3364,33 +2052,21 @@ def _cuda_vram_snapshot(device: int = 0) -> Dict[str, float]:
     }
 
 
-def _adaptive_vllm_gpu_util(requested: float, *, speculative: bool = False) -> float:
-    """
-    Cap gpu_memory_utilization so vLLM's requested slice fits in *free* VRAM.
-    vLLM checks: free >= utilization * total (not utilization * free).
-    Speculative (base+draft) needs a higher floor — 0.70×22GB leaves no room for draft weights.
-    """
+def _adaptive_vllm_gpu_util(requested: float) -> float:
+    """Cap gpu_memory_utilization so vLLM's requested slice fits in free VRAM."""
     snap = _cuda_vram_snapshot()
     if snap["total_gib"] <= 0:
         return requested
-    if speculative:
-        safe = (snap["free_gib"] / snap["total_gib"]) * 0.95
-        util = min(float(requested), safe)
-        util = max(0.55, min(0.92, util))
-        label = "speculative"
-    else:
-        safe = (snap["free_gib"] / snap["total_gib"]) * 0.88
-        util = min(float(requested), safe)
-        util = max(0.38, min(0.88, util))
-        label = "base-only"
+    safe = (snap["free_gib"] / snap["total_gib"]) * 0.88
+    util = min(float(requested), safe)
+    util = max(0.38, min(0.88, util))
     print(
         f"[LOAD] VRAM cuda:0 "
         f"free {snap['free_gib']:.2f}/{snap['total_gib']:.2f} GiB "
         f"(allocated {snap['allocated_gib']:.2f}) "
-        f"-> gpu_memory_utilization={util:.2f} ({label})"
+        f"-> gpu_memory_utilization={util:.2f}"
     )
     return util
-
 
 def _release_cuda_cache() -> None:
     import gc
@@ -3404,502 +2080,28 @@ def _release_cuda_cache() -> None:
             pass
 
 
-def _vllm_engine_extra_kwargs(model_path: str) -> Dict[str, Any]:
-    """Extra vLLM LLM() kwargs — text-only Qwen3.5 unlocks draft_model speculative decoding."""
-    extras: Dict[str, Any] = {}
-    if not VLLM_LANGUAGE_MODEL_ONLY:
-        return extras
-    try:
-        info = _checkpoint_model_info(model_path)
-        if info["is_qwen35"] or info["is_multimodal"]:
-            extras["language_model_only"] = True
-    except Exception:
-        pass
-    return extras
-
-
-def _vllm_native_speculative_viable(model_path: str) -> Tuple[bool, str]:
-    """
-    Stock vLLM rejects draft_model speculative decoding for multimodal targets.
-    ARC is text-only — language_model_only=True fixes this on Qwen3.5-4B target.
-    """
-    try:
-        info = _checkpoint_model_info(model_path)
-    except Exception:
-        return True, ""
-    if not (info["is_qwen35"] or info["is_multimodal"]):
-        return True, ""
-    if VLLM_LANGUAGE_MODEL_ONLY:
-        return True, "Qwen3.5 text-only via language_model_only=True"
-    return (
-        False,
-        "Qwen3.5 multimodal + draft_model spec unsupported on stock vLLM. "
-        "Set VLLM_LANGUAGE_MODEL_ONLY=True (ARC is text-only).",
-    )
-
-
-_VLLM_SPEC_ABORT_MARKERS = (
-    "does not support multimodal",
-    "Speculative Decoding with draft models",
-    "Argument input_ids not found",
-    "TransformersForCausalLM has no vLLM implementation",
-    "Loading drafter model",
-    "Engine core initialization failed",
-)
-
-
-def _vllm_spec_attempt_should_abort(exc: BaseException) -> bool:
-    blob = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
-    if any(marker in blob for marker in _VLLM_SPEC_ABORT_MARKERS):
-        return True
-    if "WorkerProc initialization failed" in blob:
-        return True
-    return False
-
-
-def _vllm_tensor_parallel_candidates(*, speculative: bool = False) -> List[int]:
-    if int(VLLM_TENSOR_PARALLEL_SIZE) > 0:
-        return [int(VLLM_TENSOR_PARALLEL_SIZE)]
-    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    if speculative and n_gpu >= 2:
-        pref = max(1, int(VLLM_SPEC_PREFER_TENSOR_PARALLEL))
-        if pref <= 1:
-            return [1, 2]
-        if n_gpu >= pref:
-            return [pref, 1]
-        return [1, 2]
-    if n_gpu >= 2:
-        return [1, 2]
-    return [1]
-
-
-_VLLM_SPEC_METHODS_CACHE: Optional[set] = None
-
-
-def _vllm_supported_speculative_methods() -> set:
-    """Methods accepted by the installed vLLM SpeculativeConfig (stock vLLM lacks 'dflash')."""
-    global _VLLM_SPEC_METHODS_CACHE
-    if _VLLM_SPEC_METHODS_CACHE is not None:
-        return _VLLM_SPEC_METHODS_CACHE
-    fallback = {
-        "draft_model",
-        "ngram",
-        "eagle",
-        "eagle3",
-        "medusa",
-        "mlp_speculator",
-    }
-    try:
-        from vllm.config import SpeculativeConfig
-
-        schema = SpeculativeConfig.model_json_schema()
-        method_prop = schema.get("properties", {}).get("method", {})
-        enum_vals = method_prop.get("enum")
-        if enum_vals:
-            _VLLM_SPEC_METHODS_CACHE = set(str(v) for v in enum_vals)
-            return _VLLM_SPEC_METHODS_CACHE
-    except Exception as exc:
-        print(f"[LOAD] SpeculativeConfig introspection failed ({exc}); using fallback set.")
-    _VLLM_SPEC_METHODS_CACHE = fallback
-    return _VLLM_SPEC_METHODS_CACHE
-
-
-def _resolve_vllm_speculative_method(draft_path: str) -> str:
-    """
-    Pick a speculative method this vLLM build actually accepts.
-    DFlash checkpoints use method=dflash only with vllm-project/speculators;
-    stock pip vLLM on Kaggle requires method=draft_model + draft checkpoint path.
-    """
-    supported = _vllm_supported_speculative_methods()
-    requested = str(VLLM_SPECULATIVE_METHOD).strip().lower()
-    is_dflash = is_dflash_draft_checkpoint(draft_path)
-
-    if requested == "auto":
-        if is_dflash and "dflash" in supported:
-            return "dflash"
-        if is_dflash:
-            print(
-                "[LOAD] vLLM has no 'dflash' speculative method "
-                f"(supported: {sorted(supported)}). "
-                "Using draft_model for Qwen3.5-4B-DFlash checkpoint."
-            )
-            return "draft_model"
-        return "draft_model"
-
-    if requested not in supported:
-        print(
-            f"[LOAD] vLLM does not support speculative method={requested!r} "
-            f"(supported: {sorted(supported)}). "
-            "Falling back to draft_model."
-        )
-        return "draft_model"
-    return requested
-
-
-def _vllm_dflash_draft_speculative_viable(draft_path: Optional[str]) -> Tuple[bool, str]:
-    """
-    Qwen3.5-4B-DFlash cannot load as stock vLLM draft_model (TransformersForCausalLM
-    + torch.compile ValueError on input_ids). Needs vllm-project/speculators method=dflash.
-    """
-    if not draft_path:
-        return True, ""
-    resolved = resolve_checkpoint_dir(draft_path) or draft_path
-    if not is_dflash_draft_checkpoint(resolved):
-        return True, ""
-    supported = _vllm_supported_speculative_methods()
-    if "dflash" in supported:
-        return True, "vLLM speculators dflash method available"
-    return (
-        False,
-        "Qwen3.5-4B-DFlash draft incompatible with stock vLLM draft_model "
-        "(crashes loading drafter as TransformersForCausalLM). "
-        f"Using base-only vLLM; ARC Phase-1 batches {ARC_HYPOTHESIS_SLOTS} hypothesis proposals "
-        f"(not BENCHMARK_K={K}). Native DFlash spec requires vllm-project/speculators.",
-    )
-
-
-def _vllm_speculative_load_viable(
-    model_path: str, draft_path: Optional[str]
-) -> Tuple[bool, str]:
-    for check in (
-        lambda: _vllm_native_speculative_viable(model_path),
-        lambda: _vllm_dflash_draft_speculative_viable(draft_path),
-    ):
-        ok, reason = check()
-        if not ok:
-            return ok, reason
-    return True, ""
-
-
-def _build_vllm_speculative_config(
-    draft_path: str,
-    *,
-    max_model_len: Optional[int] = None,
-) -> Optional[Dict[str, Any]]:
-    if not ENABLE_VLLM_SPECULATIVE_DECODING:
-        return None
-    resolved = resolve_checkpoint_dir(draft_path) or draft_path
-    if not resolved or not os.path.isdir(resolved):
-        return None
-    method = _resolve_vllm_speculative_method(resolved)
-    supported = _vllm_supported_speculative_methods()
-    if method not in supported:
-        print(
-            f"[LOAD] Resolved speculative method={method!r} not in vLLM; "
-            "using draft_model."
-        )
-        method = "draft_model"
-    if method == "dflash" and not is_dflash_draft_checkpoint(resolved):
-        print(
-            f"[LOAD] {resolved} is not a DFlash draft checkpoint; "
-            "falling back to draft_model speculative method."
-        )
-        method = "draft_model"
-    cfg: Dict[str, Any] = {
-        "method": method,
-        "model": resolved,
-        "num_speculative_tokens": max(1, int(VLLM_NUM_SPECULATIVE_TOKENS)),
-    }
-    if max_model_len is not None:
-        cfg["max_model_len"] = int(max_model_len)
-    return cfg
-
-
-def _inference_speculative_status(llm: Any) -> str:
-    if isinstance(llm, HFGenerateEngine):
-        draft = getattr(llm, "dflash_draft_path", None)
-        if draft and ENABLE_VLLM_SPECULATIVE_DECODING:
-            return "unavailable (HF fallback — vLLM required)"
-        return "n/a"
-    if getattr(llm, "speculative_decoding_enabled", False):
-        sc = getattr(llm, "speculative_config", None) or {}
-        if isinstance(sc, dict):
-            method = sc.get("method", "?")
-            n = sc.get("num_speculative_tokens", "?")
-            draft = sc.get("model", getattr(llm, "dflash_draft_path", "?"))
-            return (
-                f"active ({method}, n={n}, "
-                f"draft={os.path.basename(str(draft))})"
-            )
-        return "active"
-    draft = getattr(llm, "dflash_draft_path", None)
-    if draft and ENABLE_VLLM_SPECULATIVE_DECODING:
-        return "inactive (draft present but engine loaded without speculative_config)"
-    return "off"
-
-
-def _vllm_max_len_candidates(arc_need: int, *, speculative: bool = False) -> List[int]:
-    """Ordered max_model_len values to try for vLLM load attempts."""
-    if speculative:
-        spec_cap = int(VLLM_SPEC_MAX_MODEL_LEN) if int(VLLM_SPEC_MAX_MODEL_LEN) > 0 else arc_need
-        effective_cap = min(arc_need, spec_cap)
-        pool = sorted({4096, 6144, 8192, 10240, 11264, 12288, 14336, 16384, effective_cap})
-        pool = [m for m in pool if m <= effective_cap]
-        if VLLM_SPEC_TRY_SMALLEST_CONTEXT_FIRST:
-            return pool
-        return sorted(pool, reverse=True)
-
-    pool = sorted({arc_need, 12288, 11264, 10240, 8192, 6144, 4096}, reverse=True)
-    return [m for i, m in enumerate(pool) if m not in pool[:i]]
-
-
-def _append_vllm_attempt_variants(
-    target: List[Dict[str, Any]],
-    seen: set,
-    base: Dict[str, Any],
-    *,
-    custom: bool,
-    hf_overrides: Dict[str, Any],
-    hf_extra: Dict[str, Any],
-) -> None:
-    """Add enforce_eager=False first (fast path), then eager=True fallbacks."""
-
-    def _add(**kwargs: Any) -> None:
-        key = tuple(sorted((k, repr(v)) for k, v in kwargs.items()))
-        if key in seen:
-            return
-        seen.add(key)
-        target.append(kwargs)
-
-    eager_first = not VLLM_ENFORCE_EAGER
-    if eager_first:
-        _add(**base, runner=VLLM_RUNNER, enforce_eager=False, **hf_extra)
-    if custom or hf_overrides or VLLM_ENFORCE_EAGER:
-        _add(**base, runner=VLLM_RUNNER, enforce_eager=True, **hf_extra)
-    if not eager_first:
-        _add(**base, runner=VLLM_RUNNER, enforce_eager=VLLM_ENFORCE_EAGER, **hf_extra)
-    _add(**base, enforce_eager=True, **hf_extra)
-
-
 def _build_vllm_attempts(
     model_path: str,
     gpu_memory_utilization: float,
-    *,
-    dflash_draft_path: Optional[str] = None,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    if USE_DIFFUSIONGEMMA:
-        kwargs = _build_diffusiongemma_vllm_kwargs(
-            model_path, gpu_memory_utilization=gpu_memory_utilization
-        )
-        return [], [kwargs]
-
-    custom = _needs_custom_vllm_handling(model_path)
-    base_util = _adaptive_vllm_gpu_util(gpu_memory_utilization, speculative=False)
-    spec_util = _adaptive_vllm_gpu_util(
-        float(VLLM_SPEC_GPU_MEMORY_UTILIZATION), speculative=True
+) -> List[Dict[str, Any]]:
+    kwargs = _build_diffusiongemma_vllm_kwargs(
+        model_path, gpu_memory_utilization=gpu_memory_utilization
     )
-    arc_need = arc_vllm_context_budget()
-    if int(VLLM_MAX_MODEL_LEN) > 0:
-        arc_need = min(arc_need, int(VLLM_MAX_MODEL_LEN))
-    fallback_max_lens = _vllm_max_len_candidates(arc_need, speculative=False)
-    spec_max_lens = _vllm_max_len_candidates(arc_need, speculative=True)
-
-    hf_overrides: Dict[str, Any] = {}
-    if os.path.isfile(os.path.join(model_path, "config.json")):
-        try:
-            cfg = _read_hf_config(model_path)
-            archs = [str(a) for a in (cfg.get("architectures") or [])]
-            print(f"[LOAD] HF config architectures: {archs}")
-            if is_dflash_draft_checkpoint(model_path):
-                print("[LOAD] Skipping architecture rewrite for DFlash draft checkpoint.")
-            elif any("Embedding" in a or "Pooling" in a for a in archs):
-                guessed = _guess_causal_lm_architecture(cfg)
-                if guessed:
-                    hf_overrides["architectures"] = [guessed]
-                    print(f"[LOAD] Rewriting architectures for vLLM -> {[guessed]}")
-        except Exception as exc:
-            print(f"[LOAD] Could not inspect config.json: {exc}")
-
-    hf_extra = {"hf_overrides": hf_overrides} if hf_overrides else {}
-    engine_extras = _vllm_engine_extra_kwargs(model_path)
-    if engine_extras:
-        print(f"[LOAD] vLLM engine extras: {engine_extras}")
-
-    spec_viable, spec_reason = _vllm_speculative_load_viable(model_path, dflash_draft_path)
-    spec_root = None
-    if dflash_draft_path and ENABLE_VLLM_SPECULATIVE_DECODING:
-        if spec_viable:
-            spec_root = _build_vllm_speculative_config(dflash_draft_path)
-            if spec_reason:
-                print(f"[LOAD] Native speculative: {spec_reason}")
-        else:
-            print(f"[LOAD] Skipping vLLM native speculative — {spec_reason}")
-    elif dflash_draft_path and not ENABLE_VLLM_SPECULATIVE_DECODING:
-        _probe_ok, probe_reason = _vllm_dflash_draft_speculative_viable(dflash_draft_path)
-        if not _probe_ok:
-            print(f"[LOAD] vLLM native spec OFF — {probe_reason}")
-
-    if spec_root:
-        print(
-            f"[LOAD] vLLM speculative methods available: "
-            f"{sorted(_vllm_supported_speculative_methods())}"
-        )
-        print(
-            f"[LOAD] vLLM speculative decoding: method={spec_root['method']} "
-            f"n_tokens={spec_root['num_speculative_tokens']} "
-            f"draft={spec_root['model']}"
-        )
-        print(
-            f"[LOAD] Speculative max_model_len order: {spec_max_lens} "
-            f"(ARC budget={arc_need}, spec_cap={VLLM_SPEC_MAX_MODEL_LEN}, "
-            f"tp_pref={VLLM_SPEC_PREFER_TENSOR_PARALLEL})"
-        )
-
-    spec_attempts: List[Dict[str, Any]] = []
-    fallback_attempts: List[Dict[str, Any]] = []
-    seen: set = set()
-    spec_tp_sizes = _vllm_tensor_parallel_candidates(speculative=True)
-    tp_sizes = _vllm_tensor_parallel_candidates(speculative=False)
-    util_steps = [base_util]
-    if base_util > 0.45:
-        util_steps.append(max(0.38, base_util - 0.10))
-    spec_util_steps = [spec_util]
-    if spec_util > 0.60:
-        spec_util_steps.append(max(0.55, spec_util - 0.08))
-
-    if spec_root:
-        # One probe config first — avoid 180× EngineCore respawn loops on Kaggle.
-        probe_lens = spec_max_lens[:1]
-        probe_tp = spec_tp_sizes[:1]
-        probe_utils = spec_util_steps[:1]
-        for max_len in probe_lens:
-            for tp in probe_tp:
-                for u in probe_utils:
-                    spec_load_util = max(
-                        0.55, float(u) * float(VLLM_SPEC_DRAFT_GPU_UTIL_SCALE)
-                    )
-                    spec_cfg = dict(spec_root)
-                    spec_cfg["max_model_len"] = max_len
-                    spec_base = {
-                        "model": model_path,
-                        "trust_remote_code": True,
-                        "dtype": "auto",
-                        "max_model_len": max_len,
-                        "gpu_memory_utilization": spec_load_util,
-                        "tensor_parallel_size": tp,
-                        "speculative_config": spec_cfg,
-                        **engine_extras,
-                    }
-                    _append_vllm_attempt_variants(
-                        spec_attempts,
-                        seen,
-                        spec_base,
-                        custom=custom,
-                        hf_overrides=hf_overrides,
-                        hf_extra=hf_extra,
-                    )
-
-    skip_base_fallback = bool(
-        dflash_draft_path
-        and ENABLE_VLLM_SPECULATIVE_DECODING
-        and VLLM_REQUIRE_SPECULATIVE
-    )
-    if skip_base_fallback:
-        print(
-            "[LOAD] VLLM_REQUIRE_SPECULATIVE=True — will not fall back to base-only "
-            "without DFlash draft."
-        )
-    else:
-        for max_len in fallback_max_lens:
-            for tp in tp_sizes:
-                for u in util_steps:
-                    base: Dict[str, Any] = {
-                        "model": model_path,
-                        "trust_remote_code": True,
-                        "dtype": "auto",
-                        "max_model_len": max_len,
-                        "gpu_memory_utilization": u,
-                        "tensor_parallel_size": tp,
-                        **engine_extras,
-                    }
-                    _append_vllm_attempt_variants(
-                        fallback_attempts,
-                        seen,
-                        base,
-                        custom=custom,
-                        hf_overrides=hf_overrides,
-                        hf_extra=hf_extra,
-                    )
-
-    return spec_attempts, fallback_attempts
-
+    return [kwargs]
 
 def _build_vllm_worker_fast_attempts(
     model_path: str,
     gpu_memory_utilization: float,
 ) -> List[Dict[str, Any]]:
-    """
-    Minimal vLLM load grid for voter subprocesses.
-    Avoids the 40+ attempt loop (max_model_len=22272 first) that can stall 30+ minutes.
-    """
-    if USE_DIFFUSIONGEMMA:
-        return [
-            _build_diffusiongemma_vllm_kwargs(
-                model_path,
-                gpu_memory_utilization=gpu_memory_utilization,
-                max_model_len=ARC_WORKER_VLLM_MAX_MODEL_LEN or DIFFUSION_MAX_MODEL_LEN,
-                max_num_seqs=1,
-            )
-        ]
-
-    util = _adaptive_vllm_gpu_util(float(gpu_memory_utilization), speculative=False)
-    env_cap = int(os.environ.get("MBR_WORKER_MAX_MODEL_LEN", "0") or 0)
-    worker_cap = (
-        env_cap
-        if env_cap > 0
-        else (
-            int(ARC_WORKER_VLLM_MAX_MODEL_LEN)
-            if int(ARC_WORKER_VLLM_MAX_MODEL_LEN) > 0
-            else 8192
+    """Minimal vLLM load grid for voter subprocesses."""
+    return [
+        _build_diffusiongemma_vllm_kwargs(
+            model_path,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=ARC_WORKER_VLLM_MAX_MODEL_LEN or DIFFUSION_MAX_MODEL_LEN,
+            max_num_seqs=1,
         )
-    )
-    max_len = int(worker_cap)
-    cap = float(ARC_WORKER_VLLM_GPU_UTIL_CAP)
-    if cap > 0:
-        util = min(util, cap)
-    engine_extras = _vllm_engine_extra_kwargs(model_path)
-    max_num_seqs = max(1, int(ARC_WORKER_VLLM_MAX_NUM_SEQS))
-    engines_per_gpu = max(1, int(os.environ.get("MBR_ENGINES_PER_GPU", "1") or 1))
-    prefer_eager = engines_per_gpu > 1
-    common: Dict[str, Any] = {
-        "model": model_path,
-        "trust_remote_code": True,
-        "dtype": "auto",
-        "tensor_parallel_size": 1,
-        "runner": VLLM_RUNNER,
-        "max_num_seqs": max_num_seqs,
-        "max_num_batched_tokens": min(max_len, 4096),
-        **engine_extras,
-    }
-    attempts = [
-        {
-            **common,
-            "max_model_len": max_len,
-            "gpu_memory_utilization": util,
-            "enforce_eager": prefer_eager,
-        },
     ]
-    if not prefer_eager:
-        attempts.append(
-            {
-                **common,
-                "max_model_len": max_len,
-                "gpu_memory_utilization": util,
-                "enforce_eager": True,
-            }
-        )
-    for fallback_len in (9728, 8192):
-        if max_len > fallback_len:
-            attempts.append(
-                {
-                    **common,
-                    "max_model_len": fallback_len,
-                    "gpu_memory_utilization": max(0.32, util - 0.06),
-                    "enforce_eager": True,
-                }
-            )
-    return attempts
-
 
 @dataclass
 class _HFCompletionOutput:
@@ -3980,31 +2182,19 @@ def _top_p_sample_logits(logits: torch.Tensor, temperature: float, top_p: float)
 
 
 class HFGenerateEngine:
-    """Fallback engine when vLLM cannot load a custom DFlash / Qwen3.5 checkpoint."""
+    """Fallback engine when vLLM cannot load DiffusionGemma."""
 
     def __init__(
         self,
         model_path: str,
         tokenizer: Any,
         *,
-        dflash_draft_path: Optional[str] = None,
         local_only: bool = True,
     ):
-        if is_dflash_draft_checkpoint(model_path):
-            raise ValueError(
-                f"Refusing to load DFlash draft as causal LM: {model_path}"
-            )
-
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         print(f"[LOAD][HF] Loading causal LM from {model_path} ...")
-        if dflash_draft_path:
-            print(
-                f"[LOAD][HF] DFlash draft present ({dflash_draft_path}) but HF "
-                "fallback cannot run vLLM speculative decoding."
-            )
         self.tokenizer = tokenizer
         self.model_path = model_path
-        self.dflash_draft_path = dflash_draft_path
         self.model = _load_hf_generation_model(
             model_path,
             dtype=dtype,
@@ -4014,8 +2204,7 @@ class HFGenerateEngine:
         emb = self.model.get_input_embeddings()
         if emb is None or emb.weight.numel() == 0:
             raise RuntimeError(
-                f"[LOAD][HF] Model at {model_path} has no usable embed_tokens — "
-                "this is likely a DFlash draft checkpoint, not a base causal LM."
+                f"[LOAD][HF] Model at {model_path} has no usable embed_tokens."
             )
         print("[LOAD][HF] HuggingFace generate engine ready (vLLM-compatible API).")
 
@@ -4283,214 +2472,67 @@ def create_inference_engine(
     tokenizer: Any,
     *,
     gpu_memory_utilization: Optional[float] = None,
-    dflash_draft_path: Optional[str] = None,
 ) -> Any:
-    """Create vLLM engine — DiffusionGemma diffusion path or legacy causal LM."""
-    gen_path, auto_draft = resolve_generation_model_path(model_path)
-    draft_path = None if USE_DIFFUSIONGEMMA else (dflash_draft_path or auto_draft)
+    """Create DiffusionGemma vLLM engine (HF fallback on load failure)."""
+    gen_path = resolve_generation_model_path(model_path)
     local_only = os.path.isdir(gen_path)
     gpu_mem = (
         float(gpu_memory_utilization)
         if gpu_memory_utilization is not None
-        else (
-            float(DIFFUSION_GPU_UTIL)
-            if USE_DIFFUSIONGEMMA
-            else float(VLLM_GPU_MEMORY_UTILIZATION)
-        )
+        else float(DIFFUSION_GPU_UTIL)
     )
 
-    if USE_DIFFUSIONGEMMA:
-        kwargs = _build_diffusiongemma_vllm_kwargs(
-            gen_path, gpu_memory_utilization=gpu_mem
-        )
-        print(
-            f"[LOAD] DiffusionGemma vLLM: canvas={DIFFUSION_CANVAS_LENGTH} "
-            f"max_seqs={kwargs.get('max_num_seqs')} "
-            f"max_len={kwargs.get('max_model_len')} "
-            f"gpu_util={kwargs.get('gpu_memory_utilization')}",
-            flush=True,
-        )
-        try:
-            llm = LLM(**kwargs)
-            ctx = int(kwargs.get("max_model_len", DIFFUSION_MAX_MODEL_LEN))
-            setattr(llm, "max_model_len", ctx)
-            setattr(llm, "diffusiongemma_enabled", True)
-            setattr(llm, "speculative_decoding_enabled", False)
-            print(
-                f"[LOAD] DiffusionGemma engine ready (max_model_len={ctx}, "
-                f"canvas={DIFFUSION_CANVAS_LENGTH})"
-            )
-            return llm
-        except Exception as exc:
-            print(f"[LOAD] DiffusionGemma load failed: {exc}")
-            if not VLLM_FALLBACK_TO_HF:
-                raise
-            print("[LOAD] Falling back to HF generate engine for DiffusionGemma.")
-
-    if _should_skip_vllm(gen_path):
-        if PREFER_HF_INFERENCE and not ARC_TRY_VLLM:
-            reason = "PREFER_HF_INFERENCE=True (set ARC_TRY_VLLM=True to attempt vLLM)"
-        else:
-            reason = "Qwen3.5 multimodal checkpoint"
-        print(f"[LOAD] Skipping vLLM ({reason}); using HuggingFace generate engine.")
-        return HFGenerateEngine(
-            gen_path,
-            tokenizer,
-            dflash_draft_path=draft_path,
-            local_only=local_only,
-        )
-
+    kwargs = _build_diffusiongemma_vllm_kwargs(gen_path, gpu_memory_utilization=gpu_mem)
+    print(
+        f"[LOAD] DiffusionGemma vLLM: canvas={DIFFUSION_CANVAS_LENGTH} "
+        f"max_seqs={kwargs.get('max_num_seqs')} "
+        f"max_len={kwargs.get('max_model_len')} "
+        f"gpu_util={kwargs.get('gpu_memory_utilization')}",
+        flush=True,
+    )
+    attempts: List[Dict[str, Any]] = [kwargs]
     if _MBR_WORKER_SUBPROCESS and ARC_WORKER_VLLM_FAST_LOAD:
-        worker_attempts = _build_vllm_worker_fast_attempts(gen_path, gpu_mem)
-        spec_attempts: List[Dict[str, Any]] = []
-        fallback_attempts = worker_attempts
-        phases = [("worker-fast", worker_attempts)]
-        want_spec = False
+        attempts = _build_vllm_worker_fast_attempts(gen_path, gpu_mem)
         print(
-            f"[LOAD] Worker fast vLLM load: {len(worker_attempts)} attempt(s), "
-            f"max_model_len<={worker_attempts[0].get('max_model_len')}, "
-            f"max_num_seqs={worker_attempts[0].get('max_num_seqs')}, "
-            f"gpu_util={worker_attempts[0].get('gpu_memory_utilization')}",
+            f"[LOAD] Worker fast vLLM load: {len(attempts)} attempt(s), "
+            f"max_model_len={attempts[0].get('max_model_len')}",
             flush=True,
         )
-    else:
-        spec_attempts, fallback_attempts = _build_vllm_attempts(
-            gen_path, gpu_mem, dflash_draft_path=draft_path
-        )
-        want_spec = bool(
-            draft_path and ENABLE_VLLM_SPECULATIVE_DECODING and spec_attempts
-        )
-        phases = []
-        if spec_attempts:
-            phases.append(("speculative", spec_attempts))
-        if fallback_attempts:
-            phases.append(("base-only", fallback_attempts))
-    total_attempts = sum(len(batch) for _, batch in phases)
 
     last_err: Optional[BaseException] = None
-    spec_phase_aborted = False
     _release_cuda_cache()
-    attempt_idx = 0
-    for phase_name, batch in phases:
-        if phase_name == "base-only" and want_spec:
+    for attempt_idx, attempt_kwargs in enumerate(attempts, start=1):
+        try:
             print(
-                "[LOAD] All speculative attempts failed — falling back to base-only "
-                "(decode will be slower; raise VLLM_GPU_MEMORY_UTILIZATION or lower "
-                "VLLM_SPEC_MAX_MODEL_LEN if this persists)."
+                f"[LOAD] vLLM attempt {attempt_idx}/{len(attempts)}: "
+                f"max_model_len={attempt_kwargs.get('max_model_len')} "
+                f"gpu_util={attempt_kwargs.get('gpu_memory_utilization')}"
             )
-        for kwargs in batch:
-            if phase_name == "speculative" and spec_phase_aborted:
-                break
-            attempt_idx += 1
-            try:
-                spec_cfg = kwargs.get("speculative_config")
-                spec_tag = ""
-                if spec_cfg:
-                    spec_tag = (
-                        f" spec={spec_cfg.get('method')}"
-                        f" n={spec_cfg.get('num_speculative_tokens')}"
-                    )
-                print(
-                    f"[LOAD] vLLM attempt {attempt_idx}/{total_attempts} "
-                    f"({phase_name}): "
-                    f"max_model_len={kwargs.get('max_model_len')} "
-                    f"gpu_util={kwargs.get('gpu_memory_utilization')} "
-                    f"tp={kwargs.get('tensor_parallel_size', 1)} "
-                    f"eager={kwargs.get('enforce_eager')}{spec_tag}"
-                )
-                llm = LLM(**kwargs)
-                ctx = int(kwargs.get("max_model_len", 4096))
-                setattr(llm, "max_model_len", ctx)
-                setattr(
-                    llm,
-                    "speculative_decoding_enabled",
-                    bool(spec_cfg),
-                )
-                if spec_cfg:
-                    setattr(llm, "speculative_config", spec_cfg)
-                print(
-                    f"[LOAD] vLLM engine ready (max_model_len={ctx}; "
-                    f"Qwen native context can be 150k+ but KV cache limits this on GPU)."
-                )
-                if draft_path:
-                    setattr(llm, "dflash_draft_path", draft_path)
-                if spec_cfg:
-                    print(
-                        "[LOAD] vLLM speculative decoding ACTIVE "
-                        f"({spec_cfg.get('method')}, "
-                        f"n={spec_cfg.get('num_speculative_tokens')})"
-                    )
-                elif draft_path and ENABLE_VLLM_SPECULATIVE_DECODING:
-                    print(
-                        "[LOAD] [WARN] DFlash draft available but this attempt "
-                        "loaded WITHOUT speculative_config (VRAM fallback)."
-                    )
-                    if VLLM_REQUIRE_SPECULATIVE:
-                        print(
-                            "[LOAD] Rejecting base-only engine "
-                            "(VLLM_REQUIRE_SPECULATIVE=True)."
-                        )
-                        _release_cuda_cache()
-                        continue
-                return llm
-            except Exception as exc:
-                last_err = exc
-                if phase_name == "speculative" and _vllm_spec_attempt_should_abort(exc):
-                    print(
-                        "[LOAD] Aborting speculative load attempts — "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                    spec_phase_aborted = True
-                    _release_cuda_cache()
-                    break
-                print(
-                    f"[LOAD] vLLM attempt {attempt_idx} failed: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-                _release_cuda_cache()
-
-    if (
-        draft_path
-        and ENABLE_VLLM_SPECULATIVE_DECODING
-        and VLLM_REQUIRE_SPECULATIVE
-    ):
-        raise RuntimeError(
-            "[LOAD] DFlash speculative decoding required but all vLLM spec attempts "
-            f"failed for {gen_path}. Last error: {last_err}. "
-            "Try: restart kernel (fresh VRAM), set VLLM_SPEC_MAX_MODEL_LEN=12288, "
-            "VLLM_SPEC_PREFER_TENSOR_PARALLEL=2 on 4×L4, or "
-            "VLLM_SPECULATIVE_METHOD='draft_model' (stock vLLM has no 'dflash' method)."
-        ) from last_err
+            llm = LLM(**attempt_kwargs)
+            ctx = int(attempt_kwargs.get("max_model_len", DIFFUSION_MAX_MODEL_LEN))
+            setattr(llm, "max_model_len", ctx)
+            setattr(llm, "diffusiongemma_enabled", True)
+            print(f"[LOAD] DiffusionGemma engine ready (max_model_len={ctx})")
+            return llm
+        except Exception as exc:
+            last_err = exc
+            print(f"[LOAD] vLLM attempt {attempt_idx} failed: {type(exc).__name__}: {exc}")
+            _release_cuda_cache()
 
     if VLLM_FALLBACK_TO_HF:
-        print(
-            "[LOAD] All vLLM attempts failed; using HuggingFace generate fallback."
-        )
-        return HFGenerateEngine(
-            gen_path,
-            tokenizer,
-            dflash_draft_path=draft_path,
-            local_only=local_only,
-        )
+        print("[LOAD] All vLLM attempts failed; using HuggingFace generate fallback.")
+        return HFGenerateEngine(gen_path, tokenizer, local_only=local_only)
 
-    raise RuntimeError(
-        f"Failed to load inference engine for {gen_path}"
-    ) from last_err
-
+    raise RuntimeError(f"Failed to load inference engine for {gen_path}") from last_err
 
 def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
-    """
-    Fail fast before ARC eval if the engine cannot tokenize/generate.
-    Catches stale Kaggle copies (old HFGenerateEngine manual-forward loop) and
-    DFlash drafts mistakenly loaded as causal LMs.
-    """
+    """Fail fast before ARC eval if the engine cannot tokenize/generate."""
     engine_label = (
         "HF-fallback"
         if isinstance(llm, HFGenerateEngine)
         else getattr(type(llm), "__name__", str(type(llm)))
     )
     gen_path = getattr(llm, "model_path", None)
-    draft_path = getattr(llm, "dflash_draft_path", None)
     print("\n[VERIFY] Inference engine smoke test (parent/coordinator engine)")
     print(f"    script   : {SCRIPT_VERSION}")
     print(f"    engine   : {engine_label}")
@@ -4506,26 +2548,12 @@ def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
         )
     if gen_path:
         print(f"    generate : {gen_path}")
-    if draft_path:
-        print(f"    dflash   : {draft_path}")
-        spec_status = _inference_speculative_status(llm)
-        print(f"    spec_dec : {spec_status}")
-        if (
-            ENABLE_VLLM_SPECULATIVE_DECODING
-            and not isinstance(llm, HFGenerateEngine)
-            and not getattr(llm, "speculative_decoding_enabled", False)
-        ):
-            print(
-                "    [WARN] DFlash speculative INACTIVE — expect ~2-3x slower decode. "
-                "Restart kernel with more free VRAM or set VLLM_GPU_MEMORY_UTILIZATION=0.75."
-            )
     ctx = get_inference_max_context(llm)
-    print(f"    max_ctx  : {ctx} tokens (vLLM max_model_len / HF cap; Qwen native >> this)")
+    print(f"    max_ctx  : {ctx} tokens (vLLM max_model_len / HF cap)")
     if isinstance(llm, HFGenerateEngine) and ARC_TRY_VLLM:
         print(
-            "    [WARN] HF fallback active — ARC eval will be ~10-50x slower than vLLM "
-            "and DFlash speculative decoding is NOT used. Fix vLLM load or set "
-            "ARC_TRY_VLLM=False if intentional."
+            "    [WARN] HF fallback active — ARC eval will be ~10-50x slower than vLLM. "
+            "Fix vLLM load or set ARC_TRY_VLLM=False if intentional."
         )
     if ctx < arc_vllm_context_budget():
         print(
@@ -4536,10 +2564,7 @@ def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
     probe = "ARC smoke test."
     encoded = tokenizer(probe, return_tensors="pt", add_special_tokens=True)
     if encoded["input_ids"].shape[1] == 0:
-        raise RuntimeError(
-            "[VERIFY] Tokenizer produced empty input_ids. "
-            "Load tokenizer from the paired BASE model, not the DFlash draft."
-        )
+        raise RuntimeError("[VERIFY] Tokenizer produced empty input_ids.")
 
     sp = SamplingParams(temperature=0.0, max_tokens=1)
     setattr(sp, "stream_label", "VERIFY-smoke")
@@ -4549,8 +2574,7 @@ def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
         hint = ""
         if "cannot reshape tensor of 0 elements" in str(exc):
             hint = (
-                "\n  Likely cause: DFlash draft loaded as causal LM, or stale script "
-                f"(need SCRIPT_VERSION={SCRIPT_VERSION} in banner)."
+                f"\n  Likely cause: stale script (need SCRIPT_VERSION={SCRIPT_VERSION} in banner)."
             )
         raise RuntimeError(
             f"[VERIFY] Engine smoke test failed: {type(exc).__name__}: {exc}{hint}"
@@ -4594,33 +2618,21 @@ def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
             long_in = count_prompt_tokens(tokenizer, long_prompt)
             print(
                 f"    long_bench: {long_n} tok in {long_elapsed:.2f}s "
-                f"({long_tps:.1f} tok/s, prompt~{long_in}tok) "
-                f"spec={getattr(llm, 'speculative_decoding_enabled', False)}"
+                f"({long_tps:.1f} tok/s, prompt~{long_in}tok)"
             )
         except Exception as exc:
             print(f"    long_bench: skipped ({type(exc).__name__}: {exc})")
 
 
 def load_models(model_name: str):
-    """
-    Load one inference engine (vLLM preferred; HF fallback for custom DFlash checkpoints).
-    Also load a lightweight HF tokenizer copy for decode/encode consistency.
-    """
+    """Load DiffusionGemma inference engine + tokenizer."""
     local_only = os.path.isdir(model_name) and local_dir_exists(model_name)
-    if local_only:
-        gen_path, draft_path = resolve_generation_model_path(model_name)
-    else:
-        gen_path, draft_path = model_name, None
+    gen_path = resolve_generation_model_path(model_name) if local_only else model_name
     load_label = gen_path if local_only else f"{gen_path} (remote)"
     print(
-        f"\n[LOAD] Initializing inference engine for {load_label}"
+        f"\n[LOAD] Initializing DiffusionGemma engine for {load_label}"
         + ("" if local_only else " (this can take 30-120s on first download)...")
     )
-    if draft_path:
-        print(
-            f"[LOAD] DFlash draft paired: {draft_path} "
-            f"(vLLM speculative={'on' if ENABLE_VLLM_SPECULATIVE_DECODING else 'off'})"
-        )
     tokenizer = AutoTokenizer.from_pretrained(
         gen_path,
         trust_remote_code=True,
@@ -4629,192 +2641,54 @@ def load_models(model_name: str):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    llm = create_inference_engine(
-        gen_path,
-        tokenizer,
-        dflash_draft_path=draft_path,
-    )
+    llm = create_inference_engine(gen_path, tokenizer)
     if isinstance(llm, HFGenerateEngine):
         setattr(llm, "model_path", gen_path)
-    elif draft_path:
-        setattr(llm, "dflash_draft_path", draft_path)
     setattr(llm, "generation_model_path", gen_path)
 
     hf_model = None
     if isinstance(llm, HFGenerateEngine):
         hf_model = llm.model
-    else:
-        try:
-            snap = _cuda_vram_snapshot()
-            if snap["free_gib"] >= 10.0:
-                hf_model = _load_hf_generation_model(
-                    gen_path,
-                    dtype=torch.bfloat16
-                    if torch.cuda.is_bf16_supported()
-                    else torch.float16,
-                    local_only=local_only,
-                ).eval()
-                print(
-                    "[LOAD] Optional HF reference model also resident for hidden-state introspection."
-                )
-            else:
-                print(
-                    f"[LOAD] Skipping duplicate HF reference model "
-                    f"(only {snap['free_gib']:.1f} GiB free after vLLM)."
-                )
-        except Exception:
-            pass
-
     return llm, tokenizer, hf_model
 
-
-# =============================================================================
-# LOCAL KAGGLE LOADERS (optional dual-engine path when both checkpoints exist)
-# =============================================================================
 def load_local_models() -> Tuple[LLM, Any, Optional[LLM], Optional[Any]]:
-    """
-    Load local checkpoints without network access.
-
-    DFlash draft checkpoints are loaded as vLLM speculative_config draft models
-    (never as standalone causal LMs). A paired BASE causal LM must exist.
-
-    Returns: (primary_llm, primary_tokenizer, optional_second_llm, optional_second_tokenizer)
-    """
-    print("\n[LOCAL-LOAD] Checkpoint inventory:")
-    print(f"    ROOT   {KAGGLE_QWEN_BUNDLE_ROOT} -> "
-          f"{'OK' if os.path.isdir(KAGGLE_QWEN_BUNDLE_ROOT) else 'MISSING'}")
+    """Load local DiffusionGemma without network access."""
+    print("\n[LOCAL-LOAD] DiffusionGemma paths:")
     for tag, raw in (
-        ("BASE", LOCAL_BASE_DIR),
-        ("DFLASH", LOCAL_DFLASH_DIR),
+        ("KAGGLE", KAGGLE_DIFFUSIONGEMMA_DIR),
+        ("LOCAL", LOCAL_DIFFUSIONGEMMA_DIR),
         ("MODEL", LOCAL_MODEL_PATH),
     ):
         resolved = resolve_checkpoint_dir(raw) if raw else None
-        role = "n/a"
-        if resolved:
-            named = bundle_folder_role(resolved)
-            role = (
-                "BASE" if named == "base"
-                else "DRAFT" if named == "draft"
-                else (
-                    "FULL"
-                    if is_full_causal_lm_checkpoint(resolved)
-                    else ("DRAFT" if is_dflash_draft_checkpoint(resolved) else "UNKNOWN")
-                )
-            )
-        print(f"    {tag:<6} {raw or '—'} -> {resolved or 'MISSING'} [{role}]")
+        print(f"    {tag:<6} {raw or '—'} -> {resolved or 'MISSING'}")
         if resolved:
             print_checkpoint_diagnostics(resolved)
-
-    bundle_base, bundle_dflash = discover_qwen_dflash_bundle_paths()
-    if bundle_base or bundle_dflash:
-        print("[LOCAL-LOAD] Auto-discovered qwen3.5-4b-dflash bundle:")
-        print(f"    BASE   -> {bundle_base or 'MISSING'}")
-        print(f"    DFLASH -> {bundle_dflash or 'MISSING'}")
-
-    def _load_generation_engine(
-        gen_path: str,
-        *,
-        label: str,
-        gpu_util: float,
-        draft_path: Optional[str] = None,
-    ) -> Tuple[LLM, Any]:
-        print(f"\n[LOCAL-LOAD] {label}")
-        print(f"    generation: {gen_path}")
-        if draft_path:
-            print(
-                f"    dflash    : {draft_path} "
-                f"(vLLM speculative draft, "
-                f"method={VLLM_SPECULATIVE_METHOD})"
-            )
-        tokenizer = AutoTokenizer.from_pretrained(
-            gen_path, trust_remote_code=True, local_files_only=True
-        )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        llm = create_inference_engine(
-            gen_path,
-            tokenizer,
-            gpu_memory_utilization=gpu_util,
-            dflash_draft_path=draft_path,
-        )
-        if isinstance(llm, HFGenerateEngine):
-            setattr(llm, "model_path", gen_path)
-        setattr(llm, "generation_model_path", gen_path)
-        backend = "HF-fallback" if isinstance(llm, HFGenerateEngine) else "vLLM"
-        spec_line = (
-            f", {_inference_speculative_status(llm)}"
-            if draft_path or getattr(llm, "speculative_decoding_enabled", False)
-            else ""
-        )
-        print(
-            f"[LOCAL-LOAD] {os.path.basename(gen_path)} engine ready "
-            f"({backend}{spec_line})."
-        )
-        return llm, tokenizer
-
-    # Always load Qwen3.5-4B as the base/generation model — never classify it as draft.
-    base_path = resolve_checkpoint_dir(LOCAL_BASE_DIR)
-    if not base_path and os.path.isdir(KAGGLE_QWEN_BUNDLE_ROOT):
-        base_path = os.path.join(KAGGLE_QWEN_BUNDLE_ROOT, "Qwen3.5-4B")
-        if not local_dir_exists(base_path):
-            base_path = None
-
-    if base_path and local_dir_exists(base_path):
-        dflash_path = resolve_checkpoint_dir(LOCAL_DFLASH_DIR)
-        if not dflash_path and os.path.isdir(KAGGLE_QWEN_BUNDLE_ROOT):
-            candidate = os.path.join(KAGGLE_QWEN_BUNDLE_ROOT, "Qwen3.5-4B-DFlash")
-            if local_dir_exists(candidate):
-                dflash_path = candidate
-        gen_llm, gen_tok = _load_generation_engine(
-            base_path,
-            label="Base Qwen3.5-4B (generation)",
-            gpu_util=VLLM_GPU_MEMORY_UTILIZATION,
-            draft_path=dflash_path if dflash_path and is_dflash_draft_checkpoint(dflash_path) else None,
-        )
-        if dflash_path:
-            setattr(gen_llm, "dflash_draft_path", dflash_path)
-        return gen_llm, gen_tok, None, None
 
     ensure_model_available()
     primary = resolve_local_model_path()
     if primary is None:
         raise RuntimeError(
-            "[LOCAL-LOAD] No usable local checkpoint found after prefetch.\n"
-            "  Expected one of:\n"
-            f"    - {LOCAL_DFLASH_DIR}\n"
-            f"    - {LOCAL_BASE_DIR}\n"
-            f"    - LOCAL_MODEL_PATH = {LOCAL_MODEL_PATH!r}\n"
-            "    - any */config.json under /kaggle/input, /kaggle/working, or HF hub cache\n"
-            "  Turn Kaggle Internet ON and re-run from the top, or add dataset "
-            f"'{KAGGLE_DATASET_HANDLE}' as notebook Input.\n"
-            "  If using DFlash: also attach the paired BASE model at LOCAL_BASE_DIR "
-            f"({LOCAL_BASE_DIR!r})."
+            "[LOCAL-LOAD] No DiffusionGemma checkpoint found.\n"
+            f"  Add Kaggle Models input: google/diffusiongemma ({KAGGLE_DIFFUSIONGEMMA_DIR})"
         )
 
-    gen_path, draft_path = resolve_generation_model_path(primary)
-    llm, tok = _load_generation_engine(
-        gen_path,
-        label="Primary local checkpoint",
-        gpu_util=VLLM_GPU_MEMORY_UTILIZATION,
-        draft_path=draft_path,
+    gen_path = resolve_generation_model_path(primary)
+    tokenizer = AutoTokenizer.from_pretrained(
+        gen_path, trust_remote_code=True, local_only=True
     )
-    return llm, tok, None, None
-
-
-# =============================================================================
-# ARC-AGI DATASET EVALUATION (parameterized paths; data/ is not in git)
-# =============================================================================
-ARC_SPLIT_FILES = {
-    "training": (
-        "arc-agi_training_challenges.json",
-        "arc-agi_training_solutions.json",
-    ),
-    "evaluation": (
-        "arc-agi_evaluation_challenges.json",
-        "arc-agi_evaluation_solutions.json",
-    ),
-}
-
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    llm = create_inference_engine(
+        gen_path,
+        tokenizer,
+        gpu_memory_utilization=DIFFUSION_GPU_UTIL,
+    )
+    if isinstance(llm, HFGenerateEngine):
+        setattr(llm, "model_path", gen_path)
+    setattr(llm, "generation_model_path", gen_path)
+    backend = "HF-fallback" if isinstance(llm, HFGenerateEngine) else "vLLM"
+    print(f"[LOCAL-LOAD] {os.path.basename(gen_path)} engine ready ({backend}).")
+    return llm, tokenizer, None, None
 
 def discover_kaggle_arc_competition_dir() -> Optional[str]:
     """Find the ARC Prize competition mount under /kaggle/input/competitions."""
@@ -6887,10 +4761,7 @@ def arc_direct_generate(
     temperature: float = ARC_GENERATION_TEMPERATURE,
     seed: int = 42,
 ) -> Dict[str, Any]:
-    """
-    Single-pass generation for ARC eval.
-    When vLLM speculative decoding is active, DFlash draft+verify runs inside generate().
-    """
+    """Single-pass generation for ARC eval final grid synthesis."""
     del seed  # temperature 0 is deterministic; seed reserved for API compatibility
     sp = SamplingParams(
         temperature=float(temperature),
@@ -6912,7 +4783,6 @@ def arc_direct_generate(
     if out.outputs:
         gen_ids = list(out.outputs[0].token_ids)
     generated_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
-    spec_active = bool(getattr(vllm_llm, "speculative_decoding_enabled", False))
     result: Dict[str, Any] = {
         "final_text": prompt + generated_text,
         "generated_text": generated_text,
@@ -6926,8 +4796,7 @@ def arc_direct_generate(
         "acceptance_history": [1.0] if gen_ids else [0.0],
         "feature_history": [["DirectGenerate"]],
         "reframe_events": 0,
-        "generation_mode": "direct+speculative" if spec_active else "direct",
-        "speculative_decoding": spec_active,
+        "generation_mode": "direct",
     }
     gen_suffix = extract_arc_generated_suffix(result, prompt)
     parsed_grid = parse_arc_answer_grid(gen_suffix)
@@ -8048,50 +5917,10 @@ def _resolve_multi_agent_worker_script_path() -> str:
 
 
 def _resolve_voter_pool_gen_path() -> str:
-    """
-    Resolve BASE generation checkpoint for voter pool without loading a parent vLLM.
-    Tries local bundle paths first, then prefetch + pick_model_name().
-    """
-    if USE_DIFFUSIONGEMMA:
-        return resolve_diffusiongemma_model_path()
-
-    bundle_base, _bundle_draft = discover_qwen_dflash_bundle_paths()
-    for raw in (
-        bundle_base,
-        resolve_checkpoint_dir(LOCAL_BASE_DIR),
-        resolve_local_model_path(),
-    ):
-        if not raw:
-            continue
-        gen_path, _draft = resolve_generation_model_path(raw)
-        if gen_path and os.path.isdir(gen_path):
-            print(f"[VOTER-POOL] Generation checkpoint: {gen_path}", flush=True)
-            return os.path.abspath(gen_path)
-
-    ensure_model_available()
-    for raw in (resolve_local_model_path(),):
-        if not raw:
-            continue
-        gen_path, _draft = resolve_generation_model_path(raw)
-        if gen_path and os.path.isdir(gen_path):
-            print(f"[VOTER-POOL] Generation checkpoint (post-prefetch): {gen_path}", flush=True)
-            return os.path.abspath(gen_path)
-
-    model_name, _backend = pick_model_name()
-    gen_path, _draft = resolve_generation_model_path(model_name)
-    if gen_path and os.path.isdir(gen_path):
-        print(f"[VOTER-POOL] Generation checkpoint (resolved): {gen_path}", flush=True)
-        return os.path.abspath(gen_path)
-    if os.path.isdir(model_name):
-        print(f"[VOTER-POOL] Generation checkpoint (model id): {model_name}", flush=True)
-        return os.path.abspath(model_name)
-
-    raise RuntimeError(
-        "[VOTER-POOL] No BASE generation checkpoint found for voter pool. "
-        f"Tried bundle={bundle_base!r}, LOCAL_BASE_DIR={LOCAL_BASE_DIR!r}, "
-        f"pick_model_name()={model_name!r}."
-    )
-
+    """Resolve DiffusionGemma checkpoint for voter pool workers."""
+    path = resolve_diffusiongemma_model_path()
+    print(f"[VOTER-POOL] Generation checkpoint: {path}", flush=True)
+    return os.path.abspath(path)
 
 def _read_worker_stream_line(stream: Any, timeout_s: float) -> Optional[str]:
     """Read one line; None = timeout, '' = EOF."""
@@ -8426,7 +6255,7 @@ def _worker_restore_stdout_fd(saved_fd: int) -> None:
 
 
 def _multi_agent_worker_main(agent_id: int, gen_path: str) -> None:
-    """Subprocess entry: one Qwen engine pinned to CUDA_VISIBLE_DEVICES from parent env."""
+    """Subprocess entry: one DiffusionGemma engine pinned to CUDA_VISIBLE_DEVICES from parent env."""
     gpu_id = int(os.environ.get("MBR_WORKER_GPU", "0"))
     saved_stdout = sys.stdout
     saved_stdout_fd = _worker_redirect_stdout_fd_to_stderr()
@@ -8446,10 +6275,6 @@ def _multi_agent_worker_main(agent_id: int, gen_path: str) -> None:
         )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        draft_path = None
-        if not ARC_MULTI_AGENT_DISABLE_SPECULATIVE:
-            _, auto_draft = resolve_generation_model_path(gen_path)
-            draft_path = auto_draft
         gpu_util = (
             float(ARC_MULTI_AGENT_GPU_UTIL)
             if float(ARC_MULTI_AGENT_GPU_UTIL) > 0
@@ -8472,7 +6297,6 @@ def _multi_agent_worker_main(agent_id: int, gen_path: str) -> None:
             gen_path,
             tokenizer,
             gpu_memory_utilization=gpu_util,
-            dflash_draft_path=draft_path,
         )
         print(
             f"[VOTER-WORKER {agent_id}] cuda:{gpu_id} vLLM ready "
@@ -8567,7 +6391,7 @@ def _multi_agent_worker_main(agent_id: int, gen_path: str) -> None:
 
 class MultiAgentEnginePool:
     """
-    N persistent Qwen subprocess workers (spawn + CUDA_VISIBLE_DEVICES per child).
+    N persistent DiffusionGemma subprocess workers (spawn + CUDA_VISIBLE_DEVICES per child).
     Each test case runs MBR on all agents in parallel, then plurality-votes grids.
     """
 
@@ -8576,9 +6400,7 @@ class MultiAgentEnginePool:
         gen_path: str,
         *,
         n_agents: int = ARC_MULTI_AGENT_N,
-        draft_path: Optional[str] = None,
     ) -> None:
-        del draft_path  # draft path resolved inside workers when speculative enabled
         self.gen_path = os.path.abspath(gen_path)
         self.n_agents = max(1, int(n_agents))
         self.n_gpus = max(1, torch.cuda.device_count() if torch.cuda.is_available() else 1)
@@ -8883,18 +6705,9 @@ def print_arc_pipeline_architecture(
         )
     print("")
     print(
-        f"  BENCHMARK_K={K} is for the demo/token-speculative path only — "
+        f"  BENCHMARK_K={K} is for the demo/benchmark path only — "
         f"ARC hypothesis count is ARC_HYPOTHESIS_SLOTS={ARC_HYPOTHESIS_SLOTS}"
     )
-    if vllm_llm is not None:
-        print(
-            f"  vLLM native DFlash speculative: {_inference_speculative_status(vllm_llm)} "
-            f"(ENABLE_VLLM_SPECULATIVE_DECODING={ENABLE_VLLM_SPECULATIVE_DECODING})"
-        )
-    else:
-        print(
-            "  vLLM native DFlash speculative: n/a (multi-agent parent; each worker loads its own engine)"
-        )
     print("=" * 80 + "\n")
 
 
@@ -8955,7 +6768,7 @@ def evaluate_arc_dataset(
     voter_pool_single_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Run million-brains-dflash on an ARC-AGI split.
+    Run Million-Brains DiffusionGemma ARC-AGI evaluation on a split.
     Requires explicit challenges + solutions paths (typically under data/, gitignored).
     """
     dataset = load_arc_dataset(challenges_path, solutions_path)
@@ -9032,11 +6845,6 @@ def evaluate_arc_dataset(
             f"[CONFIG] Voter pool: SINGLE ENGINE ({reason}) | "
             f"Phase1={arc_hypothesis_k()} props/test | Phase2=1 grid/test"
         )
-        if vllm_llm is not None:
-            print(
-                f"[CONFIG] vLLM speculative: {_inference_speculative_status(vllm_llm)} "
-                f"(ENABLE_VLLM_SPECULATIVE_DECODING={ENABLE_VLLM_SPECULATIVE_DECODING})"
-            )
     if visual_grading and ARC_SAVE_GRADE_IMAGES:
         print(f"Grade images: {_arc_grade_output_dir()}/")
     print("-" * 80)
@@ -9370,7 +7178,7 @@ def evaluate_arc_dataset(
 
 def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="one-million-brains-dflash benchmark and ARC-AGI evaluation"
+        description="Million-Brains DiffusionGemma benchmark and ARC-AGI evaluation"
     )
     parser.add_argument(
         "--arc-profile",
@@ -9444,29 +7252,17 @@ def benchmark(
     prompt: str,
     max_new: int = TARGET_MAX_TOKENS,
 ):
-    """
-    Run one-million-brains-dflash (K=4, permutation-based feature-slot allocation).
-    Reports tokens/sec, avg accepted tokens per block, feature reallocation count,
-    and sample text.
-    """
+    """Run Million-Brains DiffusionGemma conditioned denoising benchmark."""
     print("\n" + "=" * 80)
-    engine_tag = (
-        "MILLION-BRAINS-DIFFUSIONGEMMA"
-        if USE_DIFFUSIONGEMMA
-        else "MILLION-BRAINS-DFLASH"
-    )
-    print(f"BENCHMARK: {engine_tag} (BENCHMARK_K={K} — demo only, not ARC eval)")
+    print(f"BENCHMARK: MILLION-BRAINS-DIFFUSIONGEMMA (BENCHMARK_K={K} — demo only, not ARC eval)")
     print("=" * 80)
     print(f"Prompt (first 180 chars): {prompt[:180]}...")
     print(
         f"Target generation length: {max_new} tokens | Block size: {BLOCK_SIZE} | K: {K}"
     )
-    print(f"vLLM speculative: {_inference_speculative_status(vllm_llm)}")
     print("-" * 80)
 
-    print(
-        "\n[MBR] Running full one-million-brains-dflash (permutation allocator + CTSB smoothing + cross-stream integration + adaptive reallocation) ..."
-    )
+    print("\n[MBR] Running Million-Brains DiffusionGemma conditioned denoising ...")
     t0 = time.perf_counter()
     allocator = PermutationFeatureSlotAllocator(
         internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=K
@@ -9539,7 +7335,7 @@ if __name__ == "__main__":
     args = parse_cli_args()
 
     print(
-        "\n[million_brains_dflash.py] Starting full one-million-brains-dflash (Fast Million Brains) Kaggle run"
+        "\n[million_brains_dflash.py] Starting Million-Brains DiffusionGemma Kaggle run"
     )
     print(f"    SCRIPT_VERSION={SCRIPT_VERSION}")
     print(
@@ -9547,9 +7343,7 @@ if __name__ == "__main__":
         f"BENCHMARK_K={K} (demo only) | BLOCK_SIZE={BLOCK_SIZE}"
     )
     print(
-        f"    ENGINE: diffusiongemma={USE_DIFFUSIONGEMMA} "
-        f"canvas={DIFFUSION_CANVAS_LENGTH} denoise_k={K} | "
-        f"speculative=False dflash_patch=False | "
+        f"    ENGINE: DiffusionGemma canvas={DIFFUSION_CANVAS_LENGTH} denoise_k={K} | "
         f"spatial_ensemble={ARC_SPATIAL_GRID_ENSEMBLE} "
         f"phase1_parallel={ARC_PHASE1_PROMPT_PARALLELISM}"
     )
@@ -9564,9 +7358,7 @@ if __name__ == "__main__":
         args.eval_challenges, args.eval_solutions, args.arc_source
     )
 
-    # 1) Live-edit banner was already printed right after the patcher ran.
-
-    # 2) Optional one-time prefetch when Kaggle Internet is enabled
+    # Optional one-time prefetch when Kaggle Internet is enabled
     ensure_model_available()
 
     # 3) Choose & load model (voter pool is default for ARC eval; single engine for demo only)
@@ -9581,40 +7373,19 @@ if __name__ == "__main__":
         and args.eval_challenges
         and args.eval_solutions
     )
-    use_multi_agent = (
-        ARC_MULTI_AGENT_ENABLED
-        and run_arc_eval
-        and not (
-            VLLM_SINGLE_ENGINE_SPECULATIVE
-            and ENABLE_VLLM_SPECULATIVE_DECODING
-        )
-    )
+    use_multi_agent = ARC_MULTI_AGENT_ENABLED and run_arc_eval
     print(
         f"[CONFIG] voter_pool={'REQUIRED x' + str(ARC_MULTI_AGENT_N) if use_multi_agent else 'off (demo/single)'} | "
         f"hypothesis_slots={ARC_HYPOTHESIS_SLOTS}/test/phase1 | "
         f"run_arc_eval={run_arc_eval} | ARC_MULTI_AGENT_REQUIRED={ARC_MULTI_AGENT_REQUIRED}"
     )
-    if (
-        ARC_MULTI_AGENT_ENABLED
-        and run_arc_eval
-        and not use_multi_agent
-        and ENABLE_VLLM_SPECULATIVE_DECODING
-    ):
-        msg = (
-            "VLLM_SINGLE_ENGINE_SPECULATIVE=True with native spec ON blocks voter pool"
-        )
-        if ARC_MULTI_AGENT_REQUIRED:
-            raise RuntimeError(f"[VOTER-POOL] {msg}")
-        voter_pool_single_reason = msg
-        print(f"[VOTER-POOL] Skipped — {msg}")
-
     if use_multi_agent:
         try:
             gen_path = _resolve_voter_pool_gen_path()
             model_name = gen_path
             worker_entry = _resolve_multi_agent_worker_script_path()
             print(
-                f"\n[VOTER-POOL] Spawning {ARC_MULTI_AGENT_N} subprocess Qwen voters "
+                f"\n[VOTER-POOL] Spawning {ARC_MULTI_AGENT_N} subprocess DiffusionGemma voters "
                 f"(entry={worker_entry}; parent does not load vLLM)."
             )
             multi_agent_pool = create_multi_agent_pool(gen_path)
@@ -9641,21 +7412,15 @@ if __name__ == "__main__":
             )
         voter_pool_single_reason = "ARC_MULTI_AGENT_ENABLED=False"
         if PREFER_LOCAL_MODELS:
-            dflash_llm, dflash_tok, base_llm, base_tok = load_local_models()
-            vllm_llm, tokenizer, hf_model = dflash_llm, dflash_tok, None
-            model_name = resolve_local_model_path() or LOCAL_DFLASH_DIR or "local"
-            if base_llm is not None:
-                _available_engines = {"dflash": dflash_llm, "base": base_llm}
+            vllm_llm, tokenizer, hf_model = load_local_models()[:3]
+            model_name = resolve_local_model_path() or KAGGLE_DIFFUSIONGEMMA_DIR
         else:
             model_name, _backend = pick_model_name()
             vllm_llm, tokenizer, hf_model = load_models(model_name)
     elif PREFER_LOCAL_MODELS:
         try:
-            dflash_llm, dflash_tok, base_llm, base_tok = load_local_models()
-            vllm_llm, tokenizer, hf_model = dflash_llm, dflash_tok, None
-            model_name = resolve_local_model_path() or LOCAL_DFLASH_DIR or "local"
-            if base_llm is not None:
-                _available_engines = {"dflash": dflash_llm, "base": base_llm}
+            vllm_llm, tokenizer, hf_model = load_local_models()[:3]
+            model_name = resolve_local_model_path() or KAGGLE_DIFFUSIONGEMMA_DIR
         except RuntimeError as _local_e:
             print(_local_e)
             print("[LOCAL-LOAD] Falling back to remote model resolution...")
@@ -9666,7 +7431,7 @@ if __name__ == "__main__":
         vllm_llm, tokenizer, hf_model = load_models(model_name)
 
     # 4) Sanity: force the banner again so it is unmistakable in the log
-    print_one_million_brains_banner(_LIVE_PATCH_SUCCESS)
+    print_one_million_brains_banner(True)
 
     if multi_agent_pool is None:
         verify_inference_engine(vllm_llm, tokenizer)

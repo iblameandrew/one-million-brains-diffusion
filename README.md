@@ -1,94 +1,44 @@
-# one-million-brains-speculative-decoding
+# one-million-brains-diffusiongemma
 
 
 <img width="784" height="1168" alt="image" src="https://github.com/user-attachments/assets/41dd8f5d-7fb1-4437-acd5-ddc00146e6d9" />
 
 
-**Permutation-Gated Feature-Slot Speculative Decoding** — the Fast Million Brains approach.
+**Permutation-Gated Feature-Slot Diffusion** — the Fast Million Brains approach on DiffusionGemma.
 
-I'm very much of the idea that intelligence means: reasembling perspectives; sometimes models get stuck at spurious minima. This repo combines two meaningful work streams of mine: iblameandrew/patterns and iblameandrew/open-deepthink . Esentially here i wire together super-diffusion blocks in a speculative decoder using grammars of function-calls: if your biggest conditional signal on the outcome is the system prompt, why not hot-swap it? All done in real time, without prompting. Last ARC-AGI-2  edition i got stuck with my QNN algorithm because it relied on a multi agent system that took 30 min per problem. This is a complete, self-contained, runnable Kaggle script (`million_brains_dflash.py`) that implements an advanced, live-wired QNN speculative decoding architecture on top of vLLM fast kernels.
+This repo wires a deterministic circuit grammar (12 spatial primitives, K parallel slots per denoise step) into DiffusionGemma block-diffusion via orchestration-layer conditioning — not draft-model speculative decoding.
 
 ## What it is
 
-Instead of a single linear draft, this system maintains a small fixed bank of **12 personality features** (cognitive biases / thinking styles):
+- **Engine:** DiffusionGemma (vLLM `diffusion_config` + entropy-bound denoising)
+- **Controller:** `PermutationFeatureSlotAllocator` + CTSB circuit smoothing + adaptive reallocation
+- **Per step:** K conditioned trajectories → cross-stream fusion → cumprod verification → commit into canvas
+- **ARC eval:** spatial grid ensemble (Phase-1 hypotheses + pixel majority vote) with optional multi-agent voter pool
 
-- PreciseAnchor, CreativeExplorer, LogicalReasoner, SelfCritic, Reframer, Synthesizer, DevilAdvocate, PatternMatcher, EdgeCaseHunter, ContextGrounding, Abstractor, MirrorReflector
+## Key files
 
-At every super-block it uses a **deterministic permutation grammar** (combinadic unranking of P(12, K)) to select and assign K distinct features to K parallel "feature-slots". Each slot runs with its own feature embedding bias, positional offset, and sampling hyperparameters.
+- `million_brains_dflash.py` — full Kaggle script (installs vLLM, loads DiffusionGemma, runs benchmark + ARC eval)
+- `mbr_voter_worker.py` — thin voter-pool worker entry
 
-A lightweight two-phase process (independent drafting → cross-stream fusion) + target verification + generalized cumprod acceptance allows the system to accept variable-length coherent continuations while exploring multiple reasoning trajectories in parallel.
+## Quick start (Kaggle)
 
-Adaptive reallocation ("mirror descent") swaps under-performing features out of slots on the fly.
+1. Add Models input: `google/diffusiongemma` → `diffusiongemma-26b-a4b-it`
+2. Add competition input: `arc-prize-2026-arc-agi-2` (for eval)
+3. Paste/run `million_brains_dflash.py` (A100+ recommended for 26B)
+4. Expect banner: `ONE-MILLION-BRAINS-DIFFUSIONGEMMA INITIALIZED`
 
-This is the **Fast Million Brains** idea: rapidly reconfiguring a compact set of high-signal cognitive circuits into thousands of different parallel thought configurations every few tokens, rather than relying on a single sequential stream.
+## Circuit grammar (orchestration layer)
 
-## Key Files
+At each denoise super-block:
 
-- `million_brains_dflash.py` — the full implementation (installs vLLM + dependencies, live monkey-patches for DFlash-style extension, runs the million-brains-dflash benchmark).
+1. Hash pooled history → permutation of K features from 12 primitives
+2. CTSB geodesic step limits circuit jumps; SPI blends sampling params
+3. K parallel `vllm_llm.generate()` calls with per-slot lens prompts
+4. Fusion + target verification + cumprod acceptance
+5. Committed text feeds the next circuit selection
 
-## Quick Start (Kaggle)
+Feature injection is **prompt + sampling-params** level today (not hidden-state kernel patch).
 
-1. Upload `million_brains_dflash.py` as a Script or Notebook.
-2. Run it. It will:
-   - `!pip install ...` (or equivalent)
-   - Perform the live-edit / monkey-patch of vLLM draft mechanisms
-   - Print the **MILLION-BRAINS-DFLASH INITIALIZED** banner
-   - Load a small Qwen model (with fallbacks)
-   - Run the million-brains-dflash benchmark (K=4 feature-slot parallel mode)
-   - Report tokens/sec, average accepted tokens per block, feature reallocations, etc.
+## License / usage
 
-## How the "Grammar" Works
-
-The core combinatorial engine lives in `PermutationFeatureSlotAllocator`:
-
-- `hash_to_feature_permutation(pooled_vec, step, n=12, k=4)` — turns previous verification hidden state into a stable seed → rank → ordered K-tuple via factorial number system unranking.
-- This produces a valid injection: which 4 features go into which of the K slots for the next super-block.
-- Feature vectors, stream-positional embeddings, and per-feature sampling params are then applied to the K parallel streams.
-- After drafting + fusion + verification, the new pooled state feeds the next permutation.
-
-All 11,880 possible allocations (for K=4) are reachable and deterministic given history. The "circuits" (feature embeddings, gates, sampling biases) are fixed atoms; the grammar composes them into new temporary parallel reasoning circuits on every super-block.
-
-## Current Implementation Notes
-
-- High-level simulation using vLLM's `LLM.generate()` with batched heterogeneous requests (vLLM handles the actual multi-request batching).
-- Feature injection and cross-stream "group think" are approximated via per-request SamplingParams + Python-side fusion.
-- The low-level vision (true per-slot hierarchical attention masks, feature embeddings added inside the model forward, proper shared-prefix KV for divergent branches) is documented in the code comments and the `NexusDFlashDraftModel` / patcher sections for future deeper integration.
-
-## Benchmark Output (example)
-
-The script ends with a results table:
-
-- Tokens/sec for million-brains-dflash
-- Average accepted tokens per super-block
-- Number of feature reallocations (how often the permutation grammar + mirror mechanism swapped in better features)
-- Sample generated output
-
-## Requirements
-
-- vLLM (mainstream recent version)
-- transformers, accelerate, flash-attn
-- CUDA GPU (tested conceptually on 4060m-class hardware; scales with better batching hardware)
-
-## Theoretical Speedup
-
-See earlier analysis in the thread. With a baseline of ~40 tps on a 4B model:
-
-- Realistic: 1.6×–2.2× (64–88+ tps)
-- At an assumed effective 300 tps system throughput: a hard math olympiad problem is estimated to take **~35–70 seconds** of wall time for a rigorous solution (highly dependent on actual acceptance rate `α` achieved by the parallel feature slots).
-
-## Future Directions (not yet implemented)
-
-- Lower-level vLLM integration (LLMEngine + custom model runner) for true prefix KV sharing and tree attention across branches.
-- Actual injection of `feature_emb` / per-feature gating inside the transformer forward pass.
-- Custom hierarchical attention masks matching the documented two-phase Group Think / non-causal intra-block + causal inter-block design.
-- Proper training or distillation of the feature embedding tables.
-
-## License / Usage
-
-Educational + research prototype. The code is heavily commented for clarity around the permutation math, the feature-slot allocator, and the speculative acceptance logic.
-
-Pull requests and experiments welcome — especially measurements of real acceptance rates on reasoning-heavy prompts and attempts at deeper vLLM patching.
-
----
-
-Built as a thought experiment in "fast million brains" inference: a small number of high-quality fixed cognitive circuits + an extremely fast deterministic grammar that can reconfigure them into many parallel reasoning paths on every super-block.
+Educational + research prototype. Pull requests welcome.
