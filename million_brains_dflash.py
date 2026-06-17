@@ -203,11 +203,16 @@ elif not _MBR_WORKER_SUBPROCESS:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-19-diffusion"  # DiffusionGemma + hard-wired MBR conditioned denoising
+SCRIPT_VERSION = "2026-06-19-diffusion-b"  # Kaggle Models path for DiffusionGemma
 # --- DiffusionGemma core (default engine) ---
 USE_DIFFUSIONGEMMA = True  # True = DiffusionGemma denoising + MBR conditioning (no DFlash draft)
-DIFFUSIONGEMMA_MODEL_PRIMARY = "RedHatAI/diffusiongemma-26B-A4B-it-NVFP4"
-DIFFUSIONGEMMA_MODEL_FALLBACK = "google/diffusiongemma-26B-A4B-it"
+# Kaggle: Add Input -> Models -> google/diffusiongemma -> diffusiongemma-26b-a4b-it
+KAGGLE_DIFFUSIONGEMMA_DIR = (
+    "/kaggle/input/models/google/diffusiongemma/transformers/diffusiongemma-26b-a4b-it/1"
+)
+LOCAL_DIFFUSIONGEMMA_DIR = KAGGLE_DIFFUSIONGEMMA_DIR  # override for local dev if needed
+DIFFUSIONGEMMA_MODEL_PRIMARY = "google/diffusiongemma-26B-A4B-it"  # HF id (offline fallback)
+DIFFUSIONGEMMA_MODEL_FALLBACK = "RedHatAI/diffusiongemma-26B-A4B-it-NVFP4"  # NVFP4 variant
 DIFFUSION_CANVAS_LENGTH = 256  # vLLM diffusion_config canvas block size
 DIFFUSION_MAX_NUM_SEQS = 4  # vLLM recipe: keep low (diffusion state ∝ max_seqs × canvas × vocab)
 DIFFUSION_ENTROPY_BOUND = 0.1  # entropy-bound denoising sampler
@@ -1215,20 +1220,53 @@ def make_target_verify_sampling_params() -> SamplingParams:
 # DIFFUSIONGEMMA + MILLION-BRAINS CONDITIONED DENOISING
 # =============================================================================
 def resolve_diffusiongemma_model_path() -> str:
-    """Pick NVFP4 primary, full-precision fallback, or local cache."""
-    for candidate in (DIFFUSIONGEMMA_MODEL_PRIMARY, DIFFUSIONGEMMA_MODEL_FALLBACK):
-        local = resolve_checkpoint_dir(candidate.split("/")[-1])
-        if local and local_dir_exists(local):
-            print(f"[DIFFUSION] Local DiffusionGemma checkpoint: {local}")
-            return local
+    """
+    Resolution order:
+      1. KAGGLE_DIFFUSIONGEMMA_DIR (Kaggle Models mount)
+      2. Auto-scan /kaggle/input/models/google/diffusiongemma/
+      3. HF hub cache
+      4. Remote HF model id
+    """
+    for raw in (LOCAL_DIFFUSIONGEMMA_DIR, KAGGLE_DIFFUSIONGEMMA_DIR):
+        if not raw:
+            continue
+        resolved = resolve_checkpoint_dir(raw)
+        if resolved and local_dir_exists(resolved):
+            print(f"[DIFFUSION] Kaggle DiffusionGemma checkpoint: {resolved}")
+            return resolved
+
+    kaggle_models_root = "/kaggle/input/models/google/diffusiongemma"
+    if os.path.isdir(kaggle_models_root):
+        found: List[str] = []
+
+        def _walk(base: str, depth: int = 0) -> None:
+            if depth > 6:
+                return
+            if local_dir_exists(base):
+                found.append(os.path.abspath(base))
+                return
+            try:
+                for entry in sorted(os.listdir(base)):
+                    if entry.startswith("."):
+                        continue
+                    _walk(os.path.join(base, entry), depth + 1)
+            except OSError:
+                pass
+
+        _walk(kaggle_models_root)
+        if found:
+            best = sorted(found, key=lambda p: (-len(p), p))[0]
+            print(f"[DIFFUSION] Discovered DiffusionGemma under Kaggle Models: {best}")
+            return best
+
     for candidate in (DIFFUSIONGEMMA_MODEL_PRIMARY, DIFFUSIONGEMMA_MODEL_FALLBACK):
         cache = _hf_hub_snapshot_path(candidate)
         if cache and local_dir_exists(cache):
             print(f"[DIFFUSION] HF cache DiffusionGemma: {cache}")
             return cache
     print(
-        f"[DIFFUSION] Using remote model id: {DIFFUSIONGEMMA_MODEL_PRIMARY} "
-        f"(fallback {DIFFUSIONGEMMA_MODEL_FALLBACK})"
+        f"[DIFFUSION] No local checkpoint — will fetch {DIFFUSIONGEMMA_MODEL_PRIMARY!r} "
+        f"(add Kaggle Models input: google/diffusiongemma)"
     )
     return DIFFUSIONGEMMA_MODEL_PRIMARY
 
