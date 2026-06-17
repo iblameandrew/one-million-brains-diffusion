@@ -180,7 +180,7 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-16t"  # bump when re-uploading to Kaggle to confirm latest script
+SCRIPT_VERSION = "2026-06-16u"  # bump when re-uploading to Kaggle to confirm latest script
 K = 4  # number of parallel drafter streams / feature-slots per super-block
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
 BLOCK_SIZE = 6  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
@@ -262,7 +262,8 @@ ARC_EVAL_GENERATION_MODE = "direct"
 ARC_USE_CHAT_TEMPLATE = True  # Qwen3.5 expects chat_template.jinja wrapping
 ARC_DISABLE_THINKING = not STREAM_PRINT_THINKING  # False = model may emit <think> blocks
 ARC_STRUCTURED_THINKING = True  # require incremental HYPOTHESIS_GRID inside <think>
-ARC_PRINT_STEP_MATRICES = True  # full ASCII grids at every MBR draft slot + commit
+ARC_PRINT_STEP_MATRICES = False  # debug: ASCII grids at every MBR draft slot + commit
+ARC_PRINT_FINAL_MATRICES = True  # one final ASCII summary per test (gold + preds + verdict + timing)
 ARC_ASSISTANT_PREFILL = "[["  # chat prefill anchors JSON grid (skipped when thinking is on)
 ARC_GENERATION_TEMPERATURE = 0.0  # greedy JSON for grid tasks
 EVAL_SMOKE_TASK_ID = None  # e.g. "0934a4d8" — run only this task (overrides max_tasks slice)
@@ -4461,6 +4462,77 @@ def print_arc_answer_comparison(
     print(bar, flush=True)
 
 
+def print_arc_final_result(
+    *,
+    task_id: str,
+    task_idx: int,
+    num_tasks: int,
+    test_index: int,
+    test_input: List[List[int]],
+    gold: List[List[int]],
+    classic_pred: Optional[List[List[int]]],
+    mbr_pred: Optional[List[List[int]]],
+    classic_stats: Dict[str, Any],
+    mbr_stats: Dict[str, Any],
+    classic_timing: Optional[Dict[str, Any]] = None,
+    mbr_timing: Optional[Dict[str, Any]] = None,
+    split: str = ARC_DATA_SPLIT,
+) -> None:
+    """Single end-of-test summary: verdict, timing, and final gold vs prediction grids."""
+    c_verdict = _grade_verdict_label(classic_stats)
+    m_verdict = _grade_verdict_label(mbr_stats)
+    c_icon = "PASS" if classic_stats["correct"] else "FAIL"
+    m_icon = "PASS" if mbr_stats["correct"] else "FAIL"
+    c_time = format_timing_line(classic_timing) if classic_timing else "n/a"
+    m_time = format_timing_line(mbr_timing) if mbr_timing else "n/a"
+    in_shape = _grid_shape_label(test_input)
+
+    bar = "═" * 78
+    print(f"\n{bar}")
+    print(
+        f"ARC FINAL  task {task_idx + 1}/{num_tasks}  id={task_id}  "
+        f"split={split}  test=#{test_index}  input={in_shape}"
+    )
+    print(
+        f"  CLASSIC [{c_icon}] {c_verdict:<12}  "
+        f"{classic_stats['matching_cells']}/{classic_stats['gold_cells']} cells  |  {c_time}"
+    )
+    print(
+        f"  MBR     [{m_icon}] {m_verdict:<12}  "
+        f"{mbr_stats['matching_cells']}/{mbr_stats['gold_cells']} cells  |  {m_time}"
+    )
+    print(bar)
+
+    blocks = [
+        _render_grid_ascii(gold, title=f"GOLD ({_grid_shape_label(gold)})"),
+    ]
+    if classic_pred:
+        blocks.append(
+            _render_grid_ascii(
+                classic_pred,
+                title=f"CLASSIC [{c_verdict}]",
+                diff_against=gold,
+                pred_for_diff=classic_pred,
+            )
+        )
+    else:
+        blocks.append(["CLASSIC [UNPARSED]", "  (no valid grid)"])
+    if mbr_pred:
+        blocks.append(
+            _render_grid_ascii(
+                mbr_pred,
+                title=f"MBR [{m_verdict}]",
+                diff_against=gold,
+                pred_for_diff=mbr_pred,
+            )
+        )
+    else:
+        blocks.append(["MBR [UNPARSED]", "  (no valid grid)"])
+    for line in _align_grid_columns(blocks):
+        print("  " + line)
+    print(bar, flush=True)
+
+
 def print_arc_classic_interim(
     *,
     task_id: str,
@@ -4480,19 +4552,20 @@ def print_arc_classic_interim(
         f"\n[ARC] {task_idx + 1}/{num_tasks} {task_id} test#{test_index} "
         f"— CLASSIC done [{c_tag}] | {format_timing_line(classic_timing)}"
     )
-    arc_eval_log(f"  GOLD    : {format_grid_json(gold)}")
-    arc_eval_log(
-        f"  CLASSIC : {format_grid_json(classic_pred)} "
-        f"({classic_stats['matching_cells']}/{classic_stats['gold_cells']} cells)"
-    )
-    if classic_raw_tail and not classic_stats.get("parsed"):
-        last_anchor = classic_raw_tail.rfind("[[")
-        snippet = (
-            classic_raw_tail[last_anchor : last_anchor + 800]
-            if last_anchor >= 0
-            else classic_raw_tail[-800:]
+    if not ARC_PRINT_FINAL_MATRICES:
+        arc_eval_log(f"  GOLD    : {format_grid_json(gold)}")
+        arc_eval_log(
+            f"  CLASSIC : {format_grid_json(classic_pred)} "
+            f"({classic_stats['matching_cells']}/{classic_stats['gold_cells']} cells)"
         )
-        arc_eval_log(f"  CLASSIC raw (unparsed, last [[ attempt): {snippet}")
+        if classic_raw_tail and not classic_stats.get("parsed"):
+            last_anchor = classic_raw_tail.rfind("[[")
+            snippet = (
+                classic_raw_tail[last_anchor : last_anchor + 800]
+                if last_anchor >= 0
+                else classic_raw_tail[-800:]
+            )
+            arc_eval_log(f"  CLASSIC raw (unparsed, last [[ attempt): {snippet}")
     if ARC_RUN_MBR_EVAL:
         arc_eval_log("  (running million-brains pass next…)")
 
@@ -4804,7 +4877,7 @@ def grade_arc_test_case(
     classic_stats = grid_cell_stats(classic_pred, gold)
     mbr_stats = grid_cell_stats(mbr_pred, gold)
 
-    if ARC_VISUAL_GRADING:
+    if ARC_VISUAL_GRADING and not ARC_PRINT_FINAL_MATRICES:
         print_arc_grade_card(
             task_id=task_id,
             task_idx=task_idx,
@@ -4910,7 +4983,10 @@ def evaluate_arc_dataset(
     print(f"ARC eval verbose (MBR internals): {ARC_EVAL_VERBOSE}")
     print(f"Stream generation: {STREAM_GENERATION} | stream all: {STREAM_ALL_OUTPUT}")
     print(f"Stream thinking: {STREAM_PRINT_THINKING} | disable_thinking={ARC_DISABLE_THINKING}")
-    print(f"Structured thinking: {ARC_STRUCTURED_THINKING} | step matrices: {ARC_PRINT_STEP_MATRICES}")
+    print(
+        f"Structured thinking: {ARC_STRUCTURED_THINKING} | "
+        f"step matrices: {ARC_PRINT_STEP_MATRICES} | final matrices: {ARC_PRINT_FINAL_MATRICES}"
+    )
     if EVAL_SMOKE_TASK_ID:
         print(f"Smoke task only: {EVAL_SMOKE_TASK_ID}")
     print(
@@ -5078,6 +5154,23 @@ def evaluate_arc_dataset(
             classic_stats = grade_info["classic_stats"]
             mbr_stats = grade_info["mbr_stats"]
 
+            if ARC_PRINT_FINAL_MATRICES:
+                print_arc_final_result(
+                    task_id=task_id,
+                    task_idx=task_idx,
+                    num_tasks=len(task_ids),
+                    test_index=test_index,
+                    test_input=test_input,
+                    gold=gold,
+                    classic_pred=classic_pred,
+                    mbr_pred=mbr_pred,
+                    classic_stats=classic_stats,
+                    mbr_stats=mbr_stats,
+                    classic_timing=classic_timing,
+                    mbr_timing=mbr_timing,
+                    split=split,
+                )
+
             comparison_rec = {
                 "task_id": task_id,
                 "task_idx": task_idx,
@@ -5102,7 +5195,7 @@ def evaluate_arc_dataset(
             }
             summary["answer_comparisons"].append(comparison_rec)
 
-            if ARC_PRINT_ALL_ANSWERS:
+            if ARC_PRINT_ALL_ANSWERS and not ARC_PRINT_FINAL_MATRICES:
                 print_arc_answer_comparison(
                     task_id=task_id,
                     task_idx=task_idx,
