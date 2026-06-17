@@ -180,7 +180,7 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-17j"  # bump when re-uploading to Kaggle to confirm latest script
+SCRIPT_VERSION = "2026-06-17k"  # bump when re-uploading to Kaggle to confirm latest script
 K = 4  # number of parallel drafter streams / feature-slots per super-block
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
 BLOCK_SIZE = 6  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
@@ -229,7 +229,7 @@ VLLM_TENSOR_PARALLEL_SIZE = 0  # 0=auto (retry with tp=2 when 2+ GPUs visible)
 ENABLE_VLLM_SPECULATIVE_DECODING = True
 VLLM_REQUIRE_SPECULATIVE = True  # refuse silent base-only fallback when DFlash draft is available
 VLLM_SINGLE_ENGINE_SPECULATIVE = True  # one spec engine on 4×L4; skips multi-agent pool (8 workers cannot fit draft)
-VLLM_SPECULATIVE_METHOD = "dflash"  # "dflash" | "draft_model" | "auto"
+VLLM_SPECULATIVE_METHOD = "auto"  # auto: dflash if vLLM supports it, else draft_model (stock Kaggle vLLM)
 VLLM_NUM_SPECULATIVE_TOKENS = BLOCK_SIZE  # DFlash block width per speculation step
 VLLM_SPEC_GPU_MEMORY_UTILIZATION = 0.90  # draft+target needs ~90% of 22GB L4 (0.70 left no room for draft)
 VLLM_SPEC_DRAFT_GPU_UTIL_SCALE = 1.0  # do not shrink util for target+draft
@@ -2819,13 +2819,67 @@ def _vllm_tensor_parallel_candidates(*, speculative: bool = False) -> List[int]:
     return [1]
 
 
+_VLLM_SPEC_METHODS_CACHE: Optional[set] = None
+
+
+def _vllm_supported_speculative_methods() -> set:
+    """Methods accepted by the installed vLLM SpeculativeConfig (stock vLLM lacks 'dflash')."""
+    global _VLLM_SPEC_METHODS_CACHE
+    if _VLLM_SPEC_METHODS_CACHE is not None:
+        return _VLLM_SPEC_METHODS_CACHE
+    fallback = {
+        "draft_model",
+        "ngram",
+        "eagle",
+        "eagle3",
+        "medusa",
+        "mlp_speculator",
+    }
+    try:
+        from vllm.config import SpeculativeConfig
+
+        schema = SpeculativeConfig.model_json_schema()
+        method_prop = schema.get("properties", {}).get("method", {})
+        enum_vals = method_prop.get("enum")
+        if enum_vals:
+            _VLLM_SPEC_METHODS_CACHE = set(str(v) for v in enum_vals)
+            return _VLLM_SPEC_METHODS_CACHE
+    except Exception as exc:
+        print(f"[LOAD] SpeculativeConfig introspection failed ({exc}); using fallback set.")
+    _VLLM_SPEC_METHODS_CACHE = fallback
+    return _VLLM_SPEC_METHODS_CACHE
+
+
 def _resolve_vllm_speculative_method(draft_path: str) -> str:
-    method = str(VLLM_SPECULATIVE_METHOD).strip().lower()
-    if method != "auto":
-        return method
-    if is_dflash_draft_checkpoint(draft_path):
-        return "dflash"
-    return "draft_model"
+    """
+    Pick a speculative method this vLLM build actually accepts.
+    DFlash checkpoints use method=dflash only with vllm-project/speculators;
+    stock pip vLLM on Kaggle requires method=draft_model + draft checkpoint path.
+    """
+    supported = _vllm_supported_speculative_methods()
+    requested = str(VLLM_SPECULATIVE_METHOD).strip().lower()
+    is_dflash = is_dflash_draft_checkpoint(draft_path)
+
+    if requested == "auto":
+        if is_dflash and "dflash" in supported:
+            return "dflash"
+        if is_dflash:
+            print(
+                "[LOAD] vLLM has no 'dflash' speculative method "
+                f"(supported: {sorted(supported)}). "
+                "Using draft_model for Qwen3.5-4B-DFlash checkpoint."
+            )
+            return "draft_model"
+        return "draft_model"
+
+    if requested not in supported:
+        print(
+            f"[LOAD] vLLM does not support speculative method={requested!r} "
+            f"(supported: {sorted(supported)}). "
+            "Falling back to draft_model."
+        )
+        return "draft_model"
+    return requested
 
 
 def _build_vllm_speculative_config(
@@ -2839,6 +2893,13 @@ def _build_vllm_speculative_config(
     if not resolved or not os.path.isdir(resolved):
         return None
     method = _resolve_vllm_speculative_method(resolved)
+    supported = _vllm_supported_speculative_methods()
+    if method not in supported:
+        print(
+            f"[LOAD] Resolved speculative method={method!r} not in vLLM; "
+            "using draft_model."
+        )
+        method = "draft_model"
     if method == "dflash" and not is_dflash_draft_checkpoint(resolved):
         print(
             f"[LOAD] {resolved} is not a DFlash draft checkpoint; "
@@ -2962,6 +3023,10 @@ def _build_vllm_attempts(
         else None
     )
     if spec_root:
+        print(
+            f"[LOAD] vLLM speculative methods available: "
+            f"{sorted(_vllm_supported_speculative_methods())}"
+        )
         print(
             f"[LOAD] vLLM speculative decoding: method={spec_root['method']} "
             f"n_tokens={spec_root['num_speculative_tokens']} "
@@ -3544,7 +3609,8 @@ def create_inference_engine(
             "[LOAD] DFlash speculative decoding required but all vLLM spec attempts "
             f"failed for {gen_path}. Last error: {last_err}. "
             "Try: restart kernel (fresh VRAM), set VLLM_SPEC_MAX_MODEL_LEN=12288, "
-            "or VLLM_SPEC_PREFER_TENSOR_PARALLEL=2 on 4×L4."
+            "VLLM_SPEC_PREFER_TENSOR_PARALLEL=2 on 4×L4, or "
+            "VLLM_SPECULATIVE_METHOD='draft_model' (stock vLLM has no 'dflash' method)."
         ) from last_err
 
     if VLLM_FALLBACK_TO_HF:
