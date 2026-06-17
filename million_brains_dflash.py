@@ -180,7 +180,7 @@ else:
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-17g"  # bump when re-uploading to Kaggle to confirm latest script
+SCRIPT_VERSION = "2026-06-17h"  # bump when re-uploading to Kaggle to confirm latest script
 K = 4  # number of parallel drafter streams / feature-slots per super-block
 NUM_PERSONALITY_FEATURES = 12  # size of the fixed personality feature bank; do not change unless you extend the list below
 BLOCK_SIZE = 6  # tokens each stream proposes per super-block (M = K * BLOCK_SIZE)
@@ -280,7 +280,7 @@ ARC_TRY_VLLM = True  # ARC eval requires vLLM for speed; HF fallback if load fai
 VLLM_MAX_MODEL_LEN = 0  # 0 = auto (ARC prompt + output budget); set e.g. 16384 if VRAM allows
 ARC_MAX_PROMPT_TOKENS = 6144  # tighter input budget; resolver shrinks further; lowers KV bandwidth on decode
 ARC_SLOT_HYPOTHESIS_MODE = True  # MBR: slots propose transformation text; one final pass emits grid
-ARC_MBR_OUTPUT_TOKEN_BUDGET = 8000  # total OUTPUT tokens per test (hyp slots + final grid combined)
+ARC_MBR_OUTPUT_TOKEN_BUDGET = 14000  # total OUTPUT tokens per test (hyp slots + final grid combined)
 ARC_FINAL_GRID_MIN_TOKENS = 512  # floor for final JSON grid pass
 ARC_FINAL_GRID_MAX_FRACTION = 0.85  # final may use up to 85% of output budget for large grids
 ARC_FINAL_GRID_MIN_FRACTION = 0.50  # always reserve 50% of output budget for final grid synthesis
@@ -288,7 +288,7 @@ ARC_HYPOTHESIS_MAX_TOKENS = ARC_MBR_OUTPUT_TOKEN_BUDGET * 3 // 4 // K  # legacy 
 ARC_FINAL_GRID_MAX_TOKENS = ARC_MBR_OUTPUT_TOKEN_BUDGET // 4  # legacy default; task-aware below
 ARC_FINAL_HYP_CHAR_CAPS = (360, 200, 120, 60, 0)  # shrink hypothesis text in final prompt if needed
 ARC_HYPOTHESIS_ENABLE_THINKING = True  # slots may emit </think> reasoning before TRANSFORMATION_HYPOTHESIS
-ARC_HYPOTHESIS_THINKING_TOKEN_CAP = 384  # per-slot cap when thinking on (prevents burning full 8k on hyp phase)
+ARC_HYPOTHESIS_THINKING_TOKEN_CAP = 0  # 0 = no per-slot cap; shares ARC_MBR_OUTPUT_TOKEN_BUDGET (14k)
 ARC_FINAL_ENABLE_THINKING = False  # final grid: [[ prefill + greedy JSON (much faster than thinking pass)
 # Multi-agent layer: N independent Qwen instances (1 per GPU, round-robin) + plurality vote on final grid.
 ARC_MULTI_AGENT_ENABLED = False  # True = plurality vote; False = single engine + DFlash spec (faster default)
@@ -4013,7 +4013,7 @@ def arc_final_grid_max_tokens(task: Dict[str, Any]) -> int:
 
 
 def arc_hypothesis_max_tokens(task: Dict[str, Any]) -> int:
-    """Per-slot hypothesis cap — never steal more than half the 8k output budget."""
+    """Per-slot hypothesis cap — never steal more than half the output budget."""
     budget = int(ARC_MBR_OUTPUT_TOKEN_BUDGET)
     final_reserve = max(
         arc_final_grid_max_tokens(task),
@@ -4032,7 +4032,7 @@ def arc_mbr_final_output_budget(
     task: Dict[str, Any], hyp_tokens_used: int
 ) -> int:
     """
-    Output tokens for final grid pass = full 8k budget minus what slots already emitted.
+    Output tokens for final grid pass = full output budget minus what slots already emitted.
     Unused hypothesis budget flows to the final pass.
     """
     budget = int(ARC_MBR_OUTPUT_TOKEN_BUDGET)
