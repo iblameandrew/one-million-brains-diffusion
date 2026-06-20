@@ -9,12 +9,21 @@ combinatorial feature-slot allocation, CTSB smoothing, cross-stream integration,
 verification, and doppler-guided adaptive reallocation.
 
 Kaggle: attach Models input google/diffusiongemma, run as script or notebook cell.
+
+Default backend is HuggingFace (transformers + DiffusionGemmaForBlockDiffusion).
+Set INFERENCE_BACKEND = "vllm" for optimized serving (needs unreleased vLLM gemma build).
+
+HF install (Kaggle cell 1 if needed):
+    !pip install -U transformers accelerate torch
 """
 
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-19-diffusion-e"  # Sonar FM/CF + batched Phase-1 fixes
+SCRIPT_VERSION = "2026-06-19-diffusion-i"  # HF: explicit layer device_map (no infer_auto)
+INFERENCE_BACKEND = "hf"  # "hf" (default) | "vllm"
+HF_FAST_VERIFY = True  # stub tail logprobs on diffusion verify passes (no causal forward)
+HF_TORCH_DTYPE = "bfloat16"  # official recipe; use "float16" if bf16 unsupported
 # --- DiffusionGemma core (default engine) ---
 # Kaggle: Add Input -> Models -> google/diffusiongemma -> diffusiongemma-26b-a4b-it
 KAGGLE_DIFFUSIONGEMMA_DIR = (
@@ -80,11 +89,15 @@ PREFER_LOCAL_MODELS = True  # try /kaggle/input + /kaggle/working before any Hug
 LOCAL_MODEL_PATH = KAGGLE_DIFFUSIONGEMMA_DIR
 VLLM_ENFORCE_EAGER = False  # prefer CUDA graphs; load loop retries enforce_eager=True on failure
 VLLM_RUNNER = "generate"  # do not let vLLM pick pooling/embedding runner
-VLLM_FALLBACK_TO_HF = True  # HuggingFace wrapper if vLLM still cannot load the checkpoint
-VLLM_GPU_MEMORY_UTILIZATION = 0.88  # HF fallback only; DiffusionGemma uses DIFFUSION_GPU_UTIL
+VLLM_GPU_MEMORY_UTILIZATION = 0.88  # legacy alias; DiffusionGemma uses DIFFUSION_GPU_UTIL
 VLLM_TENSOR_PARALLEL_SIZE = 0  # 0=auto (retry with tp=2 when 2+ GPUs visible)
-PREFER_HF_INFERENCE = False  # L4/A10+: prefer vLLM fast kernels; HF only on load failure
-SKIP_VLLM_FOR_QWEN35 = False  # attempt vLLM for Qwen3.5-4B (set True on broken vLLM hosts)
+VLLM_ATTENTION_BACKEND = "TRITON_ATTN"  # DiffusionGemma recipe default
+VLLM_MIN_VERSION = "0.23.0"  # floor only — PyPI 0.23.0 still lacks diffusion_config (need git main)
+VLLM_GIT_INSTALL = "git+https://github.com/vllm-project/vllm.git"  # DiffusionGemma API (unreleased on PyPI)
+VLLM_TORCH_VERSION = "2.11.0"  # pinned by vllm 0.23; Kaggle torch 2.5/2.6 breaks transformers 5.12
+TRANSFORMERS_MIN_VERSION = "5.11.0"  # diffusion_gemma architecture
+AUTO_UPGRADE_VLLM_ON_KAGGLE = True  # pip install matched stack when Internet ON
+
 AUTO_PREFETCH_TO_WORKING = True  # when online, try to cache DiffusionGemma into /kaggle/working
 PREFETCH_MODEL_ID = DIFFUSIONGEMMA_MODEL_PRIMARY
 KAGGLEHUB_MODEL_HANDLE = ""  # set if you publish DiffusionGemma on Kaggle Models
@@ -98,6 +111,16 @@ KAGGLE_DATASET_HANDLE = ""  # optional dataset fallback on Kaggle
 # ---------------------------------------------------------------------------
 ARC_DATA_PROFILE = "auto"  # "auto" | "kaggle" | "local" | "off"
 ARC_DATA_SPLIT = "evaluation"  # "training" | "evaluation"
+ARC_SPLIT_FILES = {
+    "training": (
+        "arc-agi_training_challenges.json",
+        "arc-agi_training_solutions.json",
+    ),
+    "evaluation": (
+        "arc-agi_evaluation_challenges.json",
+        "arc-agi_evaluation_solutions.json",
+    ),
+}
 KAGGLE_ARC_COMPETITION_DIR = (
     "/kaggle/input/competitions/arc-prize-2026-arc-agi-2"
 )
@@ -114,7 +137,7 @@ STREAM_GENERATION = True  # stream decoded tokens to stdout live (flush per toke
 STREAM_ALL_OUTPUT = True  # print all MBR drafts, commits, realloc, verify steps
 STREAM_PRINT_THINKING = False  # Step 2: ARC uses enable_thinking=False (no internal monologue)
 STREAM_VERIFY_PASSES = False  # verify=logprob-only; never stream those tokens
-HF_FAST_VERIFY = True  # tail-only logprobs on draft suffix (not full 4k prompt)
+
 ARC_EVAL_VERBOSE = True  # MBR super-block internals (auto-on when STREAM_ALL_OUTPUT)
 ARC_USE_CHAT_TEMPLATE = True  # Qwen3.5 expects chat_template.jinja wrapping
 ARC_DISABLE_THINKING = True  # Step 2: hard-off thinking for ARC (overrides STREAM_PRINT_THINKING)
@@ -125,7 +148,7 @@ ARC_ASSISTANT_PREFILL = "[["  # chat prefill anchors JSON grid (skipped when thi
 ARC_GENERATION_TEMPERATURE = 0.0  # greedy JSON for grid tasks
 EVAL_SMOKE_TASK_ID = None  # e.g. "0934a4d8" — run only this task (overrides max_tasks slice)
 ARC_FAST_INFERENCE = True  # ARC eval: compact prompts, batched gen, no per-token streaming
-ARC_TRY_VLLM = True  # ARC eval requires vLLM for speed; HF fallback if load fails
+ARC_TRY_VLLM = INFERENCE_BACKEND == "vllm"  # legacy flag; HF is the default engine
 # Qwen3.5-4B native context is 150k+ (YaRN); vLLM max_model_len is a VRAM budget we set at load.
 # KV cache grows with max_model_len — 4k was only to fit L4 OOM; ARC 30x30 tasks need ~8k+.
 VLLM_MAX_MODEL_LEN = 0  # 0 = auto (ARC prompt + output budget); set e.g. 16384 if VRAM allows
@@ -172,10 +195,6 @@ from collections import Counter
 
 import warnings
 import logging
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 
 def _suppress_noisy_third_party_logs() -> None:
@@ -203,9 +222,261 @@ def _suppress_noisy_third_party_logs() -> None:
 
 _suppress_noisy_third_party_logs()
 
-# Heavy libraries (installed above)
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from vllm import LLM, SamplingParams
+
+def _parse_version_tuple(ver: str) -> Tuple[int, ...]:
+    nums: List[int] = []
+    for part in (ver or "0").split("."):
+        chunk = part.split("+")[0].split("rc")[0].split("a")[0].split("b")[0]
+        try:
+            nums.append(int(chunk))
+        except ValueError:
+            break
+    return tuple(nums) if nums else (0,)
+
+
+def _version_at_least(installed: str, required: str) -> bool:
+    a = _parse_version_tuple(installed)
+    b = _parse_version_tuple(required)
+    width = max(len(a), len(b))
+    return (a + (0,) * (width - len(a))) >= (b + (0,) * (width - len(b)))
+
+
+def _package_version(name: str) -> str:
+    try:
+        from importlib.metadata import version
+
+        return version(name)
+    except Exception:
+        return "unknown"
+
+
+def _pypi_reachable() -> bool:
+    try:
+        with socket.create_connection(("pypi.org", 443), timeout=4):
+            return True
+    except OSError:
+        return False
+
+
+def _vllm_supports_diffusion_config() -> bool:
+    """True when installed vLLM exposes EngineArgs.diffusion_config (DiffusionGemma)."""
+    try:
+        from vllm.engine.arg_utils import EngineArgs
+
+        return "diffusion_config" in inspect.signature(EngineArgs.__init__).parameters
+    except Exception:
+        return False
+
+
+def _transformers_supports_diffusion_gemma() -> bool:
+    try:
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+        return "diffusion_gemma" in CONFIG_MAPPING
+    except Exception:
+        return False
+
+
+def _diffusiongemma_pip_one_liner() -> str:
+    return (
+        f'!pip install -U "torch=={VLLM_TORCH_VERSION}" '
+        f'"torchvision==0.26.0" "torchaudio==2.11.0" accelerate\n'
+        f'!pip install -U "{VLLM_GIT_INSTALL}"'
+    )
+
+
+def _diffusiongemma_runtime_help(
+    *,
+    vllm_ver: Optional[str] = None,
+    torch_ver: Optional[str] = None,
+    extra: Optional[str] = None,
+) -> str:
+    bits = []
+    if vllm_ver:
+        bits.append(f"vllm={vllm_ver}")
+    if torch_ver:
+        bits.append(f"torch={torch_ver}")
+    have = f" ({', '.join(bits)})" if bits else ""
+    msg = (
+        f"DiffusionGemma needs a matched stack{have}:\n"
+        f"  torch=={VLLM_TORCH_VERSION}, vLLM from git main (diffusion_config API), "
+        f"transformers>={TRANSFORMERS_MIN_VERSION}\n"
+        "PyPI vllm==0.23.0 passes the version check but lacks diffusion_config — "
+        "the recipe uses the unreleased gemma build (see vllm/vllm-openai:gemma).\n"
+        "Upgrading only transformers on Kaggle leaves old torch in memory and "
+        "breaks with: ImportError is_opaque_value.\n"
+        "  1. Notebook Settings -> Internet ON.\n"
+        "  2. Run ONLY this in the first cell, then Restart Kernel:\n"
+        f"       {_diffusiongemma_pip_one_liner()}\n"
+        "  3. Re-run this script (torch must load AFTER pip, before transformers).\n"
+        "  GPU: A100 80GB recommended. vLLM git build may take 15–30 min on Kaggle.\n"
+        "See: https://recipes.vllm.ai/Google/diffusiongemma-26B-A4B-it"
+    )
+    if extra:
+        msg += f"\nDetail: {extra}"
+    return msg
+
+
+def _diffusiongemma_versions_ok() -> Tuple[bool, str]:
+    vllm_ver = _package_version("vllm")
+    torch_ver = _package_version("torch")
+    tfm_ver = _package_version("transformers")
+    if not _version_at_least(vllm_ver, VLLM_MIN_VERSION):
+        return False, f"vllm={vllm_ver} need>={VLLM_MIN_VERSION}"
+    if not _version_at_least(torch_ver, VLLM_TORCH_VERSION):
+        return False, f"torch={torch_ver} need>={VLLM_TORCH_VERSION}"
+    if not _version_at_least(tfm_ver, TRANSFORMERS_MIN_VERSION):
+        return False, f"transformers={tfm_ver} need>={TRANSFORMERS_MIN_VERSION}"
+    return True, ""
+
+
+def _diffusiongemma_stack_ok(*, check_api: bool = False) -> Tuple[bool, str]:
+    ok, reason = _diffusiongemma_versions_ok()
+    if not ok:
+        return ok, reason
+    if not check_api:
+        return True, ""
+    vllm_ver = _package_version("vllm")
+    if not _vllm_supports_diffusion_config():
+        return (
+            False,
+            f"vllm={vllm_ver} missing diffusion_config "
+            f"(PyPI 0.23.0 has no DiffusionGemma; need {VLLM_GIT_INSTALL})",
+        )
+    if not _transformers_supports_diffusion_gemma():
+        tfm_ver = _package_version("transformers")
+        return False, f"transformers={tfm_ver} missing diffusion_gemma arch"
+    return True, ""
+
+
+def _install_diffusiongemma_stack() -> None:
+    """Install pinned torch, then vLLM from git (PyPI wheel lacks diffusion_config)."""
+    print(
+        f"[DEPS] pip installing matched stack: torch=={VLLM_TORCH_VERSION}, "
+        f"vLLM from git ..."
+    )
+    subprocess.check_call(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            "--upgrade",
+            f"torch=={VLLM_TORCH_VERSION}",
+            "torchvision==0.26.0",
+            "torchaudio==2.11.0",
+            "accelerate",
+        ]
+    )
+    subprocess.check_call(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            "--upgrade",
+            VLLM_GIT_INSTALL,
+        ]
+    )
+
+
+def _bootstrap_diffusiongemma_vllm() -> None:
+    """Model Runner v2 + matched pip stack BEFORE torch/transformers/vllm import."""
+    os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "1")
+
+    if "torch" in sys.modules:
+        raise RuntimeError(
+            "[DEPS] torch was imported before dependency bootstrap. "
+            "Restart kernel and run this script as the first GPU cell.\n"
+            + _diffusiongemma_runtime_help(
+                torch_ver=_package_version("torch"),
+                vllm_ver=_package_version("vllm"),
+            )
+        )
+
+    ok, reason = _diffusiongemma_versions_ok()
+    vllm_ver = _package_version("vllm")
+    torch_ver = _package_version("torch")
+    tfm_ver = _package_version("transformers")
+    if ok:
+        api_ok, api_reason = _diffusiongemma_stack_ok(check_api=True)
+        has_diffusion_kw = _vllm_supports_diffusion_config()
+        print(
+            f"[DEPS] pre-import versions OK: torch={torch_ver}, vllm={vllm_ver}, "
+            f"transformers={tfm_ver}, diffusion_config={has_diffusion_kw}, "
+            f"VLLM_USE_V2_MODEL_RUNNER=1"
+        )
+        if api_ok:
+            return
+        reason = api_reason
+        print(f"[DEPS] pre-import API mismatch: {reason}")
+    else:
+        print(f"[DEPS] pre-import version mismatch: {reason}")
+    on_kaggle = os.path.isdir("/kaggle/input")
+    if AUTO_UPGRADE_VLLM_ON_KAGGLE and on_kaggle and _pypi_reachable():
+        _install_diffusiongemma_stack()
+        ok2, reason2 = _diffusiongemma_stack_ok(check_api=True)
+        print(
+            f"[DEPS] pip finished — torch={_package_version('torch')}, "
+            f"vllm={_package_version('vllm')}, transformers={_package_version('transformers')}, "
+            f"diffusion_config={_vllm_supports_diffusion_config()}"
+        )
+        if ok2:
+            print(
+                "[DEPS] Stack metadata OK. Restart Kernel now, then re-run this cell "
+                "(required after torch upgrade)."
+            )
+            raise RuntimeError(
+                "[DEPS] Pip upgrade complete — restart the Kaggle kernel, then re-run.\n"
+                + _diffusiongemma_runtime_help(
+                    vllm_ver=_package_version("vllm"),
+                    torch_ver=_package_version("torch"),
+                )
+            )
+        raise RuntimeError(
+            f"[DEPS] Stack still broken after pip: {reason2}\n"
+            + _diffusiongemma_runtime_help(
+                vllm_ver=_package_version("vllm"),
+                torch_ver=_package_version("torch"),
+            )
+        )
+
+    raise RuntimeError(
+        _diffusiongemma_runtime_help(
+            vllm_ver=vllm_ver, torch_ver=torch_ver, extra=reason
+        )
+    )
+
+
+if INFERENCE_BACKEND == "vllm":
+    _bootstrap_diffusiongemma_vllm()
+
+# ML imports — vLLM bootstrap must finish before torch when backend=vllm
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import AutoTokenizer
+
+if INFERENCE_BACKEND == "vllm":
+    from vllm import LLM, SamplingParams
+else:
+
+    @dataclass
+    class SamplingParams:
+        """HF backend sampling bag — mirrors vLLM SamplingParams fields used in this script."""
+
+        temperature: float = 1.0
+        top_p: float = 1.0
+        max_tokens: int = 128
+        logprobs: Optional[int] = None
+        prompt_logprobs: bool = False
+        repetition_penalty: float = 1.0
+        guided_decoding: Any = None
+
+    LLM = Any  # type: ignore[misc, assignment]
 
 # =============================================================================
 # FIXED BANK OF 12 PERSONALITY FEATURES
@@ -1374,12 +1645,95 @@ def _arc_engine_max_num_seqs() -> int:
     )
 
 
+def check_diffusiongemma_runtime_deps(*, model_path: Optional[str] = None) -> None:
+    """Fail fast with actionable guidance when Kaggle/default env is too old."""
+    torch_ver = _package_version("torch")
+    tfm_ver = _package_version("transformers")
+    has_diffusion_arch = _transformers_supports_diffusion_gemma()
+    if INFERENCE_BACKEND == "hf":
+        ok, reason = _diffusiongemma_versions_ok()
+        if not _version_at_least(tfm_ver, TRANSFORMERS_MIN_VERSION):
+            ok = False
+        if not has_diffusion_arch:
+            ok = False
+            reason = f"transformers={tfm_ver} missing diffusion_gemma arch (need>={TRANSFORMERS_MIN_VERSION})"
+        print(
+            f"[DEPS] backend=hf | torch={torch_ver} | "
+            f"transformers={tfm_ver} diffusion_gemma={has_diffusion_arch}"
+        )
+        if not ok:
+            raise RuntimeError(
+                "DiffusionGemma HF backend needs transformers>="
+                f"{TRANSFORMERS_MIN_VERSION} with diffusion_gemma support.\n"
+                "  pip install -U transformers accelerate torch\n"
+                f"Detail: {reason}"
+            )
+    else:
+        vllm_ver = _package_version("vllm")
+        has_diffusion_kw = _vllm_supports_diffusion_config()
+        stack_ok, stack_reason = _diffusiongemma_stack_ok(check_api=True)
+        print(
+            f"[DEPS] backend=vllm | torch={torch_ver} (need>={VLLM_TORCH_VERSION}) | "
+            f"vllm={vllm_ver} (need>={VLLM_MIN_VERSION}+git) diffusion_config={has_diffusion_kw} | "
+            f"transformers={tfm_ver} diffusion_gemma={has_diffusion_arch} | "
+            f"VLLM_USE_V2_MODEL_RUNNER={os.environ.get('VLLM_USE_V2_MODEL_RUNNER', '')}"
+        )
+        if not stack_ok:
+            detail = stack_reason
+            if has_diffusion_arch and not has_diffusion_kw:
+                detail = (
+                    f"vllm={vllm_ver} missing diffusion_config — "
+                    f"PyPI wheel lacks DiffusionGemma; install {VLLM_GIT_INSTALL}"
+                )
+            raise RuntimeError(
+                _diffusiongemma_runtime_help(
+                    vllm_ver=vllm_ver,
+                    torch_ver=torch_ver,
+                    extra=detail,
+                )
+            )
+    if model_path:
+        info = _checkpoint_model_info(model_path)
+        if info.get("is_diffusion_gemma"):
+            print(
+                f"[DEPS] DiffusionGemma checkpoint detected — {INFERENCE_BACKEND} engine."
+            )
+
+
+def _vllm_engine_arg_names() -> set:
+    """Parameter names accepted by the installed vLLM EngineArgs / LLM constructors."""
+    names: set = set()
+    try:
+        import inspect
+
+        from vllm.engine.arg_utils import EngineArgs
+
+        names.update(inspect.signature(EngineArgs.__init__).parameters.keys())
+        names.update(inspect.signature(LLM.__init__).parameters.keys())
+    except Exception:
+        pass
+    return names
+
+
+def _filter_vllm_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop kwargs this vLLM build does not recognize (version-safe instantiation)."""
+    accepted = _vllm_engine_arg_names()
+    if not accepted:
+        return kwargs
+    filtered = {k: v for k, v in kwargs.items() if k in accepted}
+    dropped = sorted(set(kwargs) - set(filtered))
+    if dropped:
+        print(f"[LOAD] vLLM omitted unsupported kwargs: {dropped}")
+    return filtered
+
+
 def _build_diffusiongemma_vllm_kwargs(
     model_path: str,
     *,
     gpu_memory_utilization: float,
     max_model_len: Optional[int] = None,
     max_num_seqs: Optional[int] = None,
+    enforce_eager: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     vLLM-native DiffusionGemma serving config (recipes.vllm.ai/Google/diffusiongemma-26B-A4B-it).
@@ -1397,21 +1751,18 @@ def _build_diffusiongemma_vllm_kwargs(
         "max_num_seqs": seqs,
         "max_num_batched_tokens": min(ctx, DIFFUSION_CANVAS_LENGTH * 2),
         "gpu_memory_utilization": util,
+        "enable_chunked_prefill": True,
         "hf_overrides": {
             "diffusion_sampler": "entropy_bound",
             "diffusion_entropy_bound": float(DIFFUSION_ENTROPY_BOUND),
         },
         "diffusion_config": {"canvas_length": int(DIFFUSION_CANVAS_LENGTH)},
+        "generation_config": "vllm",
+        "attention_backend": VLLM_ATTENTION_BACKEND,
     }
-    # vLLM >= gemma image: ignore checkpoint generation_config.json max_tokens cap
-    try:
-        import inspect
-
-        if "generation_config" in inspect.signature(LLM).parameters:
-            kwargs["generation_config"] = "vllm"
-    except Exception:
-        pass
-    return kwargs
+    if enforce_eager is not None:
+        kwargs["enforce_eager"] = bool(enforce_eager)
+    return _filter_vllm_kwargs(kwargs)
 
 
 def _build_diffusion_conditioned_prompt(
@@ -1448,7 +1799,7 @@ def _build_diffusion_conditioned_prompt(
 
 
 def million_brains_diffusion_denoise_generate(
-    vllm_llm: LLM,
+    vllm_llm: Any,
     tokenizer: Any,
     prompt: str,
     max_new_tokens: int = 128,
@@ -1792,7 +2143,7 @@ def million_brains_diffusion_denoise_generate(
 # ONE-MILLION-BRAINS GENERATE (public API — DiffusionGemma conditioned denoising)
 # =============================================================================
 def million_brains_dflash_generate(
-    vllm_llm: LLM,
+    vllm_llm: Any,
     tokenizer: Any,
     prompt: str,
     max_new_tokens: int = 128,
@@ -2214,6 +2565,8 @@ def _checkpoint_model_info(model_path: str) -> Dict[str, Any]:
             for a in archs
             for tag in ("CausalLM", "ConditionalGeneration", "ImageTextToText")
         ),
+        "is_diffusion_gemma": model_type == "diffusion_gemma"
+        or any("DiffusionGemma" in a for a in archs),
     }
 
 
@@ -2311,81 +2664,6 @@ def _guess_causal_lm_architecture(config: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _should_skip_vllm(model_path: str) -> bool:
-    """Qwen3.5 multimodal checkpoints routinely fail vLLM on Kaggle; prefer HF."""
-    if PREFER_HF_INFERENCE and not ARC_TRY_VLLM:
-        return True
-    if not SKIP_VLLM_FOR_QWEN35:
-        return False
-    try:
-        info = _checkpoint_model_info(model_path)
-        return info["is_qwen35"] or info["is_multimodal"]
-    except Exception:
-        return False
-
-
-def _load_hf_generation_model(
-    model_path: str,
-    *,
-    dtype: torch.dtype,
-    local_only: bool,
-) -> Any:
-    """Load the correct HF class for plain LMs and Qwen3.5 multimodal text generation."""
-    info = _checkpoint_model_info(model_path)
-    common: Dict[str, Any] = {
-        "torch_dtype": dtype,
-        "device_map": "auto",
-        "trust_remote_code": True,
-        "local_files_only": local_only and os.path.isdir(model_path),
-        "low_cpu_mem_usage": True,
-        "attn_implementation": "sdpa",
-    }
-    errors: List[str] = []
-
-    if info["is_qwen35"] or info["is_multimodal"]:
-        print(
-            f"[LOAD][HF] Qwen3.5/multimodal checkpoint: "
-            f"arch={info['architectures']} — using text-only generate path"
-        )
-        for label, loader in (
-            ("AutoModelForImageTextToText", "transformers.AutoModelForImageTextToText"),
-            ("AutoModelForCausalLM", "transformers.AutoModelForCausalLM"),
-        ):
-            try:
-                import importlib
-
-                mod = importlib.import_module("transformers")
-                cls = getattr(mod, label)
-                return cls.from_pretrained(model_path, **common)
-            except Exception as exc:
-                errors.append(f"{label}: {type(exc).__name__}: {exc}")
-
-    try:
-        return AutoModelForCausalLM.from_pretrained(model_path, **common)
-    except Exception as exc:
-        errors.append(f"AutoModelForCausalLM: {type(exc).__name__}: {exc}")
-        raise RuntimeError(
-            "[LOAD][HF] Failed to load generation model from "
-            f"{model_path}.\n  " + "\n  ".join(errors)
-        ) from exc
-
-
-def _needs_custom_vllm_handling(model_path: str) -> bool:
-    path_l = model_path.lower()
-    if any(tag in path_l for tag in ("diffusiongemma", "qwen3", "custom")):
-        return True
-    try:
-        cfg = _read_hf_config(model_path)
-    except Exception:
-        return False
-    archs = [str(a) for a in (cfg.get("architectures") or [])]
-    if any("Embedding" in a or "Pooling" in a for a in archs):
-        return True
-    if cfg.get("is_embedding_model") or cfg.get("pooler_config"):
-        return True
-    return False
-
-
 def _cuda_vram_snapshot(device: int = 0) -> Dict[str, float]:
     """Return total/free GiB on a CUDA device (0 if unavailable)."""
     if not torch.cuda.is_available():
@@ -2418,14 +2696,21 @@ def _adaptive_vllm_gpu_util(requested: float) -> float:
     )
     return util
 
-def _release_cuda_cache() -> None:
+def _release_cuda_cache(model: Any = None) -> None:
     import gc
 
+    if model is not None:
+        del model
     gc.collect()
     if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            try:
+                torch.cuda.synchronize(i)
+            except Exception:
+                pass
         torch.cuda.empty_cache()
         try:
-            torch.cuda.synchronize()
+            torch.cuda.ipc_collect()
         except Exception:
             pass
 
@@ -2434,23 +2719,67 @@ def _build_vllm_attempts(
     model_path: str,
     gpu_memory_utilization: float,
 ) -> List[Dict[str, Any]]:
-    kwargs = _build_diffusiongemma_vllm_kwargs(
-        model_path, gpu_memory_utilization=gpu_memory_utilization
-    )
-    return [kwargs]
+    """Progressive vLLM load attempts (full recipe -> lower VRAM -> eager mode)."""
+    base_util = _adaptive_vllm_gpu_util(float(gpu_memory_utilization))
+    attempts: List[Dict[str, Any]] = [
+        _build_diffusiongemma_vllm_kwargs(
+            model_path, gpu_memory_utilization=base_util
+        ),
+        _build_diffusiongemma_vllm_kwargs(
+            model_path,
+            gpu_memory_utilization=min(0.75, base_util),
+            enforce_eager=True,
+        ),
+        _build_diffusiongemma_vllm_kwargs(
+            model_path,
+            gpu_memory_utilization=0.70,
+            max_model_len=min(4096, DIFFUSION_MAX_MODEL_LEN),
+            enforce_eager=True,
+        ),
+    ]
+    # Deduplicate identical filtered dicts (older vLLM may drop optional keys).
+    seen: List[str] = []
+    unique: List[Dict[str, Any]] = []
+    for attempt in attempts:
+        key = repr(sorted(attempt.items()))
+        if key not in seen:
+            seen.append(key)
+            unique.append(attempt)
+    return unique
 
 
-@dataclass
-class _HFCompletionOutput:
-    token_ids: List[int]
-    text: str
-    logprobs: Optional[List[Dict[int, float]]] = None
-
-
-@dataclass
-class _HFRequestOutput:
-    outputs: List[_HFCompletionOutput]
-    prompt_logprobs: Optional[List[Optional[Dict[int, float]]]] = None
+def print_one_million_brains_banner(success: bool = True) -> None:
+    """ASCII startup banner — must appear in Kaggle logs after engine load."""
+    banner = r"""
+================================================================================
+ ██████╗ ███╗   ██╗███████╗    ███╗   ███╗██╗██╗     ██╗     ██╗ ██████╗ ███╗   ██╗    ██████╗ ██████╗  █████╗ ██╗███╗   ██╗███████╗    ███████╗██╗      █████╗ ███████╗██╗  ██╗
+██╔═══██╗████╗  ██║██╔════╝    ████╗ ████║██║██║     ██║     ██║██╔═══██╗████╗  ██║    ██╔══██╗██╔══██╗██╔══██╗██║████╗  ██║██╔════╝    ██╔════╝██║     ██╔══██╗██╔════╝██║  ██║
+██║   ██║██╔██╗ ██║█████╗      ██╔████╔██║██║██║     ██║     ██║██║   ██║██╔██╗ ██║    ██████╔╝██████╔╝███████║██║██╔██╗ ██║███████╗    █████╗  ██║     ███████║███████╗███████║
+██║   ██║██║╚██╗██║██╔══╝      ██║╚██╔╝██║██║██║     ██║     ██║██║   ██║██║╚██╗██║    ██╔══██╗██╔══██╗██╔══██║██║██║╚██╗██║╚════██║    ██╔══╝  ██║     ██╔══██║╚════██║██╔══██║
+╚██████╔╝██║ ╚████║███████╗    ██║ ╚═╝ ██║██║███████╗███████╗██║╚██████╔╝██║ ╚████║    ██████╔╝██║  ██║██║  ██║██║██║ ╚████║███████║    ██║     ███████╗██║  ██║███████║██║  ██║
+ ╚═════╝ ╚═╝  ╚═══╝╚══════╝    ╚═╝     ╚═╝╚═╝╚══════╝╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝    ╚═╝     ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝
+================================================================================
+"""
+    print(banner)
+    if success:
+        print(
+            " ONE-MILLION-BRAINS-DIFFUSIONGEMMA INITIALIZED  |  "
+            "CANVAS=%d  |  DENOISE_K=%d  |  FEATURES=%d  |  REALLOCATION=%s"
+            % (
+                DIFFUSION_CANVAS_LENGTH,
+                K,
+                NUM_PERSONALITY_FEATURES,
+                str(ENABLE_FEATURE_REALLOCATION).upper(),
+            )
+        )
+        print(
+            f" Engine: DiffusionGemma ({INFERENCE_BACKEND}) block-diffusion + "
+            "hard-wired MBR conditioned denoising"
+        )
+        print(f" Script version: {SCRIPT_VERSION}")
+    else:
+        print(" ONE-MILLION-BRAINS-DIFFUSIONGEMMA LOAD FAILED")
+    print("================================================================================\n")
 
 
 _STREAM_IN_THINKING = False
@@ -2497,236 +2826,272 @@ def _sampling_params_label(sp: Any, fallback: str) -> str:
     return str(getattr(sp, "stream_label", None) or fallback)
 
 
-def _top_p_sample_logits(logits: torch.Tensor, temperature: float, top_p: float) -> Tuple[int, float]:
-    """Sample one token ID + logprob from logits."""
-    temp = max(float(temperature), 1e-5)
-    probs = torch.softmax(logits / temp, dim=-1)
-    if top_p < 1.0:
-        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-        cumulative = torch.cumsum(sorted_probs, dim=-1)
-        mask = cumulative > float(top_p)
-        if mask.any():
-            mask[..., 0] = False
-            sorted_probs = sorted_probs.masked_fill(mask, 0.0)
-            sorted_probs = sorted_probs / sorted_probs.sum()
-        next_local = torch.multinomial(sorted_probs, num_samples=1)
-        next_id = int(sorted_idx[next_local].item())
-        logp = float(torch.log(probs[next_id] + 1e-12).item())
-        return next_id, logp
-    next_id = int(torch.multinomial(probs, num_samples=1).item())
-    logp = float(torch.log(probs[next_id] + 1e-12).item())
-    return next_id, logp
+@dataclass
+class _HFCompletionOutput:
+    token_ids: List[int]
+    text: str
+    logprobs: Optional[List[Dict[int, float]]] = None
+
+
+@dataclass
+class _HFRequestOutput:
+    outputs: List[_HFCompletionOutput]
+    prompt_logprobs: Optional[List[Optional[Dict[int, float]]]] = None
+
+
+def _hf_resolve_dtype() -> torch.dtype:
+    if HF_TORCH_DTYPE == "bfloat16":
+        return torch.bfloat16
+    if HF_TORCH_DTYPE == "float16":
+        return torch.float16
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def _hf_max_memory_map() -> Dict[Union[int, str], str]:
+    mem: Dict[Union[int, str], str] = {"cpu": "64GiB"}
+    if not torch.cuda.is_available():
+        return mem
+    for i in range(torch.cuda.device_count()):
+        snap = _cuda_vram_snapshot(i)
+        gib = max(14, int(snap["total_gib"] * 0.90))
+        mem[i] = f"{gib}GiB"
+    return mem
+
+
+def _resolve_hf_input_device(model: Any) -> torch.device:
+    """Device for input_ids — first CUDA shard in hf_device_map, not meta."""
+    model_device = getattr(model, "device", None)
+    if model_device is not None and getattr(model_device, "type", "") != "meta":
+        return torch.device(model_device)
+
+    hf_map = getattr(model, "hf_device_map", None) or {}
+    for key in sorted(hf_map.keys(), key=lambda k: (k != "", k)):
+        target = hf_map[key]
+        if target in ("cpu", "disk", "meta"):
+            continue
+        if isinstance(target, int):
+            return torch.device(f"cuda:{target}")
+        if isinstance(target, str):
+            if target.startswith("cuda"):
+                return torch.device(target)
+            if target.isdigit():
+                return torch.device(f"cuda:{int(target)}")
+
+    emb = model.get_input_embeddings()
+    if emb is not None and getattr(emb.weight, "device", None) is not None:
+        if emb.weight.device.type != "meta":
+            return emb.weight.device
+    for param in model.parameters():
+        if param.device.type != "meta":
+            return param.device
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    return torch.device("cpu")
+
+
+def _hf_log_device_map(model: Any) -> None:
+    hf_map = getattr(model, "hf_device_map", None)
+    if not hf_map:
+        return
+    counts: Dict[str, int] = {}
+    for val in hf_map.values():
+        key = str(val)
+        counts[key] = counts.get(key, 0) + 1
+    print(f"[LOAD][HF] hf_device_map: {len(hf_map)} modules -> {counts}")
+
+
+def _hf_smoke_generate(model: Any, processor: Any, device: torch.device) -> None:
+    """Real 1-token generate — catches meta-tensor / dispatch failures."""
+    messages = [{"role": "user", "content": "Hi"}]
+    inputs = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.inference_mode():
+        model.generate(**inputs, max_new_tokens=1, do_sample=False)
+
+
+def _hf_build_manual_device_map(config: Any, n_gpu: int) -> Dict[str, int]:
+    """
+    DiffusionGemma ties encoder.language_model.layers <-> decoder.layers.
+    accelerate.infer_auto_device_map crashes on those ties (IndexError).
+    Build an explicit per-layer map instead — tied pairs share the same GPU.
+    """
+    text_cfg = getattr(config, "text_config", config)
+    n_layers = int(getattr(text_cfg, "num_hidden_layers", 0) or 0)
+    if n_layers < 1:
+        raise ValueError("DiffusionGemma config missing text_config.num_hidden_layers")
+
+    dm: Dict[str, int] = {
+        "model.decoder.embed_tokens": 0,
+        "lm_head": 0,
+        "model.encoder.language_model.embed_tokens": 0,
+        "model.encoder.language_model.norm": 0,
+        "model.encoder.language_model.rotary_emb": 0,
+        "model.decoder.norm": 0,
+        "model.decoder.rotary_emb": 0,
+        "model.decoder.self_conditioning": 0,
+        "model.encoder.vision_tower": 0,
+        "model.encoder.embed_vision": 0,
+    }
+    for i in range(n_layers):
+        gpu = i % max(1, n_gpu)
+        dm[f"model.encoder.language_model.layers.{i}"] = gpu
+        dm[f"model.decoder.layers.{i}"] = gpu
+    return dm
+
+
+def _hf_total_vram_gib() -> float:
+    if not torch.cuda.is_available():
+        return 0.0
+    return sum(_cuda_vram_snapshot(i)["total_gib"] for i in range(torch.cuda.device_count()))
+
+
+def _load_hf_diffusiongemma_model(
+    model_path: str, *, local_only: bool, processor: Any = None
+) -> Any:
+    from transformers import AutoConfig, DiffusionGemmaForBlockDiffusion
+
+    local_files_only = bool(local_only and os.path.isdir(model_path))
+    dtype = _hf_resolve_dtype()
+    n_gpu = max(1, torch.cuda.device_count() if torch.cuda.is_available() else 0)
+    total_vram = _hf_total_vram_gib()
+
+    config = AutoConfig.from_pretrained(
+        model_path, trust_remote_code=True, local_files_only=local_files_only
+    )
+    device_map = _hf_build_manual_device_map(config, n_gpu)
+    n_layers = sum(1 for k in device_map if k.startswith("model.decoder.layers."))
+
+    print(
+        f"[LOAD][HF] DiffusionGemmaForBlockDiffusion from {model_path}\n"
+        f"         dtype={dtype}, gpus={n_gpu}, vram={total_vram:.1f}GiB, "
+        f"layers={n_layers}, device_map=explicit_round_robin"
+    )
+    print("[LOAD][HF] loading weights (real shard read — expect several minutes)...")
+
+    model = DiffusionGemmaForBlockDiffusion.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        local_files_only=local_files_only,
+        dtype=dtype,
+        device_map=device_map,
+    )
+    _hf_log_device_map(model)
+    input_dev = _resolve_hf_input_device(model)
+    print(f"[LOAD][HF] weights loaded; input device={input_dev}")
+    return model
 
 
 class HFGenerateEngine:
-    """Fallback engine when vLLM cannot load DiffusionGemma."""
+    """HuggingFace DiffusionGemma block-diffusion engine (vLLM-compatible generate API)."""
 
     def __init__(
         self,
         model_path: str,
-        tokenizer: Any,
+        processor: Any,
         *,
         local_only: bool = True,
+        max_model_len: Optional[int] = None,
     ):
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        print(f"[LOAD][HF] Loading causal LM from {model_path} ...")
-        self.tokenizer = tokenizer
+        self.processor = processor
+        self.tokenizer = getattr(processor, "tokenizer", processor)
         self.model_path = model_path
-        self.model = _load_hf_generation_model(
-            model_path,
-            dtype=dtype,
-            local_only=local_only,
+        self.generation_model_path = model_path
+        self.max_model_len = int(max_model_len or DIFFUSION_MAX_MODEL_LEN)
+        self.diffusiongemma_enabled = True
+        self.model = _load_hf_diffusiongemma_model(
+            model_path, local_only=local_only, processor=processor
         ).eval()
-        self.device = next(self.model.parameters()).device
-        emb = self.model.get_input_embeddings()
-        if emb is None or emb.weight.numel() == 0:
+        self.device = _resolve_hf_input_device(self.model)
+        if self.device.type == "meta":
             raise RuntimeError(
-                f"[LOAD][HF] Model at {model_path} has no usable embed_tokens."
+                "[LOAD][HF] Could not resolve a real CUDA device for DiffusionGemma inputs."
             )
-        print("[LOAD][HF] HuggingFace generate engine ready (vLLM-compatible API).")
-
-    def _encode(self, text: str) -> torch.Tensor:
-        prompt = text if text and str(text).strip() else " "
-        encoded = self.tokenizer(
-            prompt,
-            return_tensors="pt",
-            add_special_tokens=True,
-            truncation=True,
-            max_length=max(4096, arc_vllm_context_budget()),
+        print(
+            f"[LOAD][HF] DiffusionGemma HF engine ready "
+            f"(input_device={self.device}, max_model_len={self.max_model_len})"
         )
-        input_ids = encoded["input_ids"].to(self.device)
-        if input_ids.shape[1] == 0:
-            fallback_id = (
-                getattr(self.tokenizer, "bos_token_id", None)
-                or self.tokenizer.eos_token_id
-                or 0
-            )
-            input_ids = torch.tensor([[fallback_id]], device=self.device, dtype=torch.long)
-        return input_ids
+
+    def _encode(self, text: str) -> Dict[str, torch.Tensor]:
+        prompt = text if text and str(text).strip() else " "
+        encoded = self.processor(text=prompt, return_tensors="pt")
+        return {k: v.to(self.device) for k, v in encoded.items()}
 
     def _decode_ids(self, ids: List[int]) -> str:
         return self.tokenizer.decode(ids, skip_special_tokens=True)
 
-    def _prompt_logprobs_for_ids(
+    def _stub_prompt_logprobs(
         self,
         input_ids: torch.Tensor,
         *,
         tail_count: Optional[int] = None,
     ) -> List[Optional[Dict[int, float]]]:
-        """Target logprobs for prompt tokens. tail_count limits work to draft suffix."""
+        """Diffusion models lack cheap causal prompt_logprobs — stub for MBR verify."""
         seq_len = int(input_ids.shape[1])
-        if seq_len < 2:
-            return [None]
-
-        with torch.inference_mode():
-            logits = self.model(input_ids).logits[0]
-
-        if tail_count is not None and HF_FAST_VERIFY:
-            tail_count = max(1, min(int(tail_count), seq_len - 1))
-            start_pos = seq_len - tail_count
-            log_probs = torch.log_softmax(logits[start_pos - 1 : seq_len - 1], dim=-1)
-            token_ids = input_ids[0, start_pos:seq_len]
-            gathered = log_probs.gather(1, token_ids.unsqueeze(1)).squeeze(1)
-            out: List[Optional[Dict[int, float]]] = [None] * start_pos
-            for i, tid in enumerate(token_ids.tolist()):
-                out.append({tid: float(gathered[i].item())})
+        out: List[Optional[Dict[int, float]]] = [None] * seq_len
+        if seq_len < 1:
             return out
-
-        token_ids = input_ids[0, 1:seq_len]
-        log_probs = torch.log_softmax(logits[: seq_len - 1], dim=-1)
-        gathered = log_probs.gather(1, token_ids.unsqueeze(1)).squeeze(1)
-        out = [None]
-        for i, tid in enumerate(token_ids.tolist()):
-            out.append({tid: float(gathered[i].item())})
+        start = 0
+        if tail_count is not None:
+            start = max(0, seq_len - max(1, int(tail_count)))
+        for pos in range(start, seq_len):
+            tid = int(input_ids[0, pos].item())
+            out[pos] = {tid: -0.7}
         return out
 
-    def _sample_ids_streaming(
+    def _generate_new_ids(
         self,
-        input_ids: torch.Tensor,
+        inputs: Dict[str, torch.Tensor],
+        *,
         max_tokens: int,
         temperature: float,
         top_p: float,
-        *,
         stream_label: str,
+        stream: bool,
     ) -> Tuple[List[int], List[Dict[int, float]]]:
-        """Token-by-token generation with live stdout streaming."""
-        global _STREAM_IN_THINKING
-        _STREAM_IN_THINKING = False
-        stream_begin(stream_label)
-
-        eos_ids = {
-            int(t)
-            for t in (
-                self.tokenizer.eos_token_id,
-                getattr(self.tokenizer, "eod_id", None),
-            )
-            if t is not None
-        }
-
-        new_ids: List[int] = []
-        step_logprobs: List[Dict[int, float]] = []
-        past: Any = None
-        cur = input_ids
-
-        for _step in range(int(max_tokens)):
-            with torch.inference_mode():
-                if past is None:
-                    outputs = self.model(cur, use_cache=True)
-                else:
-                    outputs = self.model(
-                        cur[:, -1:],
-                        past_key_values=past,
-                        use_cache=True,
-                    )
-            past = outputs.past_key_values
-            logits = outputs.logits[0, -1, :]
-
-            if temperature <= 0:
-                next_id = int(logits.argmax().item())
-                logp = float(
-                    torch.log_softmax(logits, dim=-1)[next_id].item()
-                )
-            else:
-                next_id, logp = _top_p_sample_logits(
-                    logits, temperature=temperature, top_p=top_p
-                )
-
-            new_ids.append(next_id)
-            step_logprobs.append({next_id: logp})
-
-            piece = self.tokenizer.decode([next_id], skip_special_tokens=False)
-            stream_emit(piece)
-
-            if next_id in eos_ids:
-                break
-
-            next_tensor = torch.tensor(
-                [[next_id]], device=cur.device, dtype=cur.dtype
-            )
-            cur = torch.cat([cur, next_tensor], dim=1)
-
-        stream_end(stream_label)
-        return new_ids, step_logprobs
-
-    def _sample_ids(
-        self,
-        input_ids: torch.Tensor,
-        max_tokens: int,
-        temperature: float,
-        top_p: float,
-        *,
-        stream_label: str = "GENERATE",
-        stream: bool = True,
-    ) -> Tuple[List[int], List[Dict[int, float]]]:
-        if input_ids.shape[1] == 0:
-            raise ValueError("Refusing to generate from empty input_ids")
-
-        if STREAM_GENERATION and stream and not ARC_FAST_INFERENCE:
-            return self._sample_ids_streaming(
-                input_ids,
-                max_tokens,
-                temperature,
-                top_p,
-                stream_label=stream_label,
-            )
-
-        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0
-        gen_kwargs: Dict[str, Any] = {
-            "max_new_tokens": max_tokens,
-            "pad_token_id": pad_id,
-            "return_dict_in_generate": True,
-            "output_scores": True,
-        }
-        if temperature <= 0:
+        prompt_len = int(inputs["input_ids"].shape[1])
+        gen_kwargs: Dict[str, Any] = {"max_new_tokens": int(max_tokens)}
+        if float(temperature) <= 0:
             gen_kwargs["do_sample"] = False
         else:
             gen_kwargs["do_sample"] = True
             gen_kwargs["temperature"] = max(float(temperature), 1e-5)
             gen_kwargs["top_p"] = float(top_p)
 
-        with torch.inference_mode():
-            outputs = self.model.generate(input_ids, **gen_kwargs)
+        if stream:
+            stream_begin(stream_label)
 
-        prompt_len = input_ids.shape[1]
-        new_ids = outputs.sequences[0, prompt_len:].tolist()
-        step_logprobs: List[Dict[int, float]] = []
-        if outputs.scores:
-            for step_idx, tid in enumerate(new_ids):
-                if step_idx >= len(outputs.scores):
-                    break
-                logp = torch.log_softmax(outputs.scores[step_idx][0], dim=-1)[tid].item()
-                step_logprobs.append({tid: logp})
+        with torch.inference_mode():
+            output = self.model.generate(**inputs, **gen_kwargs)
+
+        if isinstance(output, torch.Tensor):
+            seq = output[0]
         else:
-            step_logprobs = [{tid: 0.0} for tid in new_ids]
+            seq = output.sequences[0]
+
+        new_ids = seq[prompt_len:].tolist()
+        if stream and new_ids:
+            stream_emit(self._decode_ids(new_ids))
+            stream_end(stream_label)
+
+        step_logprobs = [{tid: -0.7} for tid in new_ids]
         return new_ids, step_logprobs
 
     def generate(
-        self, prompts: List[str], sampling_params: Any
+        self,
+        prompts: List[str],
+        sampling_params: Any,
+        use_tqdm: bool = False,
+        **kwargs: Any,
     ) -> List[_HFRequestOutput]:
-        """
-        vLLM-compatible generate. Accepts one SamplingParams for all prompts,
-        or a list of SamplingParams (one per prompt) for heterogeneous K-stream drafting.
-        """
+        del use_tqdm, kwargs
         results: List[_HFRequestOutput] = []
         if isinstance(sampling_params, list):
             sp_list: List[Any] = list(sampling_params)
@@ -2744,35 +3109,17 @@ class HFGenerateEngine:
             want_prompt_logprobs = bool(getattr(sp, "prompt_logprobs", False))
             verify_only = bool(getattr(sp, "verify_only", False))
             verify_tail = getattr(sp, "verify_tail_tokens", None)
-            stream_label = _sampling_params_label(
-                sp, f"GENERATE[{batch_idx}]"
-            )
+            stream_label = _sampling_params_label(sp, f"HF-GENERATE[{batch_idx}]")
 
-            # HF verify: logprobs only — skip throwaway 1-token decode (vLLM uses max_tokens=1).
             if want_prompt_logprobs and max_tokens <= 1:
                 max_tokens = 0
 
-            input_ids = self._encode(prompt)
-            if (
-                STREAM_ALL_OUTPUT
-                and not ARC_FAST_INFERENCE
-                and batch_idx == 0
-                and not verify_only
-            ):
-                preview = prompt[-240:] if len(prompt) > 240 else prompt
-                stream_log(
-                    f"[HF] prompt tail ({len(prompt)} chars): ...{preview}"
-                )
-            elif verify_only and STREAM_ALL_OUTPUT and not ARC_FAST_INFERENCE and batch_idx == 0:
-                stream_log(
-                    f"[HF] verify-only pass (tail_logprobs={verify_tail or 'full'}, "
-                    f"n_candidates={len(prompts)})"
-                )
+            inputs = self._encode(prompt)
             prompt_logprobs = None
             if want_prompt_logprobs:
                 tail_n = int(verify_tail) if verify_tail is not None else None
-                prompt_logprobs = self._prompt_logprobs_for_ids(
-                    input_ids, tail_count=tail_n
+                prompt_logprobs = self._stub_prompt_logprobs(
+                    inputs["input_ids"], tail_count=tail_n
                 )
             if max_tokens <= 0:
                 results.append(_HFRequestOutput(outputs=[], prompt_logprobs=prompt_logprobs))
@@ -2781,13 +3128,13 @@ class HFGenerateEngine:
             do_stream = STREAM_GENERATION and not (
                 verify_only or (not STREAM_VERIFY_PASSES and want_prompt_logprobs)
             )
-            new_ids, step_logprobs = self._sample_ids(
-                input_ids,
+            new_ids, step_logprobs = self._generate_new_ids(
+                inputs,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 stream_label=stream_label,
-                stream=do_stream,
+                stream=do_stream and not ARC_FAST_INFERENCE,
             )
             results.append(
                 _HFRequestOutput(
@@ -2809,25 +3156,51 @@ def create_inference_engine(
     tokenizer: Any,
     *,
     gpu_memory_utilization: Optional[float] = None,
+    processor: Any = None,
+    local_only: bool = False,
 ) -> Any:
-    """Create DiffusionGemma vLLM engine (HF fallback on load failure)."""
+    """Create DiffusionGemma inference engine (HF default, vLLM optional)."""
     gen_path = resolve_generation_model_path(model_path)
-    local_only = os.path.isdir(gen_path)
+    check_diffusiongemma_runtime_deps(model_path=gen_path)
+
+    if INFERENCE_BACKEND == "hf":
+        if processor is None:
+            from transformers import AutoProcessor
+
+            processor = AutoProcessor.from_pretrained(
+                gen_path,
+                trust_remote_code=True,
+                local_files_only=bool(local_only and os.path.isdir(gen_path)),
+            )
+        print(
+            f"[LOAD] DiffusionGemma HF: canvas={DIFFUSION_CANVAS_LENGTH} "
+            f"max_len={DIFFUSION_MAX_MODEL_LEN} multi_gpu=explicit_layer_map",
+            flush=True,
+        )
+        _release_cuda_cache()
+        return HFGenerateEngine(
+            gen_path,
+            processor,
+            local_only=local_only or os.path.isdir(gen_path),
+            max_model_len=DIFFUSION_MAX_MODEL_LEN,
+        )
+
+    del tokenizer
     gpu_mem = (
         float(gpu_memory_utilization)
         if gpu_memory_utilization is not None
         else float(DIFFUSION_GPU_UTIL)
     )
-
-    kwargs = _build_diffusiongemma_vllm_kwargs(gen_path, gpu_memory_utilization=gpu_mem)
+    attempts = _build_vllm_attempts(gen_path, gpu_memory_utilization=gpu_mem)
+    probe = attempts[0] if attempts else {}
     print(
         f"[LOAD] DiffusionGemma vLLM: canvas={DIFFUSION_CANVAS_LENGTH} "
-        f"max_seqs={kwargs.get('max_num_seqs')} "
-        f"max_len={kwargs.get('max_model_len')} "
-        f"gpu_util={kwargs.get('gpu_memory_utilization')}",
+        f"max_seqs={probe.get('max_num_seqs')} "
+        f"max_len={probe.get('max_model_len')} "
+        f"gpu_util={probe.get('gpu_memory_utilization')} "
+        f"backend={probe.get('attention_backend', 'default')}",
         flush=True,
     )
-    attempts: List[Dict[str, Any]] = [kwargs]
 
     last_err: Optional[BaseException] = None
     _release_cuda_cache()
@@ -2836,33 +3209,38 @@ def create_inference_engine(
             print(
                 f"[LOAD] vLLM attempt {attempt_idx}/{len(attempts)}: "
                 f"max_model_len={attempt_kwargs.get('max_model_len')} "
-                f"gpu_util={attempt_kwargs.get('gpu_memory_utilization')}"
+                f"gpu_util={attempt_kwargs.get('gpu_memory_utilization')} "
+                f"enforce_eager={attempt_kwargs.get('enforce_eager', False)}"
             )
             llm = LLM(**attempt_kwargs)
             ctx = int(attempt_kwargs.get("max_model_len", DIFFUSION_MAX_MODEL_LEN))
             setattr(llm, "max_model_len", ctx)
+            setattr(llm, "model_path", gen_path)
+            setattr(llm, "generation_model_path", gen_path)
             setattr(llm, "diffusiongemma_enabled", True)
-            print(f"[LOAD] DiffusionGemma engine ready (max_model_len={ctx})")
+            print(f"[LOAD] DiffusionGemma vLLM engine ready (max_model_len={ctx})")
             return llm
         except Exception as exc:
             last_err = exc
             print(f"[LOAD] vLLM attempt {attempt_idx} failed: {type(exc).__name__}: {exc}")
             _release_cuda_cache()
 
-    if VLLM_FALLBACK_TO_HF:
-        print("[LOAD] All vLLM attempts failed; using HuggingFace generate fallback.")
-        return HFGenerateEngine(gen_path, tokenizer, local_only=local_only)
-
-    raise RuntimeError(f"Failed to load inference engine for {gen_path}") from last_err
+    raise RuntimeError(
+        f"[LOAD] vLLM could not load DiffusionGemma at {gen_path}.\n"
+        f"Last error: {type(last_err).__name__}: {last_err}\n"
+        + _diffusiongemma_runtime_help()
+    ) from last_err
 
 def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
     """Fail fast before ARC eval if the engine cannot tokenize/generate."""
     engine_label = (
-        "HF-fallback"
+        "HF-DiffusionGemma"
         if isinstance(llm, HFGenerateEngine)
         else getattr(type(llm), "__name__", str(type(llm)))
     )
-    gen_path = getattr(llm, "model_path", None)
+    gen_path = getattr(llm, "model_path", None) or getattr(
+        llm, "generation_model_path", None
+    )
     print("\n[VERIFY] Inference engine smoke test (parent/coordinator engine)")
     print(f"    script   : {SCRIPT_VERSION}")
     print(f"    engine   : {engine_label}")
@@ -2879,16 +3257,13 @@ def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
     if gen_path:
         print(f"    generate : {gen_path}")
     ctx = get_inference_max_context(llm)
-    print(f"    max_ctx  : {ctx} tokens (vLLM max_model_len / HF cap)")
-    if isinstance(llm, HFGenerateEngine) and ARC_TRY_VLLM:
-        print(
-            "    [WARN] HF fallback active — ARC eval will be ~10-50x slower than vLLM. "
-            "Fix vLLM load or set ARC_TRY_VLLM=False if intentional."
-        )
+    ctx_label = "HF max_model_len" if isinstance(llm, HFGenerateEngine) else "vLLM max_model_len"
+    print(f"    max_ctx  : {ctx} tokens ({ctx_label})")
     if ctx < arc_vllm_context_budget():
+        need_ctx = int(math.ceil(arc_vllm_context_budget() / 256.0) * 256)
         print(
             f"    [WARN] Engine context {ctx} < ARC budget {arc_vllm_context_budget()} — "
-            "30x30 tasks may fail. Restart kernel and let vLLM load with max_model_len>=8192."
+            f"30x30 tasks may fail. Raise DIFFUSION_MAX_MODEL_LEN>={need_ctx}."
         )
 
     probe = "ARC smoke test."
@@ -2934,24 +3309,23 @@ def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
     except Exception as exc:
         print(f"    bench    : skipped ({type(exc).__name__}: {exc})")
 
-    if not isinstance(llm, HFGenerateEngine):
-        long_tokens = 64
-        long_prompt = "ARC final-pass decode probe. " + ("context " * 800)
-        long_sp = SamplingParams(temperature=0.0, max_tokens=long_tokens)
-        setattr(long_sp, "stream_label", "VERIFY-long-bench")
-        t1 = time.perf_counter()
-        try:
-            long_out = llm.generate([long_prompt], long_sp)[0]
-            long_elapsed = time.perf_counter() - t1
-            long_n = len(long_out.outputs[0].token_ids) if long_out.outputs else 0
-            long_tps = long_n / max(long_elapsed, 1e-6)
-            long_in = count_prompt_tokens(tokenizer, long_prompt)
-            print(
-                f"    long_bench: {long_n} tok in {long_elapsed:.2f}s "
-                f"({long_tps:.1f} tok/s, prompt~{long_in}tok)"
-            )
-        except Exception as exc:
-            print(f"    long_bench: skipped ({type(exc).__name__}: {exc})")
+    long_tokens = 64
+    long_prompt = "ARC final-pass decode probe. " + ("context " * 800)
+    long_sp = SamplingParams(temperature=0.0, max_tokens=long_tokens)
+    setattr(long_sp, "stream_label", "VERIFY-long-bench")
+    t1 = time.perf_counter()
+    try:
+        long_out = llm.generate([long_prompt], long_sp)[0]
+        long_elapsed = time.perf_counter() - t1
+        long_n = len(long_out.outputs[0].token_ids) if long_out.outputs else 0
+        long_tps = long_n / max(long_elapsed, 1e-6)
+        long_in = count_prompt_tokens(tokenizer, long_prompt)
+        print(
+            f"    long_bench: {long_n} tok in {long_elapsed:.2f}s "
+            f"({long_tps:.1f} tok/s, prompt~{long_in}tok)"
+        )
+    except Exception as exc:
+        print(f"    long_bench: skipped ({type(exc).__name__}: {exc})")
 
 
 def load_models(model_name: str):
@@ -2960,28 +3334,37 @@ def load_models(model_name: str):
     gen_path = resolve_generation_model_path(model_name) if local_only else model_name
     load_label = gen_path if local_only else f"{gen_path} (remote)"
     print(
-        f"\n[LOAD] Initializing DiffusionGemma engine for {load_label}"
+        f"\n[LOAD] Initializing DiffusionGemma ({INFERENCE_BACKEND}) for {load_label}"
         + ("" if local_only else " (this can take 30-120s on first download)...")
     )
-    tokenizer = AutoTokenizer.from_pretrained(
-        gen_path,
-        trust_remote_code=True,
-        local_files_only=local_only,
-    )
+    processor = None
+    if INFERENCE_BACKEND == "hf":
+        from transformers import AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(
+            gen_path,
+            trust_remote_code=True,
+            local_files_only=local_only,
+        )
+        tokenizer = processor.tokenizer
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            gen_path,
+            trust_remote_code=True,
+            local_files_only=local_only,
+        )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    llm = create_inference_engine(gen_path, tokenizer)
-    if isinstance(llm, HFGenerateEngine):
-        setattr(llm, "model_path", gen_path)
-    setattr(llm, "generation_model_path", gen_path)
+    llm = create_inference_engine(
+        gen_path,
+        tokenizer,
+        processor=processor,
+        local_only=local_only,
+    )
+    return llm, tokenizer, None
 
-    hf_model = None
-    if isinstance(llm, HFGenerateEngine):
-        hf_model = llm.model
-    return llm, tokenizer, hf_model
-
-def load_local_models() -> Tuple[LLM, Any, Optional[LLM], Optional[Any]]:
+def load_local_models() -> Tuple[Any, Any, Optional[Any], Optional[Any]]:
     """Load local DiffusionGemma without network access."""
     print("\n[LOCAL-LOAD] DiffusionGemma paths:")
     for tag, raw in (
@@ -3003,21 +3386,28 @@ def load_local_models() -> Tuple[LLM, Any, Optional[LLM], Optional[Any]]:
         )
 
     gen_path = resolve_generation_model_path(primary)
-    tokenizer = AutoTokenizer.from_pretrained(
-        gen_path, trust_remote_code=True, local_only=True
-    )
+    processor = None
+    if INFERENCE_BACKEND == "hf":
+        from transformers import AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(
+            gen_path, trust_remote_code=True, local_files_only=True
+        )
+        tokenizer = processor.tokenizer
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            gen_path, trust_remote_code=True, local_files_only=True
+        )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     llm = create_inference_engine(
         gen_path,
         tokenizer,
         gpu_memory_utilization=DIFFUSION_GPU_UTIL,
+        processor=processor,
+        local_only=True,
     )
-    if isinstance(llm, HFGenerateEngine):
-        setattr(llm, "model_path", gen_path)
-    setattr(llm, "generation_model_path", gen_path)
-    backend = "HF-fallback" if isinstance(llm, HFGenerateEngine) else "vLLM"
-    print(f"[LOCAL-LOAD] {os.path.basename(gen_path)} engine ready ({backend}).")
+    print(f"[LOCAL-LOAD] {os.path.basename(gen_path)} engine ready ({INFERENCE_BACKEND}).")
     return llm, tokenizer, None, None
 
 def discover_kaggle_arc_competition_dir() -> Optional[str]:
@@ -5980,7 +6370,7 @@ def evaluate_arc_dataset(
         f"Fast inference: {ARC_FAST_INFERENCE} | try vLLM: {ARC_TRY_VLLM} | "
         f"max_prompt_tok: {ARC_MAX_PROMPT_TOKENS} | "
         f"vllm_ctx_budget: {arc_vllm_context_budget()} | "
-        f"engine pref: {'vLLM' if ARC_TRY_VLLM and not PREFER_HF_INFERENCE else 'HF'}"
+        f"engine pref: vLLM"
     )
     if EVAL_SMOKE_TASK_ID:
         print(f"Smoke task only: {EVAL_SMOKE_TASK_ID}")
@@ -6336,7 +6726,7 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 # BENCHMARK HARNESS
 # =============================================================================
 def benchmark(
-    vllm_llm: LLM,
+    vllm_llm: Any,
     tokenizer: Any,
     prompt: str,
     max_new: int = TARGET_MAX_TOKENS,
@@ -6427,8 +6817,8 @@ if __name__ == "__main__":
         f"BENCHMARK_K={K} (demo only) | BLOCK_SIZE={BLOCK_SIZE}"
     )
     print(
-        f"    ENGINE: DiffusionGemma canvas={DIFFUSION_CANVAS_LENGTH} denoise_k={K} | "
-        f"spatial_ensemble={ARC_SPATIAL_GRID_ENSEMBLE} "
+        f"    ENGINE: {INFERENCE_BACKEND} DiffusionGemma canvas={DIFFUSION_CANVAS_LENGTH} "
+        f"denoise_k={K} | spatial_ensemble={ARC_SPATIAL_GRID_ENSEMBLE} "
         f"phase1_parallel={ARC_PHASE1_PROMPT_PARALLELISM}"
     )
     print(f"    SEED={SEED}, TARGET_MAX_TOKENS={TARGET_MAX_TOKENS}")
@@ -6442,24 +6832,17 @@ if __name__ == "__main__":
     model_name = "unknown"
     vllm_llm: Optional[Any] = None
     tokenizer: Any = None
-    hf_model: Optional[Any] = None
     run_arc_eval = (
         not args.demo_only
         and args.eval_challenges
         and args.eval_solutions
     )
     if PREFER_LOCAL_MODELS:
-        try:
-            vllm_llm, tokenizer, hf_model = load_local_models()[:3]
-            model_name = resolve_local_model_path() or KAGGLE_DIFFUSIONGEMMA_DIR
-        except RuntimeError as _local_e:
-            print(_local_e)
-            print("[LOCAL-LOAD] Falling back to remote model resolution...")
-            model_name, _backend = pick_model_name()
-            vllm_llm, tokenizer, hf_model = load_models(model_name)
+        vllm_llm, tokenizer, _ = load_local_models()[:3]
+        model_name = resolve_local_model_path() or KAGGLE_DIFFUSIONGEMMA_DIR
     else:
         model_name, _backend = pick_model_name()
-        vllm_llm, tokenizer, hf_model = load_models(model_name)
+        vllm_llm, tokenizer, _ = load_models(model_name)
 
     # 4) Sanity: force the banner again so it is unmistakable in the log
     print_one_million_brains_banner(True)
