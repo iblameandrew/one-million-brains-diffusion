@@ -10,17 +10,19 @@ Architecture (Riemannian base ↔ discrete fiber bundle):
   5. TFBD_Orchestrator — HuggingFace DiffusionGemmaForBlockDiffusion wrapper + KV bias
 
 Kaggle: attach Models input google/diffusiongemma, run as script or notebook cell.
-Default backend: HuggingFace (transformers + DiffusionGemmaForBlockDiffusion).
+Default backend: vLLM (godelcomplete wheels or matched pip stack). HF is optional fallback.
 
-HF install (Kaggle cell 1 if needed):
-    !pip install -U transformers accelerate torch
+Kaggle cell 1 (vLLM wheels — run once, then Restart Kernel):
+    WHEELS = "/kaggle/input/notebooks/godelcomplete/vllm-gemma/vllm_latest_wheels/"
+    !pip install --no-index --find-links=$WHEELS --upgrade vllm transformers accelerate torch torchvision torchaudio
 """
 
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-20-tfbd-b"  # fix TokenizersBackend processor (no nested .tokenizer)
-INFERENCE_BACKEND = "hf"  # "hf" (default) | "vllm"
+SCRIPT_VERSION = "2026-06-20-tfbd-c"  # restore vLLM default; relax deps when diffusion_config present
+INFERENCE_BACKEND = "vllm"  # "vllm" (default) | "hf"
+VLLM_FALLBACK_TO_HF = True  # if vLLM load fails, try HuggingFace DiffusionGemma engine
 HF_FAST_VERIFY = True  # stub tail logprobs on diffusion verify passes (no causal forward)
 HF_TORCH_DTYPE = "bfloat16"  # official recipe; use "float16" if bf16 unsupported
 # --- DiffusionGemma core (default engine) ---
@@ -112,8 +114,11 @@ VLLM_ATTENTION_BACKEND = "TRITON_ATTN"  # DiffusionGemma recipe default
 VLLM_MIN_VERSION = "0.23.0"  # floor only — PyPI 0.23.0 still lacks diffusion_config (need git main)
 VLLM_GIT_INSTALL = "git+https://github.com/vllm-project/vllm.git"  # DiffusionGemma API (unreleased on PyPI)
 VLLM_TORCH_VERSION = "2.11.0"  # pinned by vllm 0.23; Kaggle torch 2.5/2.6 breaks transformers 5.12
-TRANSFORMERS_MIN_VERSION = "5.11.0"  # diffusion_gemma architecture
-AUTO_UPGRADE_VLLM_ON_KAGGLE = True  # pip install matched stack when Internet ON
+TRANSFORMERS_MIN_VERSION = "5.11.0"  # diffusion_gemma architecture (HF backend; vLLM warns only)
+KAGGLE_VLLM_WHEELS_PATH = (
+    "/kaggle/input/notebooks/godelcomplete/vllm-gemma/vllm_latest_wheels/"
+)  # pre-built stack; set "" to disable
+AUTO_UPGRADE_VLLM_ON_KAGGLE = True  # pip git stack when Internet ON and no wheels / broken API
 
 AUTO_PREFETCH_TO_WORKING = True  # when online, try to cache DiffusionGemma into /kaggle/working
 PREFETCH_MODEL_ID = DIFFUSIONGEMMA_MODEL_PRIMARY
@@ -165,7 +170,7 @@ ARC_ASSISTANT_PREFILL = "[["  # chat prefill anchors JSON grid (skipped when thi
 ARC_GENERATION_TEMPERATURE = 0.0  # greedy JSON for grid tasks
 EVAL_SMOKE_TASK_ID = None  # e.g. "0934a4d8" — run only this task (overrides max_tasks slice)
 ARC_FAST_INFERENCE = True  # ARC eval: compact prompts, batched gen, no per-token streaming
-ARC_TRY_VLLM = INFERENCE_BACKEND == "vllm"  # legacy flag; HF is the default engine
+ARC_TRY_VLLM = True  # ARC eval expects vLLM throughput; HF fallback is much slower
 # Qwen3.5-4B native context is 150k+ (YaRN); vLLM max_model_len is a VRAM budget we set at load.
 # KV cache grows with max_model_len — 4k was only to fit L4 OOM; ARC 30x30 tasks need ~8k+.
 VLLM_MAX_MODEL_LEN = 0  # 0 = auto (ARC prompt + output budget); set e.g. 16384 if VRAM allows
@@ -274,6 +279,14 @@ def _pypi_reachable() -> bool:
             return True
     except OSError:
         return False
+
+
+def _kaggle_vllm_wheels_dir() -> Optional[str]:
+    """Resolved Kaggle wheels mount when present (godelcomplete vLLM bundle)."""
+    raw = (KAGGLE_VLLM_WHEELS_PATH or "").strip()
+    if raw and os.path.isdir(raw):
+        return raw
+    return None
 
 
 def _vllm_supports_diffusion_config() -> bool:
@@ -414,13 +427,33 @@ def _bootstrap_diffusiongemma_vllm() -> None:
             )
         )
 
-    ok, reason = _diffusiongemma_versions_ok()
     vllm_ver = _package_version("vllm")
     torch_ver = _package_version("torch")
     tfm_ver = _package_version("transformers")
+    has_diffusion_kw = _vllm_supports_diffusion_config()
+    wheels_dir = _kaggle_vllm_wheels_dir()
+
+    if has_diffusion_kw:
+        print(
+            f"[DEPS] vLLM diffusion_config present — using installed stack: "
+            f"torch={torch_ver}, vllm={vllm_ver}, transformers={tfm_ver}, "
+            f"wheels={wheels_dir or 'n/a'}, VLLM_USE_V2_MODEL_RUNNER=1"
+        )
+        if not _version_at_least(tfm_ver, TRANSFORMERS_MIN_VERSION):
+            print(
+                f"[DEPS] [WARN] transformers={tfm_ver} < {TRANSFORMERS_MIN_VERSION}. "
+                "If load fails, pip install --upgrade transformers from wheels, then Restart Kernel."
+            )
+        if not _version_at_least(torch_ver, VLLM_TORCH_VERSION):
+            print(
+                f"[DEPS] [WARN] torch={torch_ver} < {VLLM_TORCH_VERSION}. "
+                "Restart Kernel after upgrading torch from wheels."
+            )
+        return
+
+    ok, reason = _diffusiongemma_versions_ok()
     if ok:
         api_ok, api_reason = _diffusiongemma_stack_ok(check_api=True)
-        has_diffusion_kw = _vllm_supports_diffusion_config()
         print(
             f"[DEPS] pre-import versions OK: torch={torch_ver}, vllm={vllm_ver}, "
             f"transformers={tfm_ver}, diffusion_config={has_diffusion_kw}, "
@@ -432,6 +465,17 @@ def _bootstrap_diffusiongemma_vllm() -> None:
         print(f"[DEPS] pre-import API mismatch: {reason}")
     else:
         print(f"[DEPS] pre-import version mismatch: {reason}")
+
+    if wheels_dir:
+        raise RuntimeError(
+            "[DEPS] vLLM wheels found but diffusion_config API missing.\n"
+            f"  Wheels: {wheels_dir}\n"
+            "  Run this in the cell BEFORE tfbd.py, then Restart Kernel:\n"
+            f"    !pip install --no-index --find-links={wheels_dir} "
+            "--upgrade vllm transformers accelerate torch torchvision torchaudio\n"
+            f"Detail: {reason}"
+        )
+
     on_kaggle = os.path.isdir("/kaggle/input")
     if AUTO_UPGRADE_VLLM_ON_KAGGLE and on_kaggle and _pypi_reachable():
         _install_diffusiongemma_stack()
@@ -2181,19 +2225,39 @@ def check_diffusiongemma_runtime_deps(*, model_path: Optional[str] = None) -> No
     else:
         vllm_ver = _package_version("vllm")
         has_diffusion_kw = _vllm_supports_diffusion_config()
-        stack_ok, stack_reason = _diffusiongemma_stack_ok(check_api=True)
+        wheels_dir = _kaggle_vllm_wheels_dir()
         print(
             f"[DEPS] backend=vllm | torch={torch_ver} (need>={VLLM_TORCH_VERSION}) | "
-            f"vllm={vllm_ver} (need>={VLLM_MIN_VERSION}+git) diffusion_config={has_diffusion_kw} | "
+            f"vllm={vllm_ver} (need>={VLLM_MIN_VERSION}) diffusion_config={has_diffusion_kw} | "
             f"transformers={tfm_ver} diffusion_gemma={has_diffusion_arch} | "
+            f"wheels={wheels_dir or 'n/a'} | "
             f"VLLM_USE_V2_MODEL_RUNNER={os.environ.get('VLLM_USE_V2_MODEL_RUNNER', '')}"
         )
+        if has_diffusion_kw:
+            if not has_diffusion_arch:
+                print(
+                    f"[DEPS] [WARN] transformers={tfm_ver} lacks diffusion_gemma arch; "
+                    "vLLM loads the checkpoint directly — upgrade transformers if load fails."
+                )
+            if not _version_at_least(torch_ver, VLLM_TORCH_VERSION):
+                print(
+                    f"[DEPS] [WARN] torch={torch_ver} < {VLLM_TORCH_VERSION} — "
+                    "restart kernel after pip upgrade from wheels."
+                )
+            return
+        stack_ok, stack_reason = _diffusiongemma_stack_ok(check_api=True)
         if not stack_ok:
             detail = stack_reason
             if has_diffusion_arch and not has_diffusion_kw:
                 detail = (
                     f"vllm={vllm_ver} missing diffusion_config — "
                     f"PyPI wheel lacks DiffusionGemma; install {VLLM_GIT_INSTALL}"
+                )
+            if wheels_dir:
+                detail = (
+                    f"{detail}\n  Kaggle wheels: {wheels_dir}\n"
+                    f"  !pip install --no-index --find-links={wheels_dir} "
+                    "--upgrade vllm transformers accelerate torch"
                 )
             raise RuntimeError(
                 _diffusiongemma_runtime_help(
@@ -3719,7 +3783,7 @@ def create_inference_engine(
     processor: Any = None,
     local_only: bool = False,
 ) -> Any:
-    """Create DiffusionGemma inference engine (HF default, vLLM optional)."""
+    """Create DiffusionGemma inference engine (vLLM default, HF optional fallback)."""
     gen_path = resolve_generation_model_path(model_path)
     check_diffusiongemma_runtime_deps(model_path=gen_path)
 
@@ -3785,6 +3849,26 @@ def create_inference_engine(
             print(f"[LOAD] vLLM attempt {attempt_idx} failed: {type(exc).__name__}: {exc}")
             _release_cuda_cache()
 
+    if VLLM_FALLBACK_TO_HF:
+        print(
+            "[LOAD] All vLLM attempts failed; using HuggingFace DiffusionGemma fallback."
+        )
+        if processor is None:
+            from transformers import AutoProcessor
+
+            processor = AutoProcessor.from_pretrained(
+                gen_path,
+                trust_remote_code=True,
+                local_files_only=bool(local_only and os.path.isdir(gen_path)),
+            )
+        _release_cuda_cache()
+        return HFGenerateEngine(
+            gen_path,
+            processor,
+            local_only=local_only or os.path.isdir(gen_path),
+            max_model_len=DIFFUSION_MAX_MODEL_LEN,
+        )
+
     raise RuntimeError(
         f"[LOAD] vLLM could not load DiffusionGemma at {gen_path}.\n"
         f"Last error: {type(last_err).__name__}: {last_err}\n"
@@ -3794,7 +3878,7 @@ def create_inference_engine(
 def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
     """Fail fast before ARC eval if the engine cannot tokenize/generate."""
     engine_label = (
-        "HF-DiffusionGemma"
+        "HF-fallback"
         if isinstance(llm, HFGenerateEngine)
         else getattr(type(llm), "__name__", str(type(llm)))
     )
@@ -3819,6 +3903,11 @@ def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
     ctx = get_inference_max_context(llm)
     ctx_label = "HF max_model_len" if isinstance(llm, HFGenerateEngine) else "vLLM max_model_len"
     print(f"    max_ctx  : {ctx} tokens ({ctx_label})")
+    if isinstance(llm, HFGenerateEngine) and ARC_TRY_VLLM:
+        print(
+            "    [WARN] HF fallback active — ARC eval will be much slower than vLLM. "
+            "Fix vLLM load or set ARC_TRY_VLLM=False if intentional."
+        )
     if ctx < arc_vllm_context_budget():
         need_ctx = int(math.ceil(arc_vllm_context_budget() / 256.0) * 256)
         print(
