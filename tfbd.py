@@ -2,9 +2,6 @@
 """
 tfbd.py — Topological Fiber-Bundle Diffusion (TFBD) × DiffusionGemma for ARC-AGI
 
-Replaces the flawed 1D Sonar / CTSB projection (Combinatorial Token Sequence Bottleneck
-and Topological Collapse) with a production TFBD stack over DiffusionGemma block diffusion.
-
 Architecture (Riemannian base ↔ discrete fiber bundle):
   1. TopologicalFiberEmbedding  — E = E_value + E_row + E_col + E_symmetry (GSDM sharing)
   2. CosmosSparsifier + TorusCache — latent sparsification + T^2 measure dispersion
@@ -22,7 +19,7 @@ HF install (Kaggle cell 1 if needed):
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-20-tfbd-a"  # Topological Fiber-Bundle Diffusion over DiffusionGemma
+SCRIPT_VERSION = "2026-06-20-tfbd-b"  # fix TokenizersBackend processor (no nested .tokenizer)
 INFERENCE_BACKEND = "hf"  # "hf" (default) | "vllm"
 HF_FAST_VERIFY = True  # stub tail logprobs on diffusion verify passes (no causal forward)
 HF_TORCH_DTYPE = "bfloat16"  # official recipe; use "float16" if bf16 unsupported
@@ -3891,6 +3888,17 @@ def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
         print(f"    long_bench: skipped ({type(exc).__name__}: {exc})")
 
 
+def _resolve_hf_tokenizer(processor: Any) -> Any:
+    """
+    DiffusionGemma AutoProcessor may return TokenizersBackend directly (transformers 5.x),
+    not a ProcessorMixin with a nested .tokenizer attribute.
+    """
+    nested = getattr(processor, "tokenizer", None)
+    if nested is not None:
+        return nested
+    return processor
+
+
 def load_models(model_name: str):
     """Load DiffusionGemma inference engine + tokenizer."""
     local_only = os.path.isdir(model_name) and local_dir_exists(model_name)
@@ -3909,14 +3917,14 @@ def load_models(model_name: str):
             trust_remote_code=True,
             local_files_only=local_only,
         )
-        tokenizer = processor.tokenizer
+        tokenizer = _resolve_hf_tokenizer(processor)
     else:
         tokenizer = AutoTokenizer.from_pretrained(
             gen_path,
             trust_remote_code=True,
             local_files_only=local_only,
         )
-    if tokenizer.pad_token is None:
+    if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
         tokenizer.pad_token = tokenizer.eos_token
 
     llm = create_inference_engine(
@@ -3925,6 +3933,8 @@ def load_models(model_name: str):
         processor=processor,
         local_only=local_only,
     )
+    if INFERENCE_BACKEND == "hf":
+        tokenizer = getattr(llm, "tokenizer", tokenizer)
     return llm, tokenizer, None
 
 def load_local_models() -> Tuple[Any, Any, Optional[Any], Optional[Any]]:
@@ -3956,12 +3966,12 @@ def load_local_models() -> Tuple[Any, Any, Optional[Any], Optional[Any]]:
         processor = AutoProcessor.from_pretrained(
             gen_path, trust_remote_code=True, local_files_only=True
         )
-        tokenizer = processor.tokenizer
+        tokenizer = _resolve_hf_tokenizer(processor)
     else:
         tokenizer = AutoTokenizer.from_pretrained(
             gen_path, trust_remote_code=True, local_files_only=True
         )
-    if tokenizer.pad_token is None:
+    if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
         tokenizer.pad_token = tokenizer.eos_token
     llm = create_inference_engine(
         gen_path,
@@ -3970,6 +3980,8 @@ def load_local_models() -> Tuple[Any, Any, Optional[Any], Optional[Any]]:
         processor=processor,
         local_only=True,
     )
+    if INFERENCE_BACKEND == "hf":
+        tokenizer = getattr(llm, "tokenizer", tokenizer)
     print(f"[LOCAL-LOAD] {os.path.basename(gen_path)} engine ready ({INFERENCE_BACKEND}).")
     return llm, tokenizer, None, None
 
