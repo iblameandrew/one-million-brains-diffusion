@@ -19,7 +19,7 @@ Kaggle cell 1 (run once, then Restart Kernel):
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-20-tfbd-g"  # deps warn-only; hub>=1.5 matched to transformers 5.12
+SCRIPT_VERSION = "2026-06-20-tfbd-h"  # TFBD fiber modules sync to HF model CUDA device
 HF_FAST_VERIFY = True  # stub tail logprobs on diffusion verify passes (no causal forward)
 HF_TORCH_DTYPE = "bfloat16"  # official recipe; use "float16" if bf16 unsupported
 # --- DiffusionGemma core (default engine) ---
@@ -670,6 +670,8 @@ class TopologicalFiberEmbedding(nn.Module):
             return z.to(device) if device else z
         rows, cols = len(grid), len(grid[0])
         dev = device or self.value_emb.weight.device
+        if device is not None and self.value_emb.weight.device != device:
+            self.to(device)
         flat_vals: List[int] = []
         flat_rows: List[int] = []
         flat_cols: List[int] = []
@@ -1049,16 +1051,46 @@ class TFBD_Orchestrator(nn.Module):
             internal_dim=fiber_dim, num_features=NUM_PERSONALITY_FEATURES, k=k
         )
 
+    def _resolve_engine_device(self, engine: Optional[Any] = None) -> torch.device:
+        model = self.model
+        if model is None and engine is not None:
+            model = getattr(engine, "model", None)
+        if model is not None:
+            try:
+                emb = model.get_input_embeddings()
+                if emb is not None and getattr(emb.weight, "device", None) is not None:
+                    if emb.weight.device.type != "meta":
+                        return emb.weight.device
+            except Exception:
+                pass
+            for param in model.parameters():
+                if param.device.type != "meta":
+                    return param.device
+        if torch.cuda.is_available():
+            return torch.device("cuda:0")
+        return torch.device("cpu")
+
+    def sync_modules_to_model_device(self, engine: Optional[Any] = None) -> torch.device:
+        """Move TFBD fiber/allocator weights off CPU onto the DiffusionGemma input device."""
+        device = self._resolve_engine_device(engine)
+        if next(self.fiber_embed.parameters()).device != device:
+            self.to(device)
+        return device
+
     def build_spatial_bias(
         self,
         grid: List[List[int]],
         seq_len: int,
+        *,
+        engine: Optional[Any] = None,
     ) -> torch.Tensor:
         """
         KV-cache / attention spatial bias from fiber coordinates.
         B[i,j] ~ <fiber_i, fiber_j> restricted to seq_len (Morse-Smale locality).
         """
-        nodes = self.fiber_embed(grid)
+        device = self._resolve_engine_device(engine)
+        self.sync_modules_to_model_device(engine)
+        nodes = self.fiber_embed(grid, device=device)
         n = min(seq_len, nodes.shape[0])
         if n < 1:
             return torch.zeros(1, 1)
@@ -1086,9 +1118,8 @@ class TFBD_Orchestrator(nn.Module):
             return inputs
         with torch.no_grad():
             tok_emb = emb_layer(ids)
-            fiber_nodes = self.fiber_embed(
-                grid, device=tok_emb.device
-            )
+            self.sync_modules_to_model_device()
+            fiber_nodes = self.fiber_embed(grid, device=tok_emb.device)
             if fiber_nodes.shape[0] > 0:
                 fiber_mean = fiber_nodes.mean(dim=0)
                 d = min(tok_emb.shape[-1], fiber_mean.shape[0])
@@ -1120,6 +1151,8 @@ class TFBD_Orchestrator(nn.Module):
         if hasattr(engine, "processor") and self.processor is None:
             self.processor = engine.processor
             self.tokenizer = getattr(engine.processor, "tokenizer", engine.processor)
+        if self.model is not None:
+            self.sync_modules_to_model_device(engine)
         if hasattr(engine, "_encode") and self.model is not None and context_grid:
             inputs = engine._encode(prompt)
             inputs = self.inject_fiber_into_inputs(inputs, context_grid)
@@ -1217,6 +1250,7 @@ class TFBD_Orchestrator(nn.Module):
         self.model = model
         self.processor = processor
         self.tokenizer = getattr(processor, "tokenizer", processor)
+        self.sync_modules_to_model_device()
 
 
 # Back-compat aliases (deprecated)
