@@ -19,6 +19,12 @@ class TestSourceStructure(unittest.TestCase):
     def test_version_is_diffusion_e(self):
         self.assertIn('SCRIPT_VERSION = "2026-06-19-diffusion-e"', SOURCE)
 
+    def test_sonar_orchestrator_present(self):
+        self.assertIn("class SonarCompressedSensingOrchestrator", SOURCE)
+        self.assertIn("class SonarAugmentedAllocator", SOURCE)
+        self.assertIn("def make_feature_slot_allocator", SOURCE)
+        self.assertIn('ALLOCATOR_MODE = "hybrid"', SOURCE)
+
     def test_single_engine_arc_no_voter_pool(self):
         self.assertNotIn("ARC_MULTI_AGENT_REQUIRED", SOURCE)
         self.assertNotIn("MultiAgentEnginePool", SOURCE)
@@ -143,17 +149,21 @@ class TestCollectFeatureSlotHypothesesMock(unittest.TestCase):
         except Exception as exc:
             self.skipTest(f"full module import unavailable in this env: {exc}")
 
-        captured = {}
+        captured: dict = {"calls": []}
 
         class FakeOut:
             def __init__(self, n: int):
                 self.outputs = [MagicMock(token_ids=list(range(10)))]
 
         def fake_generate(prompts, sp_list, use_tqdm=True):
-            captured["use_tqdm"] = use_tqdm
-            captured["n_prompts"] = len(prompts)
-            captured["max_tokens"] = [sp.max_tokens for sp in sp_list]
-            captured["temps"] = [sp.temperature for sp in sp_list]
+            captured["calls"].append(
+                {
+                    "use_tqdm": use_tqdm,
+                    "n_prompts": len(prompts),
+                    "max_tokens": [sp.max_tokens for sp in sp_list],
+                    "temps": [sp.temperature for sp in sp_list],
+                }
+            )
             return [FakeOut(i) for i in range(len(prompts))]
 
         llm = MagicMock()
@@ -183,9 +193,7 @@ class TestCollectFeatureSlotHypothesesMock(unittest.TestCase):
 
         with patch.object(mbr, "count_prompt_tokens", return_value=100), patch.object(
             mbr, "make_pooled_state", return_value=MagicMock()
-        ), patch.object(
-            mbr, "PermutationFeatureSlotAllocator", return_value=fake_allocator
-        ):
+        ), patch.object(mbr, "make_feature_slot_allocator", return_value=fake_allocator):
             hyps = mbr.collect_feature_slot_hypotheses(
                 llm,
                 tok,
@@ -196,11 +204,16 @@ class TestCollectFeatureSlotHypothesesMock(unittest.TestCase):
                 verbose=False,
             )
 
-        self.assertFalse(captured.get("use_tqdm", True))
-        self.assertEqual(captured.get("n_prompts"), 8)
+        calls = captured.get("calls", [])
+        self.assertEqual(len(calls), 8)
+        self.assertTrue(all(c["use_tqdm"] is False for c in calls))
         self.assertEqual(len(hyps), 8)
-        self.assertTrue(all(t == 0.0 for t in captured.get("temps", [])))
-        self.assertTrue(all(mt == 875 for mt in captured.get("max_tokens", [])))
+        self.assertTrue(
+            all(t == 0.0 for c in calls for t in c.get("temps", []))
+        )
+        self.assertTrue(
+            all(mt == 875 for c in calls for mt in c.get("max_tokens", []))
+        )
 
 
 def main() -> int:

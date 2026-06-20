@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 million_brains_dflash.py — ONE-MILLION-BRAINS-DIFFUSIONGEMMA
-Permutation-Gated Feature-Slot Allocator hard-wired into DiffusionGemma canvas denoising.
+Sonar-augmented permutation-gated feature-slot allocator hard-wired into DiffusionGemma.
 
 Architecture: DiffusionGemma block-diffusion (256-token canvas, iterative denoising) with
-K parallel Million-Brains conditioned trajectories per denoise step — feature-slot allocation,
-CTSB smoothing, cross-stream integration, cumprod verification, and adaptive reallocation.
+K parallel Million-Brains conditioned trajectories per denoise step — FM/CF Sonar resonance,
+combinatorial feature-slot allocation, CTSB smoothing, cross-stream integration, cumprod
+verification, and doppler-guided adaptive reallocation.
 
 Kaggle: attach Models input google/diffusiongemma, run as script or notebook cell.
 """
@@ -13,7 +14,7 @@ Kaggle: attach Models input google/diffusiongemma, run as script or notebook cel
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-19-diffusion-e"  # batched Phase-1 + tokenization hot-path fixes
+SCRIPT_VERSION = "2026-06-19-diffusion-e"  # Sonar FM/CF + batched Phase-1 fixes
 # --- DiffusionGemma core (default engine) ---
 # Kaggle: Add Input -> Models -> google/diffusiongemma -> diffusiongemma-26b-a4b-it
 KAGGLE_DIFFUSIONGEMMA_DIR = (
@@ -61,6 +62,18 @@ CTSB_COHERENCE_GAMMA = 0.25  # TAFK weight on discourse coherence
 CTSB_COHERENCE_ETA = 0.15  # TAFK penalty for stylistic jump vs committed prefix
 CTSB_COHERENCE_KAPPA = 0.12  # TAFK bonus for features continuing from previous circuit
 ANCHOR_SLOT = 0  # slot 0 receives extra smoothing inertia (stable chain scribe)
+# --- Sonar compressed sensing orchestrator (training-free FM/CF resonance) ---
+ALLOCATOR_MODE = "hybrid"  # "permutation" | "hybrid" | "sonar"
+SONAR_DOPPLER_TEMPERATURE = 1.0  # softmax temperature for CF reflector matching
+SONAR_DOPPLER_RERANK_MARGIN = 0.15  # hybrid: swap slot when doppler disagrees by this margin
+SONAR_EARLY_STEP_THRESHOLD = 4  # Walsh high-pass band emphasis below this step
+SONAR_DEEP_STEP_THRESHOLD = 12  # Walsh low-pass band emphasis above this step
+SONAR_CHIRP_IN_DISCOURSE = True  # mix truncated chirp into CTSB discourse buffer
+SONAR_KV_STUB_ENABLED = True  # shape kv chirp per layer (logged only; no vLLM injection yet)
+SONAR_PRIMITIVE_BANK_SEED = 42  # deterministic semantic Hadamard reflector bank
+SONAR_KV_HEAD_DIM = 128  # stub KV projection width (DiffusionGemma head_dim placeholder)
+SONAR_KV_NUM_HEADS = 8  # stub KV projection heads placeholder
+SONAR_KV_NUM_LAYERS = 32  # stub layer count for depth-modulated chirp formatting
 # Local/offline model paths (Kaggle: attach a HF dataset or pre-download to /kaggle/working)
 PREFER_LOCAL_MODELS = True  # try /kaggle/input + /kaggle/working before any HuggingFace request
 # Local model path override (optional; DiffusionGemma resolved via KAGGLE_DIFFUSIONGEMMA_DIR)
@@ -154,7 +167,7 @@ import traceback
 from pathlib import Path
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Optional, Any
+from typing import List, Tuple, Dict, Optional, Any, Union
 from collections import Counter
 
 import warnings
@@ -370,7 +383,10 @@ class PermutationFeatureSlotAllocator(nn.Module):
         self.feature_emb = nn.Embedding(num_features, internal_dim)
 
         # Per-feature gating vectors (post cross-stream integration scaling / bias).
-        self.feature_gates = nn.Parameter(torch.ones(num_features, internal_dim) * 0.9)
+        self.register_buffer(
+            "feature_gates", torch.ones(num_features, internal_dim) * 0.9
+        )
+        self.feature_emb.weight.requires_grad_(False)
 
         # Positional components used to differentiate the K feature-slotted streams.
         self.segment_emb = nn.Embedding(64, internal_dim)  # super-block / horizon index
@@ -424,6 +440,323 @@ class PermutationFeatureSlotAllocator(nn.Module):
 
 
 # =============================================================================
+# SONAR COMPRESSED SENSING — FM chirp + CF doppler resonance (training-free)
+# =============================================================================
+def _next_power_of_two(n: int) -> int:
+    if n <= 1:
+        return 1
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
+
+
+def _fast_walsh_hadamard_transform_butterfly(x: torch.Tensor) -> torch.Tensor:
+    """Pure PyTorch FWHT via butterfly add/subtract (orthogonal, untrained)."""
+    out = x.clone().float()
+    if out.dim() == 1:
+        out = out.unsqueeze(0)
+    n = out.shape[-1]
+    if n & (n - 1) != 0:
+        raise ValueError(f"FWHT requires power-of-2 last dim, got {n}")
+    h = 1
+    while h < n:
+        for i in range(0, n, h * 2):
+            a = out[..., i : i + h]
+            b = out[..., i + h : i + h * 2]
+            out[..., i : i + h] = a + b
+            out[..., i + h : i + h * 2] = a - b
+        h *= 2
+    return out / math.sqrt(n)
+
+
+def _primitive_lens_fingerprint(primitive_name: str, hadamard_dim: int, seed: int) -> torch.Tensor:
+    """Deterministic semantic fingerprint from primitive lens text (no training)."""
+    lens = SPATIAL_PRIMITIVE_LENSES.get(primitive_name, primitive_name)
+    payload = f"{primitive_name}|{lens}|seed={seed}"
+    vec = torch.zeros(hadamard_dim, dtype=torch.float32)
+    for i, ch in enumerate(payload.encode("utf-8")):
+        vec[(i * 131 + ch * 17 + seed) % hadamard_dim] += float(ch) * 0.013 + 0.001
+    norm = vec.norm()
+    if norm > 1e-8:
+        vec = vec / norm
+    return vec
+
+
+def _build_semantic_hadamard_bank(
+    num_features: int, hadamard_dim: int, seed: int
+) -> torch.Tensor:
+    """
+    Orthogonal CF reflector bank: Hadamard rows modulated by per-primitive lens hashes.
+    Each row is a distinct echo signature for zero-shot doppler matching.
+    """
+    h_dim = _next_power_of_two(max(hadamard_dim, num_features))
+    bank = torch.zeros(num_features, h_dim, dtype=torch.float32)
+    hadamard = _fast_walsh_hadamard_transform_butterfly(
+        torch.eye(h_dim, dtype=torch.float32)
+    )
+    perm = list(range(h_dim))
+    rng = random.Random(seed)
+    rng.shuffle(perm)
+    for p in range(num_features):
+        row_idx = perm[p % h_dim]
+        lens_fp = _primitive_lens_fingerprint(
+            PERSONALITY_FEATURES[p], hadamard_dim=h_dim, seed=seed + p
+        )
+        bank[p] = hadamard[row_idx] * (0.65 + 0.35 * lens_fp)
+        norm = bank[p].norm()
+        if norm > 1e-8:
+            bank[p] = bank[p] / norm
+    return bank
+
+
+class SonarCompressedSensingOrchestrator(nn.Module):
+    """
+    Bat-sonar compressed sensing for Million Brains (training-free).
+
+    FM (identification): FWHT projects verification memory (pooled_vec) into a 1D
+    orthogonal chirp — an untrained measurement basis over hidden-state geometry.
+
+    CF (extraction): fixed semantic Hadamard reflectors (12 spatial primitives) resonate
+    with the depth-modulated chirp via inner product; softmax yields doppler_probs.
+
+    The chirp can be formatted for future DFlash KV injection; today it also feeds CTSB
+    discourse when SONAR_CHIRP_IN_DISCOURSE is enabled.
+    """
+
+    def __init__(
+        self,
+        internal_dim: int = 256,
+        num_features: int = 12,
+        k: int = 4,
+        bank_seed: int = SONAR_PRIMITIVE_BANK_SEED,
+    ):
+        super().__init__()
+        self.internal_dim = internal_dim
+        self.num_features = num_features
+        self.k = k
+        self.hadamard_dim = _next_power_of_two(internal_dim)
+        self.register_buffer(
+            "primitive_bank",
+            _build_semantic_hadamard_bank(num_features, self.hadamard_dim, bank_seed),
+        )
+
+    def _fast_walsh_hadamard_transform(self, x: torch.Tensor) -> torch.Tensor:
+        """Pad pooled_vec to N=2^k, apply FWHT, return 1D FM chirp [N]."""
+        v = x.detach().float().flatten()
+        n = self.hadamard_dim
+        if v.numel() < n:
+            v = F.pad(v, (0, n - v.numel()))
+        else:
+            v = v[:n]
+        chirp = _fast_walsh_hadamard_transform_butterfly(v)
+        return chirp.squeeze(0)
+
+    def _depth_mask(self, step: int) -> torch.Tensor:
+        """Layer-aware Walsh bandpass: early=spatial high bands, deep=reasoning low bands."""
+        n = self.hadamard_dim
+        idx = torch.arange(n, dtype=torch.float32)
+        early = float(SONAR_EARLY_STEP_THRESHOLD)
+        deep = float(SONAR_DEEP_STEP_THRESHOLD)
+        if step <= early:
+            high_w = 1.0
+            low_w = 0.3
+        elif step >= deep:
+            high_w = 0.3
+            low_w = 1.0
+        else:
+            t = (step - early) / max(deep - early, 1.0)
+            high_w = 1.0 - 0.7 * t
+            low_w = 0.3 + 0.7 * t
+        mid = n / 2.0
+        return torch.where(
+            idx < mid, torch.full_like(idx, low_w), torch.full_like(idx, high_w)
+        )
+
+    def _compute_doppler_shift(self, chirp_1d: torch.Tensor, step: int) -> torch.Tensor:
+        """CF extraction: dot(modulated_chirp, primitive_bank[p]) -> softmax doppler_probs."""
+        mod_chirp = chirp_1d * self._depth_mask(step)
+        scores = mod_chirp @ self.primitive_bank.T
+        temp = max(SONAR_DOPPLER_TEMPERATURE, 1e-6)
+        return torch.softmax(scores / temp, dim=-1)
+
+    def format_kv_chirp_for_layer(
+        self,
+        chirp_1d: torch.Tensor,
+        layer_idx: int,
+        head_dim: int = SONAR_KV_HEAD_DIM,
+        num_heads: int = SONAR_KV_NUM_HEADS,
+        num_layers: int = SONAR_KV_NUM_LAYERS,
+    ) -> torch.Tensor:
+        """
+        Shape 1D chirp for future draft-layer K/V injection [num_heads, head_dim].
+        Depth-modulated per layer; not applied to vLLM until kernel patch lands.
+        """
+        depth_t = layer_idx / max(num_layers - 1, 1)
+        layer_mod = 0.35 + 0.65 * (1.0 - depth_t)
+        vec = chirp_1d * layer_mod
+        need = head_dim * num_heads
+        if vec.numel() < need:
+            vec = vec.repeat(int(math.ceil(need / vec.numel())))[:need]
+        else:
+            vec = vec[:need]
+        return vec.view(num_heads, head_dim)
+
+    def forward(self, pooled: torch.Tensor, step: int) -> Dict[str, Any]:
+        chirp = self._fast_walsh_hadamard_transform(pooled)
+        doppler_probs = self._compute_doppler_shift(chirp, step)
+        _, top_idx = torch.topk(doppler_probs, k=min(self.k, self.num_features))
+        selected = top_idx.detach().cpu().tolist()
+        kv_layers: Dict[int, torch.Tensor] = {}
+        if SONAR_KV_STUB_ENABLED:
+            for layer_i in range(SONAR_KV_NUM_LAYERS):
+                kv_layers[layer_i] = self.format_kv_chirp_for_layer(chirp, layer_i)
+        return {
+            "selected_primitives": selected,
+            "kv_chirp_injection": chirp,
+            "kv_chirp_by_layer": kv_layers,
+            "doppler_probs": doppler_probs,
+            "chirp_norm": float(chirp.norm().item()),
+        }
+
+
+class SonarAugmentedAllocator(nn.Module):
+    """
+    Wrapper preserving PermutationFeatureSlotAllocator forward() contract.
+
+    Modes:
+      - permutation: delegate to base hash unrank only
+      - sonar: top-K doppler resonance as primary circuit selector
+      - hybrid: hash unrank primary + doppler advisory rerank (max 1 slot/step)
+    """
+
+    def __init__(
+        self,
+        base: PermutationFeatureSlotAllocator,
+        mode: str = ALLOCATOR_MODE,
+        sonar: Optional[SonarCompressedSensingOrchestrator] = None,
+    ):
+        super().__init__()
+        self.base = base
+        self.mode = mode
+        self.sonar = sonar or SonarCompressedSensingOrchestrator(
+            internal_dim=base.internal_dim,
+            num_features=base.num_features,
+            k=base.k,
+        )
+        self.num_features = base.num_features
+        self.k = base.k
+        self.internal_dim = base.internal_dim
+
+    @property
+    def feature_emb(self) -> nn.Embedding:
+        return self.base.feature_emb
+
+    @property
+    def feature_gates(self) -> torch.Tensor:
+        return self.base.feature_gates
+
+    def _indices_from_doppler(self, doppler_probs: torch.Tensor) -> List[int]:
+        _, order = torch.sort(doppler_probs, descending=True)
+        picked: List[int] = []
+        for idx in order.tolist():
+            if idx not in picked:
+                picked.append(idx)
+            if len(picked) >= self.k:
+                break
+        while len(picked) < self.k:
+            for c in range(self.num_features):
+                if c not in picked:
+                    picked.append(c)
+                    break
+        return picked[: self.k]
+
+    def _hybrid_rerank(
+        self, base_indices: List[int], doppler_probs: torch.Tensor, step: int
+    ) -> List[int]:
+        """Swap at most one slot when doppler strongly disagrees with assignment."""
+        if doppler_probs is None or doppler_probs.numel() == 0:
+            return list(base_indices)
+        probs = doppler_probs.detach().float()
+        result = list(base_indices)
+        best_p = int(torch.argmax(probs).item())
+        worst_slot = min(
+            range(self.k),
+            key=lambda s: probs[result[s]].item() if result[s] < probs.numel() else 0.0,
+        )
+        assigned = result[worst_slot]
+        margin = probs[best_p].item() - probs[assigned].item()
+        if (
+            margin >= SONAR_DOPPLER_RERANK_MARGIN
+            and best_p not in result
+            and worst_slot == (step % self.k)
+        ):
+            result[worst_slot] = best_p
+        return result
+
+    def _pack_output(
+        self, feature_indices: List[int], sonar_out: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        device = self.base.feature_emb.weight.device
+        idx_t = torch.tensor(feature_indices, dtype=torch.long, device=device)
+        return {
+            "feature_indices": feature_indices,
+            "feature_vectors": self.base.feature_emb(idx_t),
+            "gates": self.base.feature_gates[idx_t],
+            "stream_pos": self.base.stream_pos_emb(
+                torch.arange(self.k, device=device)
+            ),
+            "feature_names": [PERSONALITY_FEATURES[i] for i in feature_indices],
+            "selected_primitives": sonar_out.get("selected_primitives", feature_indices),
+            "kv_chirp_injection": sonar_out.get("kv_chirp_injection"),
+            "kv_chirp_by_layer": sonar_out.get("kv_chirp_by_layer", {}),
+            "doppler_probs": sonar_out.get("doppler_probs"),
+            "chirp_norm": sonar_out.get("chirp_norm"),
+            "allocator_mode": self.mode,
+        }
+
+    def forward(self, pooled: torch.Tensor, step: int) -> Dict[str, Any]:
+        if self.mode == "permutation":
+            out = dict(self.base(pooled, step))
+            out["allocator_mode"] = "permutation"
+            return out
+
+        sonar_out = self.sonar(pooled, step)
+        if self.mode == "sonar":
+            feature_indices = self._indices_from_doppler(sonar_out["doppler_probs"])
+        else:
+            base_indices = hash_to_feature_permutation(
+                pooled, step, self.num_features, self.k
+            )
+            feature_indices = self._hybrid_rerank(
+                base_indices, sonar_out["doppler_probs"], step
+            )
+        return self._pack_output(feature_indices, sonar_out)
+
+    def get_feature_params(self, feature_indices: List[int]) -> List[Dict[str, float]]:
+        return self.base.get_feature_params(feature_indices)
+
+
+def make_feature_slot_allocator(
+    internal_dim: int = 256,
+    num_features: int = NUM_PERSONALITY_FEATURES,
+    k: int = K,
+    mode: Optional[str] = None,
+) -> nn.Module:
+    """Factory: permutation-only base or Sonar-augmented wrapper per ALLOCATOR_MODE."""
+    base = PermutationFeatureSlotAllocator(
+        internal_dim=internal_dim, num_features=num_features, k=k
+    )
+    resolved = (mode or ALLOCATOR_MODE).lower()
+    if resolved == "permutation":
+        return base
+    return SonarAugmentedAllocator(base, mode=resolved)
+
+
+FeatureSlotAllocator = Union[PermutationFeatureSlotAllocator, SonarAugmentedAllocator]
+
+
+# =============================================================================
 # FAKE / SIMULATED POOLED HIDDEN STATE (from text history)
 # Educational stand-in for "target_hidden" after verification step.
 # =============================================================================
@@ -467,6 +800,7 @@ class CTSBState:
     """Persistent cross-circuit memory carried across super-blocks."""
 
     discourse: Optional[torch.Tensor] = None
+    last_chirp: Optional[torch.Tensor] = None
     prev_feature_indices: Optional[List[int]] = None
     prev_params: Optional[List[Dict[str, float]]] = None
     prev_committed_ids: List[int] = field(default_factory=list)
@@ -490,7 +824,7 @@ class CircuitTransitionSmoother:
         k: int = K,
         num_features: int = NUM_PERSONALITY_FEATURES,
         internal_dim: int = 256,
-        allocator: Optional[PermutationFeatureSlotAllocator] = None,
+        allocator: Optional[FeatureSlotAllocator] = None,
     ):
         self.k = k
         self.num_features = num_features
@@ -573,6 +907,12 @@ class CircuitTransitionSmoother:
         h_meta[1] = meta["last_step"] * 0.05
 
         instant = 0.55 * h_verify + 0.30 * h_lex + 0.15 * h_meta
+        if SONAR_CHIRP_IN_DISCOURSE and self.state.last_chirp is not None:
+            chirp = self.state.last_chirp.detach().float().flatten()
+            h_chirp = torch.zeros(dim, dtype=torch.float32)
+            for i, v in enumerate(chirp[:dim]):
+                h_chirp[i] = v
+            instant = 0.45 * h_verify + 0.25 * h_lex + 0.15 * h_meta + 0.15 * h_chirp
         if self.state.discourse is None:
             self.state.discourse = instant.clone()
         else:
@@ -624,7 +964,7 @@ class CircuitTransitionSmoother:
         prev_indices: List[int],
         effective_indices: List[int],
         blend_lambda: float,
-        allocator: PermutationFeatureSlotAllocator,
+        allocator: FeatureSlotAllocator,
     ) -> torch.Tensor:
         """CBF: blend previous and target feature embeddings (+ residual-free v1)."""
         device = allocator.feature_emb.weight.device
@@ -698,7 +1038,7 @@ class CircuitTransitionSmoother:
 
     def prepare_block(
         self,
-        allocator: PermutationFeatureSlotAllocator,
+        allocator: FeatureSlotAllocator,
         pooled: torch.Tensor,
         target_indices: List[int],
         prev_acceptance_rate: float,
@@ -1114,7 +1454,7 @@ def million_brains_diffusion_denoise_generate(
     max_new_tokens: int = 128,
     k: int = 4,
     block_size: int = 6,
-    allocator: Optional[PermutationFeatureSlotAllocator] = None,
+    allocator: Optional[FeatureSlotAllocator] = None,
     enable_reallocation: bool = True,
     enable_smoothing: bool = ENABLE_CIRCUIT_SMOOTHING,
     seed: int = 42,
@@ -1137,7 +1477,7 @@ def million_brains_diffusion_denoise_generate(
     torch.manual_seed(seed)
 
     if allocator is None:
-        allocator = PermutationFeatureSlotAllocator(
+        allocator = make_feature_slot_allocator(
             internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=k
         )
     smoother = (
@@ -1179,6 +1519,16 @@ def million_brains_diffusion_denoise_generate(
         target_feature_indices = alloc_out["feature_indices"]
         target_feature_names = alloc_out["feature_names"]
         feature_history.append(target_feature_names)
+        if smoother is not None and alloc_out.get("kv_chirp_injection") is not None:
+            smoother.state.last_chirp = alloc_out["kv_chirp_injection"]
+        if (verbose or STREAM_ALL_OUTPUT) and alloc_out.get("doppler_probs") is not None:
+            probs = alloc_out["doppler_probs"]
+            top_i = int(torch.argmax(probs).item())
+            stream_log(
+                f"  [SONAR] step={step:02d} top={PERSONALITY_FEATURES[top_i]} "
+                f"p={probs[top_i].item():.3f} chirp_norm={alloc_out.get('chirp_norm', 0.0):.3f} "
+                f"mode={alloc_out.get('allocator_mode', ALLOCATOR_MODE)}"
+            )
 
         blend_lambda = 1.0
         if smoother is not None:
@@ -1386,7 +1736,16 @@ def million_brains_diffusion_denoise_generate(
                         if r not in active_feature_indices
                     ]
                     if unused:
-                        new_feat = unused[(step * 31 + i) % len(unused)]
+                        doppler = alloc_out.get("doppler_probs")
+                        if doppler is not None:
+                            new_feat = max(
+                                unused, key=lambda p: float(doppler[p].item())
+                            )
+                        else:
+                            new_feat = unused[(step * 31 + i) % len(unused)]
+                        active_feature_indices[i] = new_feat
+                        active_feature_names[i] = PERSONALITY_FEATURES[new_feat]
+                        feature_params[i] = allocator.get_feature_params([new_feat])[0]
                         feature_reallocations += 1
                         ema_accept[i] = 0.55
 
@@ -1439,7 +1798,7 @@ def million_brains_dflash_generate(
     max_new_tokens: int = 128,
     k: int = 4,
     block_size: int = 6,
-    allocator: Optional[PermutationFeatureSlotAllocator] = None,
+    allocator: Optional[FeatureSlotAllocator] = None,
     enable_reallocation: bool = True,
     enable_smoothing: bool = ENABLE_CIRCUIT_SMOOTHING,
     seed: int = 42,
@@ -4051,7 +4410,7 @@ def collect_feature_slot_hypotheses(
     test_index: int,
     *,
     k: Optional[int] = None,
-    allocator: Optional[PermutationFeatureSlotAllocator] = None,
+    allocator: Optional[FeatureSlotAllocator] = None,
     seed: int = 42,
     verbose: bool = False,
 ) -> List[Dict[str, Any]]:
@@ -4059,7 +4418,7 @@ def collect_feature_slot_hypotheses(
     k = arc_hypothesis_k() if k is None else int(k)
     random.seed(seed)
     if allocator is None:
-        allocator = PermutationFeatureSlotAllocator(
+        allocator = make_feature_slot_allocator(
             internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=k
         )
     pooled = make_pooled_state([], 0, tokenizer=tokenizer)
@@ -4289,7 +4648,7 @@ def collect_spatial_grid_hypotheses(
     test_index: int = 0,
     *,
     k: Optional[int] = None,
-    allocator: Optional[PermutationFeatureSlotAllocator] = None,
+    allocator: Optional[FeatureSlotAllocator] = None,
     seed: int = 42,
     verbose: bool = False,
 ) -> List[Dict[str, Any]]:
@@ -4297,7 +4656,7 @@ def collect_spatial_grid_hypotheses(
     k = arc_hypothesis_k() if k is None else int(k)
     random.seed(seed)
     if allocator is None:
-        allocator = PermutationFeatureSlotAllocator(
+        allocator = make_feature_slot_allocator(
             internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=k
         )
     pooled = make_pooled_state([], 0, tokenizer=tokenizer)
@@ -4506,7 +4865,7 @@ def arc_spatial_grid_ensemble_pipeline(
     test_index: int = 0,
     *,
     k: Optional[int] = None,
-    allocator: Optional[PermutationFeatureSlotAllocator] = None,
+    allocator: Optional[FeatureSlotAllocator] = None,
     seed: int = 42,
     verbose: bool = False,
 ) -> Dict[str, Any]:
@@ -4570,7 +4929,7 @@ def arc_mbr_hypothesis_pipeline(
     test_index: int = 0,
     *,
     k: Optional[int] = None,
-    allocator: Optional[PermutationFeatureSlotAllocator] = None,
+    allocator: Optional[FeatureSlotAllocator] = None,
     seed: int = 42,
     verbose: bool = False,
 ) -> Dict[str, Any]:
@@ -5638,7 +5997,7 @@ def evaluate_arc_dataset(
         print(f"Grade images: {_arc_grade_output_dir()}/")
     print("-" * 80)
 
-    allocator = PermutationFeatureSlotAllocator(
+    allocator = make_feature_slot_allocator(
         internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=k
     )
 
@@ -5994,7 +6353,7 @@ def benchmark(
 
     print("\n[MBR] Running Million-Brains DiffusionGemma conditioned denoising ...")
     t0 = time.perf_counter()
-    allocator = PermutationFeatureSlotAllocator(
+    allocator = make_feature_slot_allocator(
         internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=K
     )
     mbr_res = million_brains_dflash_generate(
