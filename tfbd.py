@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-million_brains_dflash.py — ONE-MILLION-BRAINS-DIFFUSIONGEMMA
-Sonar-augmented permutation-gated feature-slot allocator hard-wired into DiffusionGemma.
+tfbd.py — Topological Fiber-Bundle Diffusion (TFBD) × DiffusionGemma for ARC-AGI
 
-Architecture: DiffusionGemma block-diffusion (256-token canvas, iterative denoising) with
-K parallel Million-Brains conditioned trajectories per denoise step — FM/CF Sonar resonance,
-combinatorial feature-slot allocation, CTSB smoothing, cross-stream integration, cumprod
-verification, and doppler-guided adaptive reallocation.
+Replaces the flawed 1D Sonar / CTSB projection (Combinatorial Token Sequence Bottleneck
+and Topological Collapse) with a production TFBD stack over DiffusionGemma block diffusion.
+
+Architecture (Riemannian base ↔ discrete fiber bundle):
+  1. TopologicalFiberEmbedding  — E = E_value + E_row + E_col + E_symmetry (GSDM sharing)
+  2. CosmosSparsifier + TorusCache — latent sparsification + T^2 measure dispersion
+  3. FiberBundleDenoiser — partial re-masking (lock logic skeleton, explore fiber stalks)
+  4. CohomologicalStitcher — K-trajectory sheaf stitch + homology PRM proxy (Betti / χ)
+  5. TFBD_Orchestrator — HuggingFace DiffusionGemmaForBlockDiffusion wrapper + KV bias
 
 Kaggle: attach Models input google/diffusiongemma, run as script or notebook cell.
-
-Default backend is HuggingFace (transformers + DiffusionGemmaForBlockDiffusion).
-Set INFERENCE_BACKEND = "vllm" for optimized serving (needs unreleased vLLM gemma build).
+Default backend: HuggingFace (transformers + DiffusionGemmaForBlockDiffusion).
 
 HF install (Kaggle cell 1 if needed):
     !pip install -U transformers accelerate torch
@@ -20,7 +22,7 @@ HF install (Kaggle cell 1 if needed):
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-19-diffusion-i"  # HF: explicit layer device_map (no infer_auto)
+SCRIPT_VERSION = "2026-06-20-tfbd-a"  # Topological Fiber-Bundle Diffusion over DiffusionGemma
 INFERENCE_BACKEND = "hf"  # "hf" (default) | "vllm"
 HF_FAST_VERIFY = True  # stub tail logprobs on diffusion verify passes (no causal forward)
 HF_TORCH_DTYPE = "bfloat16"  # official recipe; use "float16" if bf16 unsupported
@@ -41,7 +43,7 @@ DIFFUSION_DENOISE_CHUNK = 6  # tokens committed per denoise step (= legacy BLOCK
 K = 4  # Million-Brains parallel trajectories per denoise step (not ARC hypothesis count)
 ARC_HYPOTHESIS_SLOTS = 8  # ARC eval: batched hypothesis proposals per engine (vLLM shows N/N)
 NUM_PERSONALITY_FEATURES = 12  # personality / spatial primitive bank for allocator
-ARC_FORCE_ENABLE_THINKING = False  # Step 2: never emit Qwen3.5 </think> chains in ARC
+ARC_FORCE_ENABLE_THINKING = True  # chat_template enable_thinking=True for ARC passes
 ARC_GUIDED_JSON_DECODING = True  # Step 3: vLLM guided JSON for grid outputs
 ARC_SPATIAL_GRID_ENSEMBLE = True  # Step 4: Phase1=8 grid hypotheses, Phase2=pixel majority vote
 BLOCK_SIZE = DIFFUSION_DENOISE_CHUNK  # tokens committed per denoise step / super-block
@@ -62,27 +64,45 @@ BENCHMARK_PROMPT = (  # a single hard prompt that benefits from combinatorial di
 SEED = (
     42  # for reproducibility of permutation hashing + sampling inside active features
 )
-ENABLE_CIRCUIT_SMOOTHING = True  # CTSB: smooth transitions between permutation circuits
-CTSB_BLEND_TAU = 0.35  # acceptance-gated blend time constant (higher = slower circuit morph)
-CTSB_MAX_SLOT_SWAPS = 2  # max feature-slot changes per super-block (geodesic step)
-CTSB_DSB_EMA = 0.82  # discourse state buffer EMA decay
-CTSB_COHERENCE_ALPHA = 0.55  # TAFK weight on cumprod acceptance rate
-CTSB_COHERENCE_GAMMA = 0.25  # TAFK weight on discourse coherence
-CTSB_COHERENCE_ETA = 0.15  # TAFK penalty for stylistic jump vs committed prefix
-CTSB_COHERENCE_KAPPA = 0.12  # TAFK bonus for features continuing from previous circuit
-ANCHOR_SLOT = 0  # slot 0 receives extra smoothing inertia (stable chain scribe)
-# --- Sonar compressed sensing orchestrator (training-free FM/CF resonance) ---
-ALLOCATOR_MODE = "hybrid"  # "permutation" | "hybrid" | "sonar"
-SONAR_DOPPLER_TEMPERATURE = 1.0  # softmax temperature for CF reflector matching
-SONAR_DOPPLER_RERANK_MARGIN = 0.15  # hybrid: swap slot when doppler disagrees by this margin
-SONAR_EARLY_STEP_THRESHOLD = 4  # Walsh high-pass band emphasis below this step
-SONAR_DEEP_STEP_THRESHOLD = 12  # Walsh low-pass band emphasis above this step
-SONAR_CHIRP_IN_DISCOURSE = True  # mix truncated chirp into CTSB discourse buffer
-SONAR_KV_STUB_ENABLED = True  # shape kv chirp per layer (logged only; no vLLM injection yet)
-SONAR_PRIMITIVE_BANK_SEED = 42  # deterministic semantic Hadamard reflector bank
-SONAR_KV_HEAD_DIM = 128  # stub KV projection width (DiffusionGemma head_dim placeholder)
-SONAR_KV_NUM_HEADS = 8  # stub KV projection heads placeholder
-SONAR_KV_NUM_LAYERS = 32  # stub layer count for depth-modulated chirp formatting
+ENABLE_TFBD = True  # master switch: TFBD_Orchestrator replaces 1D Sonar/CTSB path
+ENABLE_CIRCUIT_SMOOTHING = True  # fiber-bundle transition smoothing (legacy CTSB compat)
+CTSB_BLEND_TAU = 0.35  # acceptance-gated blend on base-space logic skeleton
+CTSB_MAX_SLOT_SWAPS = 2  # max primitive-slot geodesic swaps per denoise step
+CTSB_DSB_EMA = 0.82  # torus-mapped discourse buffer EMA (base space memory)
+CTSB_COHERENCE_ALPHA = 0.55  # stitcher weight on cumprod acceptance
+CTSB_COHERENCE_GAMMA = 0.25  # stitcher weight on torus discourse coherence
+CTSB_COHERENCE_ETA = 0.15  # penalty for stylistic jump vs committed prefix
+CTSB_COHERENCE_KAPPA = 0.12  # bonus for continuing primitive from previous step
+ANCHOR_SLOT = 0  # anchor trajectory receives extra base-space inertia
+# --- TFBD hyperparameters (fiber bundle over DiffusionGemma canvas) ---
+TFBD_FIBER_DIM = 256  # composite cell embedding width
+TFBD_MAX_GRID = 30  # ARC-AGI max grid extent (rows/cols)
+TFBD_NUM_COLORS = 10  # ARC palette 0-9
+TFBD_SYMMETRY_GROUPS = 8  # D4-related orbit buckets for GSDM sharing
+TFBD_SPARSITY_P = 0.15  # CosmosSparsifier per-feature zero probability
+TFBD_TORUS_DIM = 64  # latent dimensions paired into T^2 angular coords
+TFBD_CONFIDENCE_LOCK = 0.72  # lock high-confidence base tokens (logic skeleton)
+TFBD_REMASK_FRACTION = 0.35  # re-mask low-confidence fiber positions per prism step
+TFBD_PRISM_BLOCKS = 4  # block-diffusion prism re-mask cadence
+TFBD_KV_BIAS_SCALE = 0.08  # spatial bias injection into attention logits
+TFBD_KV_HEAD_DIM = 128  # attention head width for fiber bias matrices
+TFBD_KV_NUM_HEADS = 8
+TFBD_KV_NUM_LAYERS = 32
+TFBD_PRIMITIVE_BANK_SEED = 42
+ALLOCATOR_MODE = "fiber"  # "permutation" | "fiber" | "hybrid" (fiber = TFBD primitive pick)
+TFBD_DOPPLER_TEMPERATURE = 1.0  # softmax over symmetry-group resonance scores
+TFBD_DOPPLER_RERANK_MARGIN = 0.15  # hybrid: swap slot when fiber score disagrees
+# Legacy aliases (deprecated 1D sonar toggles — kept for log compat)
+SONAR_DOPPLER_TEMPERATURE = TFBD_DOPPLER_TEMPERATURE
+SONAR_DOPPLER_RERANK_MARGIN = TFBD_DOPPLER_RERANK_MARGIN
+SONAR_CHIRP_IN_DISCOURSE = False
+SONAR_KV_STUB_ENABLED = True
+SONAR_PRIMITIVE_BANK_SEED = TFBD_PRIMITIVE_BANK_SEED
+SONAR_KV_HEAD_DIM = TFBD_KV_HEAD_DIM
+SONAR_KV_NUM_HEADS = TFBD_KV_NUM_HEADS
+SONAR_KV_NUM_LAYERS = TFBD_KV_NUM_LAYERS
+SONAR_EARLY_STEP_THRESHOLD = 4
+SONAR_DEEP_STEP_THRESHOLD = 12
 # Local/offline model paths (Kaggle: attach a HF dataset or pre-download to /kaggle/working)
 PREFER_LOCAL_MODELS = True  # try /kaggle/input + /kaggle/working before any HuggingFace request
 # Local model path override (optional; DiffusionGemma resolved via KAGGLE_DIFFUSIONGEMMA_DIR)
@@ -135,12 +155,12 @@ ARC_PRINT_ALL_ANSWERS = True  # print every prediction vs ground-truth JSON for 
 # Real-time streaming — prints every token and all model/MBR activity as it happens
 STREAM_GENERATION = True  # stream decoded tokens to stdout live (flush per token)
 STREAM_ALL_OUTPUT = True  # print all MBR drafts, commits, realloc, verify steps
-STREAM_PRINT_THINKING = False  # Step 2: ARC uses enable_thinking=False (no internal monologue)
+STREAM_PRINT_THINKING = True  # stream </think> reasoning tokens live
 STREAM_VERIFY_PASSES = False  # verify=logprob-only; never stream those tokens
 
 ARC_EVAL_VERBOSE = True  # MBR super-block internals (auto-on when STREAM_ALL_OUTPUT)
 ARC_USE_CHAT_TEMPLATE = True  # Qwen3.5 expects chat_template.jinja wrapping
-ARC_DISABLE_THINKING = True  # Step 2: hard-off thinking for ARC (overrides STREAM_PRINT_THINKING)
+ARC_DISABLE_THINKING = False  # allow </think> reasoning in ARC hypothesis phase
 ARC_STRUCTURED_THINKING = True  # require incremental HYPOTHESIS_GRID inside <think>
 ARC_PRINT_STEP_MATRICES = False  # debug: ASCII grids at every MBR draft slot + commit
 ARC_PRINT_FINAL_MATRICES = True  # one final ASCII summary per test (gold + preds + verdict + timing)
@@ -161,8 +181,9 @@ ARC_FINAL_GRID_MIN_FRACTION = 0.50  # always reserve 50% of output budget for fi
 ARC_HYPOTHESIS_MAX_TOKENS = ARC_MBR_OUTPUT_TOKEN_BUDGET * 3 // 4 // 8  # legacy default; task-aware below
 ARC_FINAL_GRID_MAX_TOKENS = ARC_MBR_OUTPUT_TOKEN_BUDGET // 4  # legacy default; task-aware below
 ARC_FINAL_HYP_CHAR_CAPS = (360, 200, 120, 60, 0)  # shrink hypothesis text in final prompt if needed
-ARC_HYPOTHESIS_ENABLE_THINKING = False  # False = fast text rules (True + thinking can stall tqdm at 0/N for minutes)
-ARC_HYPOTHESIS_THINKING_TOKEN_CAP = 512  # per-slot cap when hypothesis thinking is enabled
+ARC_HYPOTHESIS_ENABLE_THINKING = True  # text-hypothesis path: reason in </think> before prose rules
+ARC_HYPOTHESIS_THINKING_TOKEN_CAP = 512  # target reasoning reserve within each slot's generation budget
+ARC_SPATIAL_ENABLE_THINKING = False  # spatial slots emit JSON only (DiffusionGemma has no Qwen thinking)
 ARC_FINAL_ENABLE_THINKING = False  # final grid: [[ prefill + greedy JSON (much faster than thinking pass)
 ARC_PHASE1_PROMPT_PARALLELISM = True  # batch K slots per vLLM generate() (use_tqdm=False avoids stall)
 ARC_VLLM_MAX_NUM_SEQS = 4  # Phase-1 batch size; raise to 8 on A100+ if VRAM allows
@@ -711,206 +732,678 @@ class PermutationFeatureSlotAllocator(nn.Module):
 
 
 # =============================================================================
-# SONAR COMPRESSED SENSING — FM chirp + CF doppler resonance (training-free)
+# TOPOLOGICAL FIBER-BUNDLE DIFFUSION (TFBD)
+# Replaces 1D Sonar FWHT / CTSB with structured 2D/3D fiber embeddings over
+# DiffusionGemma block diffusion.  Base space = logic skeleton; fiber = grids.
 # =============================================================================
-def _next_power_of_two(n: int) -> int:
-    if n <= 1:
-        return 1
-    p = 1
-    while p < n:
-        p <<= 1
-    return p
 
 
-def _fast_walsh_hadamard_transform_butterfly(x: torch.Tensor) -> torch.Tensor:
-    """Pure PyTorch FWHT via butterfly add/subtract (orthogonal, untrained)."""
-    out = x.clone().float()
-    if out.dim() == 1:
-        out = out.unsqueeze(0)
-    n = out.shape[-1]
-    if n & (n - 1) != 0:
-        raise ValueError(f"FWHT requires power-of-2 last dim, got {n}")
-    h = 1
-    while h < n:
-        for i in range(0, n, h * 2):
-            a = out[..., i : i + h]
-            b = out[..., i + h : i + h * 2]
-            out[..., i : i + h] = a + b
-            out[..., i + h : i + h * 2] = a - b
-        h *= 2
-    return out / math.sqrt(n)
+def _d4_symmetry_orbit(row: int, col: int, rows: int, cols: int) -> int:
+    """Bucket (r,c) into one of 8 D4-related orbit classes (GSDM sharing)."""
+    mr, mc = rows - 1 - row, cols - 1 - col
+    parity = (row + col) % 2
+    quadrant = int(row * 2 >= rows - 1) + 2 * int(col * 2 >= cols - 1)
+    return (quadrant * 2 + parity) % TFBD_SYMMETRY_GROUPS
 
 
-def _primitive_lens_fingerprint(primitive_name: str, hadamard_dim: int, seed: int) -> torch.Tensor:
-    """Deterministic semantic fingerprint from primitive lens text (no training)."""
-    lens = SPATIAL_PRIMITIVE_LENSES.get(primitive_name, primitive_name)
-    payload = f"{primitive_name}|{lens}|seed={seed}"
-    vec = torch.zeros(hadamard_dim, dtype=torch.float32)
-    for i, ch in enumerate(payload.encode("utf-8")):
-        vec[(i * 131 + ch * 17 + seed) % hadamard_dim] += float(ch) * 0.013 + 0.001
-    norm = vec.norm()
-    if norm > 1e-8:
-        vec = vec / norm
-    return vec
-
-
-def _build_semantic_hadamard_bank(
-    num_features: int, hadamard_dim: int, seed: int
-) -> torch.Tensor:
+def _grid_betti_proxy(grid: List[List[int]]) -> Tuple[int, int, int]:
     """
-    Orthogonal CF reflector bank: Hadamard rows modulated by per-primitive lens hashes.
-    Each row is a distinct echo signature for zero-shot doppler matching.
+    Lightweight persistent-homology proxy on the 4-neighbor cell complex.
+    Returns (beta0, beta1, euler_chi) used by the spatial PRM — not full PH software.
+    beta0: connected components of non-zero cells; beta1: 4-cycle holes; chi = V-E+F_proxy.
     """
-    h_dim = _next_power_of_two(max(hadamard_dim, num_features))
-    bank = torch.zeros(num_features, h_dim, dtype=torch.float32)
-    hadamard = _fast_walsh_hadamard_transform_butterfly(
-        torch.eye(h_dim, dtype=torch.float32)
-    )
-    perm = list(range(h_dim))
-    rng = random.Random(seed)
-    rng.shuffle(perm)
-    for p in range(num_features):
-        row_idx = perm[p % h_dim]
-        lens_fp = _primitive_lens_fingerprint(
-            PERSONALITY_FEATURES[p], hadamard_dim=h_dim, seed=seed + p
-        )
-        bank[p] = hadamard[row_idx] * (0.65 + 0.35 * lens_fp)
-        norm = bank[p].norm()
-        if norm > 1e-8:
-            bank[p] = bank[p] / norm
-    return bank
+    if not grid or not grid[0]:
+        return 0, 0, 0
+    rows, cols = len(grid), len(grid[0])
+    nodes: List[Tuple[int, int]] = []
+    for r in range(rows):
+        for c in range(cols):
+            if int(grid[r][c]) != 0:
+                nodes.append((r, c))
+    if not nodes:
+        return 0, 0, 0
+    idx = {p: i for i, p in enumerate(nodes)}
+    parent = list(range(len(nodes)))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    edges = 0
+    for r, c in nodes:
+        i = idx[(r, c)]
+        for dr, dc in ((1, 0), (0, 1)):
+            nr, nc = r + dr, c + dc
+            if (nr, nc) in idx:
+                union(i, idx[(nr, nc)])
+                edges += 1
+    roots = {find(i) for i in range(len(nodes))}
+    beta0 = len(roots)
+    faces = 0
+    for r, c in nodes:
+        if (r, c + 1) in idx and (r + 1, c) in idx and (r + 1, c + 1) in idx:
+            faces += 1
+    v, e, f = len(nodes), edges, faces
+    chi = v - e + f
+    beta1 = max(0, beta0 - chi)
+    return beta0, beta1, chi
 
 
-class SonarCompressedSensingOrchestrator(nn.Module):
+class TopologicalFiberEmbedding(nn.Module):
     """
-    Bat-sonar compressed sensing for Million Brains (training-free).
+    Fiber space encoder for ARC lattice cells (GSDM-style structured diffusion).
 
-    FM (identification): FWHT projects verification memory (pooled_vec) into a 1D
-    orthogonal chirp — an untrained measurement basis over hidden-state geometry.
+    For cell (r,c) with value v:
+        E(r,c,v) = E_value(v) + E_row(r) + E_col(c) + E_symmetry(orbit_D4(r,c))
 
-    CF (extraction): fixed semantic Hadamard reflectors (12 spatial primitives) resonate
-    with the depth-modulated chirp via inner product; softmax yields doppler_probs.
-
-    The chirp can be formatted for future DFlash KV injection; today it also feeds CTSB
-    discourse when SONAR_CHIRP_IN_DISCOURSE is enabled.
+    Permutation-invariant node sharing: cells in the same D4 orbit share
+    E_symmetry, reducing redundant parameters across rotations/reflections.
     """
 
     def __init__(
         self,
-        internal_dim: int = 256,
-        num_features: int = 12,
-        k: int = 4,
-        bank_seed: int = SONAR_PRIMITIVE_BANK_SEED,
+        fiber_dim: int = TFBD_FIBER_DIM,
+        max_grid: int = TFBD_MAX_GRID,
+        num_colors: int = TFBD_NUM_COLORS,
+        num_symmetry_groups: int = TFBD_SYMMETRY_GROUPS,
+    ):
+        super().__init__()
+        self.fiber_dim = fiber_dim
+        self.max_grid = max_grid
+        d = fiber_dim // 4
+        self.value_emb = nn.Embedding(num_colors, d)
+        self.row_emb = nn.Embedding(max_grid, d)
+        self.col_emb = nn.Embedding(max_grid, d)
+        self.symmetry_emb = nn.Embedding(num_symmetry_groups, d)
+        self.out_proj = nn.Linear(fiber_dim, fiber_dim, bias=False)
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+    def forward(
+        self,
+        grid: List[List[int]],
+        *,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        """Return [rows*cols, fiber_dim] node embeddings for a 2D ARC grid."""
+        if not grid or not grid[0]:
+            z = torch.zeros(1, self.fiber_dim)
+            return z.to(device) if device else z
+        rows, cols = len(grid), len(grid[0])
+        dev = device or self.value_emb.weight.device
+        flat_vals: List[int] = []
+        flat_rows: List[int] = []
+        flat_cols: List[int] = []
+        flat_sym: List[int] = []
+        for r in range(rows):
+            for c in range(cols):
+                v = max(0, min(TFBD_NUM_COLORS - 1, int(grid[r][c])))
+                flat_vals.append(v)
+                flat_rows.append(min(r, self.max_grid - 1))
+                flat_cols.append(min(c, self.max_grid - 1))
+                flat_sym.append(_d4_symmetry_orbit(r, c, rows, cols))
+        vt = torch.tensor(flat_vals, dtype=torch.long, device=dev)
+        rt = torch.tensor(flat_rows, dtype=torch.long, device=dev)
+        ct = torch.tensor(flat_cols, dtype=torch.long, device=dev)
+        st = torch.tensor(flat_sym, dtype=torch.long, device=dev)
+        e = torch.cat(
+            [
+                self.value_emb(vt),
+                self.row_emb(rt),
+                self.col_emb(ct),
+                self.symmetry_emb(st),
+            ],
+            dim=-1,
+        )
+        return self.out_proj(e)
+
+
+class CosmosSparsifier(nn.Module):
+    """
+    Fine-grained latent sparsification (Cosmos-style redundancy).
+
+    During training-free inference, randomly zeros proportion p of individual
+    coordinates inside each latent vector, forcing the discourse buffer to
+    store topologically redundant cues across orthogonal subspaces.
+    """
+
+    def __init__(self, sparsity_p: float = TFBD_SPARSITY_P):
+        super().__init__()
+        self.sparsity_p = float(sparsity_p)
+
+    def forward(self, x: torch.Tensor, *, step: int = 0) -> torch.Tensor:
+        if self.sparsity_p <= 0.0 or not self.training:
+            if self.sparsity_p <= 0.0:
+                return x
+            gen = torch.Generator(device=x.device)
+            gen.manual_seed(42 + int(step) * 131)
+            mask = torch.bernoulli(
+                torch.full_like(x, 1.0 - self.sparsity_p), generator=gen
+            )
+            return x * mask
+        mask = torch.bernoulli(torch.full_like(x, 1.0 - self.sparsity_p))
+        return x * mask
+
+
+class TorusCache(nn.Module):
+    """
+    Maps latent states to T^2 = S^1 x S^1 to counter concentration of measure in R^d.
+
+    Pairs of coordinates (x_{2k}, x_{2k+1}) map to angles (theta_k, phi_k) via atan2;
+    re-embed through cos/sin lifting back to torus_dim features for discourse memory.
+    """
+
+    def __init__(self, torus_dim: int = TFBD_TORUS_DIM):
+        super().__init__()
+        self.torus_dim = torus_dim
+
+    def project(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        v = h.detach().float().flatten()
+        n_pairs = max(1, self.torus_dim // 2)
+        if v.numel() < n_pairs * 2:
+            v = F.pad(v, (0, n_pairs * 2 - v.numel()))
+        v = v[: n_pairs * 2].view(n_pairs, 2)
+        theta = torch.atan2(v[:, 1], v[:, 0].clamp(min=1e-6))
+        phi = torch.atan2(
+            torch.linalg.vector_norm(v, dim=1),
+            v[:, 0].abs() + 1e-6,
+        )
+        return theta, phi
+
+    def embed(self, theta: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
+        return torch.cat([torch.cos(theta), torch.sin(theta), torch.cos(phi), torch.sin(phi)])
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        theta, phi = self.project(h)
+        lifted = self.embed(theta, phi)
+        if lifted.numel() < self.torus_dim:
+            lifted = F.pad(lifted, (0, self.torus_dim - lifted.numel()))
+        return lifted[: self.torus_dim]
+
+
+class FiberBundleDenoiser(nn.Module):
+    """
+    Prism denoising dynamics with hierarchical partial re-masking.
+
+    Base space (logic skeleton): high-confidence token positions are locked.
+    Fiber space (spatial stalks): low-confidence positions are re-masked so
+    DiffusionGemma explores diverse grid realizations without destroying rules.
+    """
+
+    def __init__(
+        self,
+        confidence_lock: float = TFBD_CONFIDENCE_LOCK,
+        remask_fraction: float = TFBD_REMASK_FRACTION,
+    ):
+        super().__init__()
+        self.confidence_lock = confidence_lock
+        self.remask_fraction = remask_fraction
+
+    def token_confidence(self, logprobs: List[float]) -> List[float]:
+        if not logprobs:
+            return []
+        return [float(math.exp(min(lp, 0.0))) for lp in logprobs]
+
+    def partial_remask_indices(
+        self,
+        confidences: List[float],
+        *,
+        step: int,
+        canvas_length: int = DIFFUSION_CANVAS_LENGTH,
+    ) -> Tuple[List[int], List[int]]:
+        n = len(confidences)
+        if n == 0:
+            return [], list(range(min(canvas_length, TFBD_PRISM_BLOCKS * 8)))
+        locked = [i for i, c in enumerate(confidences) if c >= self.confidence_lock]
+        fiber_pool = [i for i, c in enumerate(confidences) if c < self.confidence_lock]
+        if not fiber_pool:
+            fiber_pool = list(range(n))
+        k_remask = max(1, int(len(fiber_pool) * self.remask_fraction))
+        rng = random.Random(42 + step * 17)
+        rng.shuffle(fiber_pool)
+        remasked = sorted(fiber_pool[:k_remask])
+        return locked, remasked
+
+
+class SpatialPRMProxy(nn.Module):
+    """
+    Lightweight Process Reward Model over 2D grid stalks.
+
+    Scores candidate grids by conservation of homology proxies (Betti numbers,
+    Euler characteristic) relative to train-pair deltas — a discrete stand-in for
+    validating Morse-Smale complex persistence across denoise steps.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def reference_signature(
+        self, task: Optional[Dict[str, Any]]
+    ) -> Tuple[int, int, int]:
+        if not task:
+            return 1, 0, 0
+        sigs = []
+        for ex in task.get("train") or []:
+            for key in ("input", "output"):
+                g = ex.get(key) or []
+                if g:
+                    sigs.append(_grid_betti_proxy(g))
+        if not sigs:
+            return 1, 0, 0
+        b0 = int(round(sum(s[0] for s in sigs) / len(sigs)))
+        b1 = int(round(sum(s[1] for s in sigs) / len(sigs)))
+        chi = int(round(sum(s[2] for s in sigs) / len(sigs)))
+        return b0, b1, chi
+
+    def score_grid(
+        self,
+        grid: Optional[List[List[int]]],
+        ref: Tuple[int, int, int],
+    ) -> float:
+        if grid is None:
+            return -1.0
+        b0, b1, chi = _grid_betti_proxy(grid)
+        rb0, rb1, rchi = ref
+        dist = abs(b0 - rb0) + abs(b1 - rb1) + 0.5 * abs(chi - rchi)
+        cells = max(1, len(grid) * len(grid[0]))
+        fill = sum(1 for row in grid for v in row if int(v) != 0) / cells
+        return float(2.0 - dist * 0.35 + 0.15 * fill)
+
+
+class CohomologicalStitcher(nn.Module):
+    """
+    Sheaf-theoretic fusion of K parallel diffusion trajectories.
+
+    Each trajectory supplies local stalks (row patches).  Copresheaf restriction
+    maps rho_{U->V} are linear row projections; global sections are stitched by
+    maximizing PRM score + restriction consistency (anisotropic directional glue).
+    """
+
+    def __init__(self, prm: Optional[SpatialPRMProxy] = None):
+        super().__init__()
+        self.prm = prm or SpatialPRMProxy()
+
+    def _row_stalks(self, grid: List[List[int]]) -> List[List[int]]:
+        return [list(row) for row in grid]
+
+    def _restrict_row(self, src: List[int], width: int) -> List[int]:
+        if len(src) >= width:
+            return src[:width]
+        return src + [0] * (width - len(src))
+
+    def stitch(
+        self,
+        grids: List[Optional[List[List[int]]]],
+        scores: List[float],
+        *,
+        target_shape: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[Optional[List[List[int]]], Dict[str, Any]]:
+        valid = [(g, s) for g, s in zip(grids, scores) if g is not None]
+        if not valid:
+            return None, {"n_stitched": 0, "method": "empty"}
+        if target_shape is None:
+            target_shape = (len(valid[0][0]), len(valid[0][0][0]))
+        rows, cols = target_shape
+        best = max(valid, key=lambda x: x[1])[0]
+        out: List[List[int]] = []
+        for r in range(rows):
+            stalks = []
+            for g, sc in valid:
+                if r < len(g):
+                    stalks.append((self._restrict_row(g[r], cols), sc))
+            if not stalks:
+                out.append([0] * cols)
+                continue
+            col_votes: List[List[Tuple[int, float]]] = [[] for _ in range(cols)]
+            for row, sc in stalks:
+                for c, val in enumerate(row[:cols]):
+                    col_votes[c].append((int(val), sc))
+            stitched_row = []
+            for c in range(cols):
+                if not col_votes[c]:
+                    stitched_row.append(0)
+                    continue
+                cnt: Dict[int, float] = defaultdict(float)
+                for val, sc in col_votes[c]:
+                    cnt[val] += sc
+                stitched_row.append(max(cnt.items(), key=lambda kv: kv[1])[0])
+            out.append(stitched_row)
+        return out, {
+            "n_stitched": len(valid),
+            "method": "copresheaf_row_stitch",
+            "target_shape": target_shape,
+            "best_score": max(s for _, s in valid),
+        }
+
+
+def _build_fiber_primitive_bank(
+    num_features: int, fiber_dim: int, seed: int
+) -> torch.Tensor:
+    """Orthogonal primitive fingerprints in fiber space (replaces Hadamard sonar bank)."""
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+    bank = torch.randn(num_features, fiber_dim, generator=gen)
+    return F.normalize(bank, dim=-1)
+
+
+class FiberPrimitiveAllocator(nn.Module):
+    """
+    Selects K spatial primitives by resonance in fiber space (replaces 1D doppler).
+    """
+
+    def __init__(
+        self,
+        internal_dim: int = TFBD_FIBER_DIM,
+        num_features: int = NUM_PERSONALITY_FEATURES,
+        k: int = K,
+        bank_seed: int = TFBD_PRIMITIVE_BANK_SEED,
     ):
         super().__init__()
         self.internal_dim = internal_dim
         self.num_features = num_features
         self.k = k
-        self.hadamard_dim = _next_power_of_two(internal_dim)
+        self.fiber_embed = TopologicalFiberEmbedding(fiber_dim=internal_dim)
+        self.sparsifier = CosmosSparsifier(TFBD_SPARSITY_P)
+        self.torus = TorusCache(TFBD_TORUS_DIM)
         self.register_buffer(
             "primitive_bank",
-            _build_semantic_hadamard_bank(num_features, self.hadamard_dim, bank_seed),
+            _build_fiber_primitive_bank(num_features, internal_dim, bank_seed),
         )
 
-    def _fast_walsh_hadamard_transform(self, x: torch.Tensor) -> torch.Tensor:
-        """Pad pooled_vec to N=2^k, apply FWHT, return 1D FM chirp [N]."""
-        v = x.detach().float().flatten()
-        n = self.hadamard_dim
-        if v.numel() < n:
-            v = F.pad(v, (0, n - v.numel()))
+    def _pool_to_fiber_query(self, pooled: torch.Tensor, step: int) -> torch.Tensor:
+        v = pooled.detach().float().flatten()
+        if v.numel() < self.internal_dim:
+            v = F.pad(v, (0, self.internal_dim - v.numel()))
+        v = v[: self.internal_dim]
+        v = self.sparsifier(v.unsqueeze(0), step=step).squeeze(0)
+        torus_lift = self.torus(v)
+        if torus_lift.numel() < self.internal_dim:
+            v = v + F.pad(torus_lift, (0, self.internal_dim - torus_lift.numel()))
         else:
-            v = v[:n]
-        chirp = _fast_walsh_hadamard_transform_butterfly(v)
-        return chirp.squeeze(0)
+            v = 0.7 * v + 0.3 * torus_lift[: self.internal_dim]
+        return F.normalize(v, dim=0)
 
-    def _depth_mask(self, step: int) -> torch.Tensor:
-        """Layer-aware Walsh bandpass: early=spatial high bands, deep=reasoning low bands."""
-        n = self.hadamard_dim
-        idx = torch.arange(n, dtype=torch.float32)
-        early = float(SONAR_EARLY_STEP_THRESHOLD)
-        deep = float(SONAR_DEEP_STEP_THRESHOLD)
-        if step <= early:
-            high_w = 1.0
-            low_w = 0.3
-        elif step >= deep:
-            high_w = 0.3
-            low_w = 1.0
-        else:
-            t = (step - early) / max(deep - early, 1.0)
-            high_w = 1.0 - 0.7 * t
-            low_w = 0.3 + 0.7 * t
-        mid = n / 2.0
-        return torch.where(
-            idx < mid, torch.full_like(idx, low_w), torch.full_like(idx, high_w)
-        )
-
-    def _compute_doppler_shift(self, chirp_1d: torch.Tensor, step: int) -> torch.Tensor:
-        """CF extraction: dot(modulated_chirp, primitive_bank[p]) -> softmax doppler_probs."""
-        mod_chirp = chirp_1d * self._depth_mask(step)
-        scores = mod_chirp @ self.primitive_bank.T
-        temp = max(SONAR_DOPPLER_TEMPERATURE, 1e-6)
-        return torch.softmax(scores / temp, dim=-1)
-
-    def format_kv_chirp_for_layer(
+    def format_kv_fiber_bias_for_layer(
         self,
-        chirp_1d: torch.Tensor,
+        fiber_coords: torch.Tensor,
         layer_idx: int,
-        head_dim: int = SONAR_KV_HEAD_DIM,
-        num_heads: int = SONAR_KV_NUM_HEADS,
-        num_layers: int = SONAR_KV_NUM_LAYERS,
+        head_dim: int = TFBD_KV_HEAD_DIM,
+        num_heads: int = TFBD_KV_NUM_HEADS,
+        num_layers: int = TFBD_KV_NUM_LAYERS,
     ) -> torch.Tensor:
-        """
-        Shape 1D chirp for future draft-layer K/V injection [num_heads, head_dim].
-        Depth-modulated per layer; not applied to vLLM until kernel patch lands.
-        """
+        """Spatial bias matrix stub [num_heads, head_dim] for attention injection."""
         depth_t = layer_idx / max(num_layers - 1, 1)
         layer_mod = 0.35 + 0.65 * (1.0 - depth_t)
-        vec = chirp_1d * layer_mod
+        vec = fiber_coords * layer_mod * TFBD_KV_BIAS_SCALE
         need = head_dim * num_heads
         if vec.numel() < need:
-            vec = vec.repeat(int(math.ceil(need / vec.numel())))[:need]
+            vec = vec.repeat(int(math.ceil(need / max(vec.numel(), 1))))[:need]
         else:
             vec = vec[:need]
         return vec.view(num_heads, head_dim)
 
-    def forward(self, pooled: torch.Tensor, step: int) -> Dict[str, Any]:
-        chirp = self._fast_walsh_hadamard_transform(pooled)
-        doppler_probs = self._compute_doppler_shift(chirp, step)
-        _, top_idx = torch.topk(doppler_probs, k=min(self.k, self.num_features))
+    def forward(
+        self,
+        pooled: torch.Tensor,
+        step: int,
+        *,
+        context_grid: Optional[List[List[int]]] = None,
+    ) -> Dict[str, Any]:
+        query = self._pool_to_fiber_query(pooled, step)
+        if context_grid:
+            nodes = self.fiber_embed(context_grid, device=query.device)
+            if nodes.shape[0] > 0:
+                query = F.normalize(0.6 * query + 0.4 * nodes.mean(dim=0), dim=0)
+        scores = query @ self.primitive_bank.T
+        temp = max(TFBD_DOPPLER_TEMPERATURE, 1e-6)
+        probs = torch.softmax(scores / temp, dim=-1)
+        _, top_idx = torch.topk(probs, k=min(self.k, self.num_features))
         selected = top_idx.detach().cpu().tolist()
         kv_layers: Dict[int, torch.Tensor] = {}
         if SONAR_KV_STUB_ENABLED:
-            for layer_i in range(SONAR_KV_NUM_LAYERS):
-                kv_layers[layer_i] = self.format_kv_chirp_for_layer(chirp, layer_i)
+            for layer_i in range(TFBD_KV_NUM_LAYERS):
+                kv_layers[layer_i] = self.format_kv_fiber_bias_for_layer(
+                    query, layer_i
+                )
         return {
             "selected_primitives": selected,
-            "kv_chirp_injection": chirp,
+            "fiber_query": query,
+            "kv_chirp_injection": query,
             "kv_chirp_by_layer": kv_layers,
-            "doppler_probs": doppler_probs,
-            "chirp_norm": float(chirp.norm().item()),
+            "doppler_probs": probs,
+            "chirp_norm": float(query.norm().item()),
         }
 
 
-class SonarAugmentedAllocator(nn.Module):
+class TFBD_Orchestrator(nn.Module):
     """
-    Wrapper preserving PermutationFeatureSlotAllocator forward() contract.
+    Production orchestrator bridging Riemannian torus base space and discrete
+    DiffusionGemma block diffusion for ARC-AGI matrix completion.
 
-    Modes:
-      - permutation: delegate to base hash unrank only
-      - sonar: top-K doppler resonance as primary circuit selector
-      - hybrid: hash unrank primary + doppler advisory rerank (max 1 slot/step)
+    Wraps HuggingFace DiffusionGemmaForBlockDiffusion (or HFGenerateEngine) and
+    injects TopologicalFiberEmbedding coordinates into per-layer spatial bias
+    matrices consumed by the denoise loop.
     """
+
+    def __init__(
+        self,
+        model: Optional[Any] = None,
+        processor: Optional[Any] = None,
+        *,
+        k: int = K,
+        fiber_dim: int = TFBD_FIBER_DIM,
+    ):
+        super().__init__()
+        self.model = model
+        self.processor = processor
+        self.tokenizer = getattr(processor, "tokenizer", processor) if processor else None
+        self.k = k
+        self.fiber_embed = TopologicalFiberEmbedding(fiber_dim=fiber_dim)
+        self.sparsifier = CosmosSparsifier(TFBD_SPARSITY_P)
+        self.torus = TorusCache(TFBD_TORUS_DIM)
+        self.denoiser = FiberBundleDenoiser(
+            TFBD_CONFIDENCE_LOCK, TFBD_REMASK_FRACTION
+        )
+        self.prm = SpatialPRMProxy()
+        self.stitcher = CohomologicalStitcher(self.prm)
+        self.allocator = FiberPrimitiveAllocator(
+            internal_dim=fiber_dim, num_features=NUM_PERSONALITY_FEATURES, k=k
+        )
+
+    def build_spatial_bias(
+        self,
+        grid: List[List[int]],
+        seq_len: int,
+    ) -> torch.Tensor:
+        """
+        KV-cache / attention spatial bias from fiber coordinates.
+        B[i,j] ~ <fiber_i, fiber_j> restricted to seq_len (Morse-Smale locality).
+        """
+        nodes = self.fiber_embed(grid)
+        n = min(seq_len, nodes.shape[0])
+        if n < 1:
+            return torch.zeros(1, 1)
+        patch = nodes[:n]
+        bias = patch @ patch.T
+        return bias * TFBD_KV_BIAS_SCALE
+
+    def inject_fiber_into_inputs(
+        self,
+        inputs: Dict[str, torch.Tensor],
+        grid: Optional[List[List[int]]],
+    ) -> Dict[str, torch.Tensor]:
+        """Add fiber embeddings to token inputs (training-free residual injection)."""
+        if grid is None or "input_ids" not in inputs:
+            return inputs
+        ids = inputs["input_ids"]
+        emb_layer = None
+        if self.model is not None:
+            emb_layer = getattr(self.model, "get_input_embeddings", lambda: None)()
+            if emb_layer is None and hasattr(self.model, "model"):
+                emb_layer = getattr(self.model.model, "decoder", None)
+                if emb_layer is not None:
+                    emb_layer = getattr(emb_layer, "embed_tokens", None)
+        if emb_layer is None:
+            return inputs
+        with torch.no_grad():
+            tok_emb = emb_layer(ids)
+            fiber_nodes = self.fiber_embed(
+                grid, device=tok_emb.device
+            )
+            if fiber_nodes.shape[0] > 0:
+                fiber_mean = fiber_nodes.mean(dim=0)
+                d = min(tok_emb.shape[-1], fiber_mean.shape[0])
+                tok_emb[..., :d] = tok_emb[..., :d] + 0.05 * fiber_mean[:d]
+            inputs = dict(inputs)
+            inputs["inputs_embeds"] = tok_emb
+            inputs.pop("input_ids", None)
+        return inputs
+
+    @torch.inference_mode()
+    def generate_with_engine(
+        self,
+        engine: Any,
+        prompt: str,
+        *,
+        max_new_tokens: int,
+        context_grid: Optional[List[List[int]]] = None,
+        temperature: float = 0.0,
+        stream_label: str = "TFBD-GEN",
+    ) -> Dict[str, Any]:
+        """Single trajectory through HFGenerateEngine / vLLM with fiber injection."""
+        sp = SamplingParams(
+            temperature=float(temperature),
+            max_tokens=int(max_new_tokens),
+        )
+        setattr(sp, "stream_label", stream_label)
+        if hasattr(engine, "model") and self.model is None:
+            self.model = engine.model
+        if hasattr(engine, "processor") and self.processor is None:
+            self.processor = engine.processor
+            self.tokenizer = getattr(engine.processor, "tokenizer", engine.processor)
+        if hasattr(engine, "_encode") and self.model is not None and context_grid:
+            inputs = engine._encode(prompt)
+            inputs = self.inject_fiber_into_inputs(inputs, context_grid)
+            new_ids, step_lps = engine._generate_new_ids(
+                inputs,
+                max_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=1.0,
+                stream_label=stream_label,
+                stream=STREAM_GENERATION and not ARC_FAST_INFERENCE,
+            )
+            text = engine._decode_ids(new_ids)
+            conf = self.denoiser.token_confidence([-0.7] * len(new_ids))
+            locked, remasked = self.denoiser.partial_remask_indices(conf, step=0)
+            return {
+                "generated_ids": new_ids,
+                "generated_text": text,
+                "num_tokens": len(new_ids),
+                "locked_indices": locked,
+                "remasked_indices": remasked,
+                "spatial_bias_norm": float(
+                    self.build_spatial_bias(context_grid or [[0]], len(new_ids)).norm()
+                )
+                if context_grid
+                else 0.0,
+            }
+        out = engine.generate([prompt], sp, use_tqdm=False)[0]
+        gen_ids = list(out.outputs[0].token_ids) if out.outputs else []
+        text = (
+            self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+            if self.tokenizer
+            else ""
+        )
+        return {
+            "generated_ids": gen_ids,
+            "generated_text": text,
+            "num_tokens": len(gen_ids),
+            "locked_indices": [],
+            "remasked_indices": [],
+            "spatial_bias_norm": 0.0,
+        }
+
+    def generate_k_trajectories(
+        self,
+        engine: Any,
+        prompt: str,
+        *,
+        max_new_tokens: int,
+        context_grid: Optional[List[List[int]]] = None,
+        task: Optional[Dict[str, Any]] = None,
+        seed: int = SEED,
+    ) -> Dict[str, Any]:
+        """K parallel fiber-bundle trajectories + cohomological stitch."""
+        random.seed(seed)
+        ref = self.prm.reference_signature(task)
+        grids: List[Optional[List[List[int]]]] = []
+        scores: List[float] = []
+        trajectories: List[Dict[str, Any]] = []
+        pooled = make_pooled_state([], 0, dim=TFBD_FIBER_DIM, tokenizer=self.tokenizer)
+        for traj_i in range(self.k):
+            alloc = self.allocator(pooled, traj_i, context_grid=context_grid)
+            prim = alloc["selected_primitives"][0] if alloc["selected_primitives"] else 0
+            prim_name = PERSONALITY_FEATURES[prim % len(PERSONALITY_FEATURES)]
+            cond_prompt = _build_diffusion_conditioned_prompt(
+                prompt,
+                prim_name,
+                FEATURE_PARAMS.get(prim_name, FEATURE_PARAMS[PERSONALITY_FEATURES[0]]),
+                tokenizer=self.tokenizer,
+                generated_ids=[],
+            )
+            res = self.generate_with_engine(
+                engine,
+                cond_prompt,
+                max_new_tokens=max_new_tokens,
+                context_grid=context_grid,
+                temperature=FEATURE_PARAMS.get(prim_name, {}).get("temperature", 0.0),
+                stream_label=f"TFBD/traj{traj_i}/{prim_name}",
+            )
+            text = res.get("generated_text", "")
+            grid = parse_arc_answer_grid(text)
+            sc = self.prm.score_grid(grid, ref)
+            grids.append(grid)
+            scores.append(sc)
+            trajectories.append({**res, "primitive": prim_name, "prm_score": sc})
+        stitched, meta = self.stitcher.stitch(grids, scores)
+        return {
+            "trajectories": trajectories,
+            "stitched_grid": stitched,
+            "stitch_meta": meta,
+            "generated_text": format_grid_json(stitched) if stitched else "",
+            "num_tokens": sum(t.get("num_tokens", 0) for t in trajectories),
+        }
+
+    def bind_diffusion_model(self, model: Any, processor: Any) -> None:
+        self.model = model
+        self.processor = processor
+        self.tokenizer = getattr(processor, "tokenizer", processor)
+
+
+# Back-compat aliases (deprecated)
+SonarCompressedSensingOrchestrator = FiberPrimitiveAllocator
+
+
+class FiberAugmentedAllocator(nn.Module):
+    """Wrapper preserving PermutationFeatureSlotAllocator forward() contract."""
 
     def __init__(
         self,
         base: PermutationFeatureSlotAllocator,
         mode: str = ALLOCATOR_MODE,
-        sonar: Optional[SonarCompressedSensingOrchestrator] = None,
+        fiber_alloc: Optional[FiberPrimitiveAllocator] = None,
     ):
         super().__init__()
         self.base = base
-        self.mode = mode
-        self.sonar = sonar or SonarCompressedSensingOrchestrator(
+        self.mode = mode.lower()
+        self.fiber = fiber_alloc or FiberPrimitiveAllocator(
             internal_dim=base.internal_dim,
             num_features=base.num_features,
             k=base.k,
@@ -927,8 +1420,8 @@ class SonarAugmentedAllocator(nn.Module):
     def feature_gates(self) -> torch.Tensor:
         return self.base.feature_gates
 
-    def _indices_from_doppler(self, doppler_probs: torch.Tensor) -> List[int]:
-        _, order = torch.sort(doppler_probs, descending=True)
+    def _indices_from_probs(self, probs: torch.Tensor) -> List[int]:
+        _, order = torch.sort(probs, descending=True)
         picked: List[int] = []
         for idx in order.tolist():
             if idx not in picked:
@@ -943,12 +1436,10 @@ class SonarAugmentedAllocator(nn.Module):
         return picked[: self.k]
 
     def _hybrid_rerank(
-        self, base_indices: List[int], doppler_probs: torch.Tensor, step: int
+        self, base_indices: List[int], probs: torch.Tensor, step: int
     ) -> List[int]:
-        """Swap at most one slot when doppler strongly disagrees with assignment."""
-        if doppler_probs is None or doppler_probs.numel() == 0:
+        if probs is None or probs.numel() == 0:
             return list(base_indices)
-        probs = doppler_probs.detach().float()
         result = list(base_indices)
         best_p = int(torch.argmax(probs).item())
         worst_slot = min(
@@ -958,7 +1449,7 @@ class SonarAugmentedAllocator(nn.Module):
         assigned = result[worst_slot]
         margin = probs[best_p].item() - probs[assigned].item()
         if (
-            margin >= SONAR_DOPPLER_RERANK_MARGIN
+            margin >= TFBD_DOPPLER_RERANK_MARGIN
             and best_p not in result
             and worst_slot == (step % self.k)
         ):
@@ -966,7 +1457,7 @@ class SonarAugmentedAllocator(nn.Module):
         return result
 
     def _pack_output(
-        self, feature_indices: List[int], sonar_out: Dict[str, Any]
+        self, feature_indices: List[int], fiber_out: Dict[str, Any]
     ) -> Dict[str, Any]:
         device = self.base.feature_emb.weight.device
         idx_t = torch.tensor(feature_indices, dtype=torch.long, device=device)
@@ -978,54 +1469,76 @@ class SonarAugmentedAllocator(nn.Module):
                 torch.arange(self.k, device=device)
             ),
             "feature_names": [PERSONALITY_FEATURES[i] for i in feature_indices],
-            "selected_primitives": sonar_out.get("selected_primitives", feature_indices),
-            "kv_chirp_injection": sonar_out.get("kv_chirp_injection"),
-            "kv_chirp_by_layer": sonar_out.get("kv_chirp_by_layer", {}),
-            "doppler_probs": sonar_out.get("doppler_probs"),
-            "chirp_norm": sonar_out.get("chirp_norm"),
+            "selected_primitives": fiber_out.get("selected_primitives", feature_indices),
+            "kv_chirp_injection": fiber_out.get("kv_chirp_injection"),
+            "kv_chirp_by_layer": fiber_out.get("kv_chirp_by_layer", {}),
+            "doppler_probs": fiber_out.get("doppler_probs"),
+            "chirp_norm": fiber_out.get("chirp_norm"),
             "allocator_mode": self.mode,
         }
 
-    def forward(self, pooled: torch.Tensor, step: int) -> Dict[str, Any]:
+    def forward(
+        self,
+        pooled: torch.Tensor,
+        step: int,
+        *,
+        context_grid: Optional[List[List[int]]] = None,
+    ) -> Dict[str, Any]:
         if self.mode == "permutation":
             out = dict(self.base(pooled, step))
             out["allocator_mode"] = "permutation"
             return out
-
-        sonar_out = self.sonar(pooled, step)
-        if self.mode == "sonar":
-            feature_indices = self._indices_from_doppler(sonar_out["doppler_probs"])
+        fiber_out = self.fiber(pooled, step, context_grid=context_grid)
+        if self.mode in ("fiber", "sonar"):
+            feature_indices = self._indices_from_probs(fiber_out["doppler_probs"])
         else:
             base_indices = hash_to_feature_permutation(
                 pooled, step, self.num_features, self.k
             )
             feature_indices = self._hybrid_rerank(
-                base_indices, sonar_out["doppler_probs"], step
+                base_indices, fiber_out["doppler_probs"], step
             )
-        return self._pack_output(feature_indices, sonar_out)
+        return self._pack_output(feature_indices, fiber_out)
 
     def get_feature_params(self, feature_indices: List[int]) -> List[Dict[str, float]]:
         return self.base.get_feature_params(feature_indices)
 
 
+SonarAugmentedAllocator = FiberAugmentedAllocator
+
+
 def make_feature_slot_allocator(
-    internal_dim: int = 256,
+    internal_dim: int = TFBD_FIBER_DIM,
     num_features: int = NUM_PERSONALITY_FEATURES,
     k: int = K,
     mode: Optional[str] = None,
 ) -> nn.Module:
-    """Factory: permutation-only base or Sonar-augmented wrapper per ALLOCATOR_MODE."""
+    """Factory: permutation-only base or TFBD fiber-augmented wrapper."""
     base = PermutationFeatureSlotAllocator(
         internal_dim=internal_dim, num_features=num_features, k=k
     )
     resolved = (mode or ALLOCATOR_MODE).lower()
     if resolved == "permutation":
         return base
-    return SonarAugmentedAllocator(base, mode=resolved)
+    return FiberAugmentedAllocator(base, mode=resolved)
 
 
-FeatureSlotAllocator = Union[PermutationFeatureSlotAllocator, SonarAugmentedAllocator]
+FeatureSlotAllocator = Union[PermutationFeatureSlotAllocator, FiberAugmentedAllocator]
 
+
+def make_tfbd_orchestrator(
+    engine: Optional[Any] = None,
+    *,
+    k: int = K,
+) -> TFBD_Orchestrator:
+    """Construct TFBD_Orchestrator bound to an HFGenerateEngine when available."""
+    orch = TFBD_Orchestrator(k=k)
+    if engine is not None:
+        model = getattr(engine, "model", None)
+        proc = getattr(engine, "processor", None)
+        if model is not None and proc is not None:
+            orch.bind_diffusion_model(model, proc)
+    return orch
 
 # =============================================================================
 # FAKE / SIMULATED POOLED HIDDEN STATE (from text history)
@@ -1813,19 +2326,67 @@ def million_brains_diffusion_denoise_generate(
     arc_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Hard-wired Million-Brains inside DiffusionGemma denoising.
+    TFBD-orchestrated DiffusionGemma denoising (replaces 1D Sonar / CTSB bottleneck).
 
     Each denoise iteration:
-      1) PermutationFeatureSlotAllocator picks K personality features.
-      2) CTSB smooths circuit transitions on the pooled canvas state.
-      3) K parallel conditioned trajectories propose canvas chunks (feature-biased sampling).
-      4) Cross-stream integration (Synthesizer / GroupThinkMask / anchor fusion).
+      1) FiberPrimitiveAllocator picks K primitives via fiber-space resonance.
+      2) Fiber-bundle transition smoothing on torus-mapped discourse buffer.
+      3) K parallel trajectories with partial re-masking (lock base, explore fiber).
+      4) Cohomological stitcher fuses streams via PRM homology proxy.
       5) Target verification + cumprod acceptance commits into the live canvas.
-      6) Adaptive feature reallocation on under-performing trajectories.
+      6) Adaptive primitive reallocation on under-performing trajectories.
     """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+    arc_test_input = (arc_context or {}).get("test_input")
+    arc_gold = (arc_context or {}).get("gold")
+    arc_task_id = str((arc_context or {}).get("task_id") or "")
+
+    if ENABLE_TFBD and arc_test_input:
+        orch = make_tfbd_orchestrator(vllm_llm, k=k)
+        task_stub = (arc_context or {}).get("task") or {"train": [], "test": []}
+        tfbd_res = orch.generate_k_trajectories(
+            vllm_llm,
+            prompt,
+            max_new_tokens=max_new_tokens,
+            context_grid=arc_test_input,
+            task=task_stub,
+            seed=seed,
+        )
+        stitched = tfbd_res.get("stitched_grid")
+        gen_text = tfbd_res.get("generated_text") or prompt
+        gen_ids = list(
+            tokenizer.encode(gen_text, add_special_tokens=False)
+            if stitched and tokenizer is not None
+            else []
+        )
+        return {
+            "generation_mode": "tfbd_fiber_bundle_diffusion",
+            "final_text": gen_text,
+            "generated_ids": gen_ids,
+            "num_tokens": int(tfbd_res.get("num_tokens", 0)),
+            "num_superblocks": len(tfbd_res.get("trajectories", [])),
+            "num_denoise_steps": len(tfbd_res.get("trajectories", [])),
+            "total_accepted": len(gen_ids),
+            "avg_accepted_per_block": len(gen_ids) / max(1, k),
+            "feature_reallocations": 0,
+            "acceptance_history": [
+                float(t.get("prm_score", 0.0))
+                for t in tfbd_res.get("trajectories", [])
+            ],
+            "feature_history": [
+                [t.get("primitive", "?") for t in tfbd_res.get("trajectories", [])]
+            ],
+            "reframe_events": 0,
+            "circuit_smoothing_enabled": enable_smoothing,
+            "avg_blend_lambda": 1.0,
+            "effective_feature_history": [],
+            "diffusion_canvas_length": DIFFUSION_CANVAS_LENGTH,
+            "parsed_grid": stitched,
+            "tfbd_stitch_meta": tfbd_res.get("stitch_meta"),
+        }
 
     if allocator is None:
         allocator = make_feature_slot_allocator(
@@ -1850,14 +2411,11 @@ def million_brains_diffusion_denoise_generate(
     ema_accept = [0.5] * k
     active_feature_indices: List[int] = list(range(k))
     max_steps = (max_new_tokens // max(1, block_size)) + 4
-    arc_test_input = (arc_context or {}).get("test_input")
-    arc_gold = (arc_context or {}).get("gold")
-    arc_task_id = str((arc_context or {}).get("task_id") or "")
 
     if verbose or STREAM_ALL_OUTPUT:
         stream_log(
-            f"[MBR-DIFFUSION] start k={k} chunk={block_size} canvas={DIFFUSION_CANVAS_LENGTH} "
-            f"max_new={max_new_tokens} smoothing={enable_smoothing}"
+            f"[TFBD-DIFFUSION] start k={k} chunk={block_size} canvas={DIFFUSION_CANVAS_LENGTH} "
+            f"max_new={max_new_tokens} smoothing={enable_smoothing} tfbd={ENABLE_TFBD}"
         )
 
     for step in range(max_steps):
@@ -1866,7 +2424,12 @@ def million_brains_diffusion_denoise_generate(
         denoise_steps += 1
 
         pooled = make_pooled_state(generated_ids, step, tokenizer=tokenizer)
-        alloc_out = allocator(pooled, step)
+        try:
+            alloc_out = allocator(
+                pooled, step, context_grid=arc_test_input
+            )
+        except TypeError:
+            alloc_out = allocator(pooled, step)
         target_feature_indices = alloc_out["feature_indices"]
         target_feature_names = alloc_out["feature_names"]
         feature_history.append(target_feature_names)
@@ -1876,8 +2439,8 @@ def million_brains_diffusion_denoise_generate(
             probs = alloc_out["doppler_probs"]
             top_i = int(torch.argmax(probs).item())
             stream_log(
-                f"  [SONAR] step={step:02d} top={PERSONALITY_FEATURES[top_i]} "
-                f"p={probs[top_i].item():.3f} chirp_norm={alloc_out.get('chirp_norm', 0.0):.3f} "
+                f"  [TFBD-FIBER] step={step:02d} top={PERSONALITY_FEATURES[top_i]} "
+                f"p={probs[top_i].item():.3f} fiber_norm={alloc_out.get('chirp_norm', 0.0):.3f} "
                 f"mode={alloc_out.get('allocator_mode', ALLOCATOR_MODE)}"
             )
 
@@ -2140,9 +2703,9 @@ def million_brains_diffusion_denoise_generate(
 
 
 # =============================================================================
-# ONE-MILLION-BRAINS GENERATE (public API — DiffusionGemma conditioned denoising)
+# TFBD GENERATE (public API — DiffusionGemma fiber-bundle denoising)
 # =============================================================================
-def million_brains_dflash_generate(
+def tfbd_generate(
     vllm_llm: Any,
     tokenizer: Any,
     prompt: str,
@@ -2156,7 +2719,7 @@ def million_brains_dflash_generate(
     verbose: bool = STREAM_ALL_OUTPUT,
     arc_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Million-Brains conditioned DiffusionGemma denoising (compat entry point)."""
+    """TFBD-orchestrated DiffusionGemma denoising (primary entry point)."""
     return million_brains_diffusion_denoise_generate(
         vllm_llm,
         tokenizer,
@@ -2763,18 +3326,18 @@ def print_one_million_brains_banner(success: bool = True) -> None:
     print(banner)
     if success:
         print(
-            " ONE-MILLION-BRAINS-DIFFUSIONGEMMA INITIALIZED  |  "
-            "CANVAS=%d  |  DENOISE_K=%d  |  FEATURES=%d  |  REALLOCATION=%s"
+            " TOPOLOGICAL-FIBER-BUNDLE-DIFFUSION INITIALIZED  |  "
+            "CANVAS=%d  |  K=%d  |  FIBER_DIM=%d  |  TFBD=%s"
             % (
                 DIFFUSION_CANVAS_LENGTH,
                 K,
-                NUM_PERSONALITY_FEATURES,
-                str(ENABLE_FEATURE_REALLOCATION).upper(),
+                TFBD_FIBER_DIM,
+                str(ENABLE_TFBD).upper(),
             )
         )
         print(
-            f" Engine: DiffusionGemma ({INFERENCE_BACKEND}) block-diffusion + "
-            "hard-wired MBR conditioned denoising"
+            f" Engine: DiffusionGemma ({INFERENCE_BACKEND}) + TFBD_Orchestrator "
+            f"(fiber_dim={TFBD_FIBER_DIM}, sparsity_p={TFBD_SPARSITY_P})"
         )
         print(f" Script version: {SCRIPT_VERSION}")
     else:
@@ -3580,19 +4143,25 @@ def arc_final_grid_max_tokens(task: Dict[str, Any]) -> int:
 
 
 def arc_spatial_slot_max_tokens(task: Dict[str, Any], test_index: int = 0) -> int:
-    """Per-slot output budget for spatial Phase-1 (one JSON grid, not full final-pass budget)."""
+    """
+    Per-slot generation budget for spatial Phase-1 (one full JSON grid per slot).
+    Spatial ensemble has no LLM final pass — split the full output budget across slots.
+    """
     est = 256
     for ex in task.get("train", []):
-        out = ex.get("output") or []
-        if out:
-            est = max(est, _estimate_grid_json_tokens(out))
+        for key in ("input", "output"):
+            grid = ex.get(key) or []
+            if grid:
+                est = max(est, _estimate_grid_json_tokens(grid))
     tests = task.get("test") or []
     if test_index < len(tests):
         inp = (tests[test_index].get("input") or [])
-        if inp and not any(ex.get("output") for ex in task.get("train", [])):
+        if inp:
             est = max(est, _estimate_grid_json_tokens(inp))
-    est = min(est + 128, 2048)
-    return min(est, arc_hypothesis_max_tokens(task))
+    est = est + 128
+    budget = int(ARC_MBR_OUTPUT_TOKEN_BUDGET)
+    per_slot_share = max(256, budget // max(1, arc_hypothesis_k()))
+    return max(64, min(est, per_slot_share))
 
 
 def _arc_task_with_train_limit(task: Dict[str, Any], n_train: int) -> Dict[str, Any]:
@@ -3640,6 +4209,7 @@ def _arc_phase1_generate_slots(
     sp_list: List[Any],
     *,
     label: str = "phase1",
+    enable_thinking: Optional[bool] = None,
 ) -> List[Any]:
     """Run Phase-1 slot generation; serial (batch=1) or batched per ARC_PHASE1_PROMPT_PARALLELISM."""
     k = len(prompts)
@@ -3653,6 +4223,7 @@ def _arc_phase1_generate_slots(
                 vllm_llm,
                 prompts[start:end],
                 sp_list[start:end],
+                enable_thinking=enable_thinking,
             )
         )
     return outs
@@ -3683,20 +4254,26 @@ def arc_hypothesis_k() -> int:
     return max(1, min(int(ARC_HYPOTHESIS_SLOTS), NUM_PERSONALITY_FEATURES))
 
 
+def arc_hypothesis_thinking_budget(task: Dict[str, Any]) -> int:
+    """Per-slot reasoning reserve inside </think> (subset of generation budget)."""
+    if not (ARC_HYPOTHESIS_ENABLE_THINKING and not ARC_DISABLE_THINKING):
+        return 0
+    think_cap = int(ARC_HYPOTHESIS_THINKING_TOKEN_CAP)
+    if think_cap <= 0:
+        return 0
+    total = arc_hypothesis_max_tokens(task)
+    return min(think_cap, max(0, total - 64))
+
+
 def arc_hypothesis_max_tokens(task: Dict[str, Any]) -> int:
-    """Per-slot hypothesis cap — never steal more than half the output budget."""
+    """Per-slot generation cap (reasoning + post-think output combined)."""
     budget = int(ARC_MBR_OUTPUT_TOKEN_BUDGET)
     final_reserve = max(
         arc_final_grid_max_tokens(task),
         int(budget * ARC_FINAL_GRID_MIN_FRACTION),
     )
     hyp_pool = max(0, budget - final_reserve)
-    per_slot = max(64, hyp_pool // max(1, arc_hypothesis_k()))
-    if ARC_HYPOTHESIS_ENABLE_THINKING and not ARC_DISABLE_THINKING:
-        think_cap = int(ARC_HYPOTHESIS_THINKING_TOKEN_CAP)
-        if think_cap > 0:
-            per_slot = min(per_slot, think_cap)
-    return per_slot
+    return max(64, hyp_pool // max(1, arc_hypothesis_k()))
 
 
 def arc_mbr_final_output_budget(
@@ -4120,12 +4697,15 @@ def format_arc_prompt(task_id: str, task: Dict[str, Any], test_index: int = 0) -
 
 
 def arc_resolve_enable_thinking() -> Optional[bool]:
-    """Step 2: explicit control of Qwen3.5 thinking via chat_template enable_thinking."""
-    if ARC_DISABLE_THINKING or not ARC_FORCE_ENABLE_THINKING:
+    """Explicit control of Qwen3.5 thinking via chat_template enable_thinking."""
+    if ARC_DISABLE_THINKING:
         return False
-    if STREAM_PRINT_THINKING:
-        return True
-    return False
+    return bool(
+        ARC_FORCE_ENABLE_THINKING
+        or ARC_HYPOTHESIS_ENABLE_THINKING
+        or ARC_FINAL_ENABLE_THINKING
+        or STREAM_PRINT_THINKING
+    )
 
 
 def _arc_json_grid_schema() -> Dict[str, Any]:
@@ -4179,11 +4759,18 @@ def _vllm_generate_arc(
     vllm_llm: Any,
     prompts: List[str],
     sp_list: List[Any],
+    *,
+    enable_thinking: Optional[bool] = None,
 ) -> List[Any]:
-    """Stock vLLM generate with thinking disabled and optional guided JSON."""
+    """Stock vLLM generate with explicit thinking control and optional guided JSON."""
     gen_kwargs: Dict[str, Any] = {}
-    if arc_resolve_enable_thinking() is False:
-        gen_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+    resolved = (
+        arc_resolve_enable_thinking()
+        if enable_thinking is None
+        else (False if ARC_DISABLE_THINKING else bool(enable_thinking))
+    )
+    if resolved is not None:
+        gen_kwargs["chat_template_kwargs"] = {"enable_thinking": bool(resolved)}
     try:
         return vllm_llm.generate(
             prompts, sp_list, use_tqdm=False, **gen_kwargs
@@ -4609,16 +5196,23 @@ def print_mbr_slot_inference_state(
 
 
 def parse_arc_answer_grid(text: str) -> Optional[List[List[int]]]:
-    """Prefer final grid after </think>; else latest HYPOTHESIS_GRID in thinking."""
-    cleaned = _strip_model_artifacts(text or "")
+    """Prefer final grid after </think>; else latest grid anywhere in the output."""
+    if not text:
+        return None
+    cleaned = _strip_model_artifacts(text)
     post_think = cleaned
-    if "</think>" in (text or "").lower():
-        post_think = re.split(r"</think>", text, flags=re.IGNORECASE)[-1]
-        post_think = _strip_model_artifacts(post_think)
-    final = parse_grid_from_text(post_think, only_after=None)
-    if final is not None:
-        return final
-    hyp, _, _ = parse_hypothesis_grid_from_thinking(text or "")
+    if "</think>" in text.lower():
+        post_think = _strip_model_artifacts(
+            re.split(r"</think>", text, flags=re.IGNORECASE)[-1]
+        )
+    for candidate in (post_think, cleaned, text):
+        final = parse_grid_from_text(candidate, only_after=None)
+        if final is not None:
+            return final
+        grid, _ = _parse_grid_from_fragment(candidate)
+        if grid is not None:
+            return grid
+    hyp, _, _ = parse_hypothesis_grid_from_thinking(text)
     return hyp
 
 
@@ -4817,10 +5411,7 @@ def collect_feature_slot_hypotheses(
     feature_names = alloc_out["feature_names"]
     feature_params = allocator.get_feature_params(feature_indices)
 
-    hyp_thinking = (
-        ARC_HYPOTHESIS_ENABLE_THINKING
-        and arc_resolve_enable_thinking() is True
-    )
+    hyp_thinking = ARC_HYPOTHESIS_ENABLE_THINKING and not ARC_DISABLE_THINKING
     if hyp_thinking:
         system_content = (
             "You are an ARC-AGI pattern analyst. Study grid transformations from train pairs. "
@@ -4837,6 +5428,7 @@ def collect_feature_slot_hypotheses(
     hypotheses: List[Dict[str, Any]] = []
     engine_ctx = get_inference_max_context(vllm_llm)
     hyp_max_tokens = arc_hypothesis_max_tokens(task)
+    hyp_think_budget = arc_hypothesis_thinking_budget(task)
     probe_feat = max(
         feature_names,
         key=lambda n: len(SLOT_HYPOTHESIS_LENSES.get(n, n)),
@@ -4861,7 +5453,9 @@ def collect_feature_slot_hypotheses(
     if verbose or (STREAM_ALL_OUTPUT and not ARC_FAST_INFERENCE):
         stream_log(
             f"[MBR-HYP] batched {k} slot hypotheses "
-            f"(max_tokens={hyp_max_tokens}/slot, thinking={hyp_thinking}) "
+            f"(max_gen={hyp_max_tokens}/slot "
+            f"reasoning~{hyp_think_budget}+output~{hyp_max_tokens - hyp_think_budget}, "
+            f"thinking={hyp_thinking}) "
             f"engine_ctx={engine_ctx} prompt~{probe_tok}tok({body_fmt}) "
             f"features={feature_names}"
         )
@@ -4930,7 +5524,9 @@ def collect_feature_slot_hypotheses(
         f"Rendering prompts: {k}/{k} = slot count, NOT voters)"
     )
     arc_eval_log(
-        f"[ARC-PHASE-1] Generate start: max_out={hyp_max_tokens}/slot | thinking={hyp_thinking} | "
+        f"[ARC-PHASE-1] Generate start: max_gen={hyp_max_tokens}/slot "
+        f"(reasoning~{hyp_think_budget}+output~{hyp_max_tokens - hyp_think_budget}) | "
+        f"thinking={hyp_thinking} | "
         f"prompt~{avg_prompt_tok}tok/slot ({total_prompt_tok} in total) | "
         f"greedy={ARC_FAST_INFERENCE and ARC_GENERATION_TEMPERATURE == 0.0} — "
         f"first slot may take 30-120s on L4; vLLM tqdm stays 0/{k} until one slot finishes"
@@ -5055,7 +5651,6 @@ def collect_spatial_grid_hypotheses(
     feature_names = alloc_out["feature_names"]
     feature_params = allocator.get_feature_params(feature_indices)
 
-    grid_thinking = arc_resolve_enable_thinking() is True
     system_content = (
         "You solve ARC-AGI grid puzzles using spatial transformations. "
         "Output exactly one JSON 2D array of integers (0-9). "
@@ -5105,7 +5700,7 @@ def collect_spatial_grid_hypotheses(
                     system_content=system_content,
                     engine_ctx=engine_ctx,
                     slot_max_tokens=slot_max_tokens,
-                    enable_thinking=grid_thinking,
+                    enable_thinking=False,
                 )
             )
             body_key = (task_body, system_used)
@@ -5138,7 +5733,7 @@ def collect_spatial_grid_hypotheses(
                         tokenizer,
                         user_content,
                         system_content=system_used,
-                        enable_thinking=grid_thinking,
+                        enable_thinking=False,
                         assistant_prefill=ARC_ASSISTANT_PREFILL,
                     )
                     prompts.append(prompt)
@@ -5196,10 +5791,17 @@ def collect_spatial_grid_hypotheses(
     )
     arc_eval_log(
         f"[ARC-PHASE-1] Spatial grid pool: {k} JSON grid hypotheses "
-        f"(primitives, guided={guided_on}, thinking=False, {parallel_tag})"
+        f"(primitives, guided={guided_on}, thinking=False, prefill={ARC_ASSISTANT_PREFILL!r}, "
+        f"{parallel_tag})"
     )
+    tests = task.get("test") or []
+    test_input = (
+        tests[test_index].get("input") if test_index < len(tests) else None
+    )
+    tfbd_orch = make_tfbd_orchestrator(vllm_llm) if ENABLE_TFBD else None
     arc_eval_log(
-        f"[ARC-PHASE-1] Generate start: max_out={slot_max_tokens}/slot | "
+        f"[ARC-PHASE-1] Generate start: max_gen={slot_max_tokens}/slot "
+        f"(json_grid_only) | tfbd_fiber={ENABLE_TFBD} | "
         f"prompt~{total_prompt_tok // max(1, k)}tok/slot | {parallel_tag}"
     )
     arc_eval_log(
@@ -5207,17 +5809,40 @@ def collect_spatial_grid_hypotheses(
         f"{total_prompt_tok // max(1, k)}tok/slot)"
     )
     t_gen = time.perf_counter()
-    outs = _arc_phase1_generate_slots(
-        vllm_llm, prompts, sp_list, label="phase1-spatial"
-    )
+    slot_outputs: List[Dict[str, Any]] = []
+    if ENABLE_TFBD and tfbd_orch is not None and test_input:
+        for (slot_i, prim, _params), prompt in zip(slot_meta, prompts):
+            res = tfbd_orch.generate_with_engine(
+                vllm_llm,
+                prompt,
+                max_new_tokens=int(slot_max_tokens),
+                context_grid=test_input,
+                temperature=float(ARC_GENERATION_TEMPERATURE),
+                stream_label=f"TFBD-spatial/slot{slot_i}/{prim}",
+            )
+            slot_outputs.append(res)
+    else:
+        outs = _arc_phase1_generate_slots(
+            vllm_llm, prompts, sp_list, label="phase1-spatial", enable_thinking=False
+        )
+        for out in outs:
+            gen_ids = list(out.outputs[0].token_ids) if out.outputs else []
+            slot_outputs.append(
+                {
+                    "generated_ids": gen_ids,
+                    "generated_text": tokenizer.decode(gen_ids, skip_special_tokens=True),
+                }
+            )
     arc_eval_log(
         f"[ARC-PHASE-1] Generate done: {k}/{k} spatial slots in "
         f"{time.perf_counter() - t_gen:.1f}s"
     )
 
-    for out, (slot_i, prim, _params), prompt in zip(outs, slot_meta, prompts):
-        gen_ids: List[int] = list(out.outputs[0].token_ids) if out.outputs else []
-        raw_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+    for res, (slot_i, prim, _params), prompt in zip(slot_outputs, slot_meta, prompts):
+        gen_ids: List[int] = list(res.get("generated_ids", []))
+        raw_text = str(res.get("generated_text", "")) or tokenizer.decode(
+            gen_ids, skip_special_tokens=True
+        )
         parsed = parse_arc_answer_grid(raw_text)
 
         rec = {
@@ -5236,6 +5861,12 @@ def collect_spatial_grid_hypotheses(
             stream_log(
                 f"  [SPATIAL slot {slot_i}] {prim} ({len(gen_ids)} tok) -> "
                 f"{_grid_shape_label(parsed) if parsed else 'UNPARSED'}"
+            )
+        elif not parsed and ARC_EVAL_VERBOSE:
+            tail = raw_text.strip().replace("\n", " ")[-160:]
+            arc_eval_log(
+                f"[ARC-PHASE-1] slot {slot_i}/{prim} UNPARSED "
+                f"({len(gen_ids)} tok) tail={tail!r}"
             )
 
     hyp_tok = sum(int(h.get("num_tokens", 0)) for h in hypotheses)
@@ -5277,17 +5908,45 @@ def arc_spatial_grid_ensemble_pipeline(
         verbose=verbose,
     )
     hyp_token_total = sum(int(h.get("num_tokens", 0)) for h in grid_hypotheses)
-    pooled_grid, vote_meta = pixel_wise_majority_vote_grids(
-        grid_hypotheses, task=task, test_index=test_index
-    )
+    if ENABLE_TFBD:
+        orch = make_tfbd_orchestrator(vllm_llm)
+        ref = orch.prm.reference_signature(task)
+        grids = [h.get("parsed_grid") for h in grid_hypotheses]
+        scores = [orch.prm.score_grid(g, ref) for g in grids]
+        tests = task.get("test") or []
+        target_shape = None
+        if test_index < len(tests):
+            inp = tests[test_index].get("input") or []
+            if inp and inp[0]:
+                target_shape = (len(inp), len(inp[0]))
+        pooled_grid, stitch_meta = orch.stitcher.stitch(
+            grids, scores, target_shape=target_shape
+        )
+        vote_meta = {
+            "n_parsed": sum(1 for g in grids if g is not None),
+            "n_slots": k,
+            "target_shape": stitch_meta.get("target_shape"),
+            "method": stitch_meta.get("method", "copresheaf_row_stitch"),
+            "best_score": stitch_meta.get("best_score"),
+        }
+        phase2_label = "Cohomological stitch (PRM/Betti proxy)"
+    else:
+        pooled_grid, vote_meta = pixel_wise_majority_vote_grids(
+            grid_hypotheses, task=task, test_index=test_index
+        )
+        phase2_label = "Pixel majority vote"
 
     arc_eval_log(
-        f"[ARC-PHASE-2] Pixel majority vote: {vote_meta.get('n_parsed', 0)}/"
+        f"[ARC-PHASE-2] {phase2_label}: {vote_meta.get('n_parsed', 0)}/"
         f"{vote_meta.get('n_slots', k)} grids -> shape {vote_meta.get('target_shape')}"
     )
 
     return {
-        "generation_mode": "spatial_grid_ensemble+pixel_majority",
+        "generation_mode": (
+            "tfbd_spatial_ensemble+cohomological_stitch"
+            if ENABLE_TFBD
+            else "spatial_grid_ensemble+pixel_majority"
+        ),
         "hypotheses": grid_hypotheses,
         "final_prompt": "",
         "final_text": format_grid_json(pooled_grid),
@@ -6261,7 +6920,8 @@ def print_post_load_arc_config() -> None:
     print("\n" + "-" * 72)
     print("RUNTIME ARC CONFIG — QUICK REFERENCE")
     print("-" * 72)
-    print("  Engine       : single DiffusionGemma vLLM")
+    print(f"  Engine       : TFBD + DiffusionGemma ({INFERENCE_BACKEND})")
+    print(f"  TFBD         : enabled={ENABLE_TFBD} fiber_dim={TFBD_FIBER_DIM}")
     print(f"  Per test     : Phase1:{hyp_n} props -> Phase2:1 grid (pixel vote if spatial ensemble)")
     print(f"  BENCHMARK_K  : {K} (demo benchmark only — NOT used in ARC Phase 1/2)")
     print(
@@ -6459,7 +7119,7 @@ def evaluate_arc_dataset(
                 )
                 mbr_pred = parse_arc_answer_grid(mbr_answer_text)
             else:
-                mbr_res = million_brains_dflash_generate(
+                mbr_res = tfbd_generate(
                     vllm_llm,
                     tokenizer,
                     prompt,
@@ -6472,6 +7132,7 @@ def evaluate_arc_dataset(
                     verbose=ARC_EVAL_VERBOSE or STREAM_ALL_OUTPUT,
                     arc_context={
                         "task_id": task_id,
+                        "task": task,
                         "test_input": test_input,
                         "gold": gold,
                     },
@@ -6746,7 +7407,7 @@ def benchmark(
     allocator = make_feature_slot_allocator(
         internal_dim=256, num_features=NUM_PERSONALITY_FEATURES, k=K
     )
-    mbr_res = million_brains_dflash_generate(
+    mbr_res = tfbd_generate(
         vllm_llm,
         tokenizer,
         prompt,
@@ -6802,6 +7463,10 @@ def benchmark(
     return {"mbr": {**mbr_res, "tps": mbr_tps, "time": t_mbr}}
 
 
+# Deprecated aliases (pre-rename scripts / notebooks)
+million_brains_dflash_generate = tfbd_generate
+
+
 # =============================================================================
 # MAIN ENTRY POINT (Kaggle script style - just run the file)
 # =============================================================================
@@ -6809,7 +7474,7 @@ if __name__ == "__main__":
     args = parse_cli_args()
 
     print(
-        "\n[million_brains_dflash.py] Starting Million-Brains DiffusionGemma Kaggle run"
+        "\n[tfbd.py] Starting TFBD × DiffusionGemma Kaggle run"
     )
     print(f"    SCRIPT_VERSION={SCRIPT_VERSION}")
     print(
@@ -6897,9 +7562,9 @@ if __name__ == "__main__":
 
     # Optional: write a small artifact so the Kaggle "Output" pane has something
     artifact_path = (
-        "/kaggle/working/million_brains_dflash_results.json"
+        "/kaggle/working/tfbd_results.json"
         if _on_kaggle()
-        else "million_brains_dflash_results.json"
+        else "tfbd_results.json"
     )
     try:
         payload: Dict[str, Any] = {
@@ -6929,5 +7594,5 @@ if __name__ == "__main__":
         pass
 
     print(
-        "\n[million_brains_dflash.py] All done. You can now inspect the generated samples and the metrics above."
+        "\n[tfbd.py] All done. Inspect generated samples and ARC metrics above."
     )
