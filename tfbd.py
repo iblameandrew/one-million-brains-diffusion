@@ -12,14 +12,14 @@ Architecture (Riemannian base ↔ discrete fiber bundle):
 Kaggle: attach Models input google/diffusiongemma, run as script or notebook cell.
 Backend: HuggingFace DiffusionGemmaForBlockDiffusion only (no vLLM).
 
-Kaggle cell 1 (if transformers<5.11 — run once, then Restart Kernel):
-    !pip install -U transformers>=5.11.0 accelerate torch
+Kaggle cell 1 (run once, then Restart Kernel):
+    !pip install -U "transformers>=5.12.1" "huggingface_hub>=1.5.0,<2.0" accelerate torch
 """
 
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-20-tfbd-e"  # fix diffusion_gemma detection (5.12+ w/ checkpoint)
+SCRIPT_VERSION = "2026-06-20-tfbd-g"  # deps warn-only; hub>=1.5 matched to transformers 5.12
 HF_FAST_VERIFY = True  # stub tail logprobs on diffusion verify passes (no causal forward)
 HF_TORCH_DTYPE = "bfloat16"  # official recipe; use "float16" if bf16 unsupported
 # --- DiffusionGemma core (default engine) ---
@@ -104,7 +104,8 @@ PREFER_LOCAL_MODELS = True  # try /kaggle/input + /kaggle/working before any Hug
 # Local model path override (optional; DiffusionGemma resolved via KAGGLE_DIFFUSIONGEMMA_DIR)
 LOCAL_MODEL_PATH = KAGGLE_DIFFUSIONGEMMA_DIR
 TRANSFORMERS_MIN_VERSION = "5.11.0"  # diffusion_gemma architecture in transformers
-AUTO_UPGRADE_TRANSFORMERS_ON_KAGGLE = True  # pip upgrade when Internet ON and arch missing
+HUGGINGFACE_HUB_MIN_VERSION = "1.5.0"  # transformers 5.12+ needs hub>=1.5 for @strict configs
+AUTO_UPGRADE_TRANSFORMERS_ON_KAGGLE = True  # pip upgrade when Internet ON and version too old
 
 AUTO_PREFETCH_TO_WORKING = True  # when online, try to cache DiffusionGemma into /kaggle/working
 PREFETCH_MODEL_ID = DIFFUSIONGEMMA_MODEL_PRIMARY
@@ -262,42 +263,14 @@ def _pypi_reachable() -> bool:
         return False
 
 
-def _transformers_supports_diffusion_gemma(
-    *, model_path: Optional[str] = None
-) -> bool:
-    """Detect diffusion_gemma support — CONFIG_MAPPING alone lies after pip w/o kernel restart."""
-    try:
-        from transformers import DiffusionGemmaForBlockDiffusion  # noqa: F401
-
-        return True
-    except ImportError:
-        pass
-    try:
-        from transformers.models.diffusion_gemma import DiffusionGemmaConfig  # noqa: F401
-
-        return True
-    except ImportError:
-        pass
+def _diffusion_gemma_in_mapping_names() -> bool:
+    """Safe metadata-only check — never import diffusion_gemma model modules."""
     try:
         from transformers.models.auto.auto_mappings import CONFIG_MAPPING_NAMES
 
-        if "diffusion_gemma" in CONFIG_MAPPING_NAMES:
-            return True
+        return "diffusion_gemma" in CONFIG_MAPPING_NAMES
     except Exception:
-        pass
-    try:
-        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-
-        if "diffusion_gemma" in CONFIG_MAPPING:
-            return True
-    except Exception:
-        pass
-    tfm_ver = _package_version("transformers")
-    if model_path and _version_at_least(tfm_ver, TRANSFORMERS_MIN_VERSION):
-        info = _checkpoint_model_info(model_path)
-        if info.get("is_diffusion_gemma"):
-            return True
-    return False
+        return False
 
 
 def _hf_diffusiongemma_deps_ok(
@@ -306,15 +279,12 @@ def _hf_diffusiongemma_deps_ok(
     tfm_ver = _package_version("transformers")
     if not _version_at_least(tfm_ver, TRANSFORMERS_MIN_VERSION):
         return False, f"transformers={tfm_ver} need>={TRANSFORMERS_MIN_VERSION}"
-    if not _transformers_supports_diffusion_gemma(model_path=model_path):
-        if model_path and _checkpoint_model_info(model_path).get("is_diffusion_gemma"):
-            return (
-                False,
-                f"transformers={tfm_ver} has DiffusionGemma checkpoint but arch not "
-                "importable — restart kernel after pip upgrade",
-            )
-        return False, f"transformers={tfm_ver} missing diffusion_gemma arch"
-    return True, ""
+    ckpt_ok = bool(
+        model_path and _checkpoint_model_info(model_path).get("is_diffusion_gemma")
+    )
+    if ckpt_ok or _diffusion_gemma_in_mapping_names():
+        return True, ""
+    return False, f"transformers={tfm_ver} missing diffusion_gemma in CONFIG_MAPPING_NAMES"
 
 
 def _diffusiongemma_runtime_help(*, extra: Optional[str] = None) -> str:
@@ -325,7 +295,8 @@ def _diffusiongemma_runtime_help(*, extra: Optional[str] = None) -> str:
         f"with diffusion_gemma support (have transformers={tfm_ver}, torch={torch_ver}).\n"
         "  1. Notebook Settings -> Internet ON.\n"
         "  2. Run in the first cell, then Restart Kernel:\n"
-        f"       !pip install -U \"transformers>={TRANSFORMERS_MIN_VERSION}\" accelerate torch\n"
+        f"       !pip install -U \"transformers>=5.12.1\" "
+        "\"huggingface_hub>=1.5.0,<2.0\" accelerate torch\n"
         "  3. Re-run this script.\n"
         "  GPU: A100 80GB recommended for 26B block-diffusion."
     )
@@ -346,7 +317,8 @@ def _install_hf_diffusiongemma_deps() -> None:
             "install",
             "-q",
             "--upgrade",
-            f"transformers>={TRANSFORMERS_MIN_VERSION}",
+            "transformers>=5.12.1",
+            "huggingface_hub>=1.5.0,<2.0",
             "accelerate",
             "torch",
         ]
@@ -2033,55 +2005,45 @@ def _arc_engine_max_num_seqs() -> int:
 
 
 def check_diffusiongemma_runtime_deps(*, model_path: Optional[str] = None) -> None:
-    """Fail fast with actionable guidance when transformers lacks diffusion_gemma."""
+    """Warn-only gate — never imports DiffusionGemma modules (importing them can crash)."""
     torch_ver = _package_version("torch")
     tfm_ver = _package_version("transformers")
-    has_diffusion_arch = _transformers_supports_diffusion_gemma(model_path=model_path)
-    ok, reason = _hf_diffusiongemma_deps_ok(model_path=model_path)
+    hub_ver = _package_version("huggingface_hub")
+    in_mapping = _diffusion_gemma_in_mapping_names()
     ckpt_ok = bool(
         model_path and _checkpoint_model_info(model_path).get("is_diffusion_gemma")
     )
+    tfm_ok = _version_at_least(tfm_ver, TRANSFORMERS_MIN_VERSION)
+    hub_ok = _version_at_least(hub_ver, HUGGINGFACE_HUB_MIN_VERSION)
     print(
-        f"[DEPS] backend=hf | torch={torch_ver} | "
-        f"transformers={tfm_ver} diffusion_gemma={has_diffusion_arch}"
-        + (f" | checkpoint=diffusion_gemma" if ckpt_ok else "")
+        f"[DEPS] backend=hf | torch={torch_ver} | transformers={tfm_ver} | "
+        f"hub={hub_ver} | mapping={in_mapping}"
+        + (" | checkpoint=diffusion_gemma" if ckpt_ok else "")
     )
-    if ok:
-        if not has_diffusion_arch and ckpt_ok:
-            print(
-                "[DEPS] [WARN] Live import check failed but transformers version + "
-                "checkpoint OK — proceeding (restart kernel if model load fails)."
-            )
-    elif (
-        ckpt_ok
-        and _version_at_least(tfm_ver, TRANSFORMERS_MIN_VERSION)
-        and "restart kernel" in reason
-    ):
-        print(
-            "[DEPS] [WARN] transformers upgraded in-session without kernel restart — "
-            "proceeding with DiffusionGemma checkpoint load."
-        )
-        ok = True
-    if not ok:
+    if not tfm_ok:
         on_kaggle = os.path.isdir("/kaggle/input")
-        version_low = not _version_at_least(tfm_ver, TRANSFORMERS_MIN_VERSION)
-        if (
-            AUTO_UPGRADE_TRANSFORMERS_ON_KAGGLE
-            and on_kaggle
-            and _pypi_reachable()
-            and version_low
-        ):
+        if AUTO_UPGRADE_TRANSFORMERS_ON_KAGGLE and on_kaggle and _pypi_reachable():
             _install_hf_diffusiongemma_deps()
-            ok2, reason2 = _hf_diffusiongemma_deps_ok(model_path=model_path)
             print(
                 f"[DEPS] pip finished — transformers={_package_version('transformers')}, "
-                f"diffusion_gemma={_transformers_supports_diffusion_gemma(model_path=model_path)}"
+                f"hub={_package_version('huggingface_hub')}"
             )
             raise RuntimeError(
                 "[DEPS] Pip upgrade complete — restart the Kaggle kernel, then re-run.\n"
-                + _diffusiongemma_runtime_help(extra=reason2 if not ok2 else None)
+                + _diffusiongemma_runtime_help()
             )
-        raise RuntimeError(_diffusiongemma_runtime_help(extra=reason))
+        raise RuntimeError(_diffusiongemma_runtime_help(extra=f"transformers={tfm_ver}"))
+    if not hub_ok:
+        print(
+            f"[DEPS] [WARN] huggingface_hub={hub_ver} < {HUGGINGFACE_HUB_MIN_VERSION} — "
+            "DiffusionGemma config load may fail (StrictDataclass). "
+            f"pip install -U \"huggingface_hub>={HUGGINGFACE_HUB_MIN_VERSION},<2.0\" then restart kernel."
+        )
+    if not in_mapping and not ckpt_ok:
+        print(
+            f"[DEPS] [WARN] diffusion_gemma not in CONFIG_MAPPING_NAMES "
+            f"(transformers={tfm_ver}) — proceeding to model load."
+        )
     if model_path:
         info = _checkpoint_model_info(model_path)
         if info.get("is_diffusion_gemma"):
@@ -3280,7 +3242,20 @@ def _hf_total_vram_gib() -> float:
 def _load_hf_diffusiongemma_model(
     model_path: str, *, local_only: bool, processor: Any = None
 ) -> Any:
-    from transformers import AutoConfig, DiffusionGemmaForBlockDiffusion
+    try:
+        from transformers import AutoConfig, DiffusionGemmaForBlockDiffusion
+    except Exception as exc:
+        err_name = type(exc).__name__
+        if "StrictDataclass" in err_name or "strict" in str(exc).lower():
+            raise RuntimeError(
+                "[LOAD][HF] transformers/huggingface_hub version mismatch "
+                f"({err_name}).\n"
+                "  Run in first cell, then Restart Kernel:\n"
+                '    !pip install -U "transformers>=5.12.1" '
+                '"huggingface_hub>=1.5.0,<2.0" accelerate torch\n'
+                f"  Detail: {exc}"
+            ) from exc
+        raise
 
     local_files_only = bool(local_only and os.path.isdir(model_path))
     dtype = _hf_resolve_dtype()
