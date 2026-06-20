@@ -273,20 +273,6 @@ def _diffusion_gemma_in_mapping_names() -> bool:
         return False
 
 
-def _hf_diffusiongemma_deps_ok(
-    *, model_path: Optional[str] = None
-) -> Tuple[bool, str]:
-    tfm_ver = _package_version("transformers")
-    if not _version_at_least(tfm_ver, TRANSFORMERS_MIN_VERSION):
-        return False, f"transformers={tfm_ver} need>={TRANSFORMERS_MIN_VERSION}"
-    ckpt_ok = bool(
-        model_path and _checkpoint_model_info(model_path).get("is_diffusion_gemma")
-    )
-    if ckpt_ok or _diffusion_gemma_in_mapping_names():
-        return True, ""
-    return False, f"transformers={tfm_ver} missing diffusion_gemma in CONFIG_MAPPING_NAMES"
-
-
 def _diffusiongemma_runtime_help(*, extra: Optional[str] = None) -> str:
     tfm_ver = _package_version("transformers")
     torch_ver = _package_version("torch")
