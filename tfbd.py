@@ -19,7 +19,7 @@ Kaggle cell 1 (if transformers<5.11 — run once, then Restart Kernel):
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-20-tfbd-d"  # HF-only: removed vLLM backend entirely
+SCRIPT_VERSION = "2026-06-20-tfbd-e"  # fix diffusion_gemma detection (5.12+ w/ checkpoint)
 HF_FAST_VERIFY = True  # stub tail logprobs on diffusion verify passes (no causal forward)
 HF_TORCH_DTYPE = "bfloat16"  # official recipe; use "float16" if bf16 unsupported
 # --- DiffusionGemma core (default engine) ---
@@ -262,20 +262,57 @@ def _pypi_reachable() -> bool:
         return False
 
 
-def _transformers_supports_diffusion_gemma() -> bool:
+def _transformers_supports_diffusion_gemma(
+    *, model_path: Optional[str] = None
+) -> bool:
+    """Detect diffusion_gemma support — CONFIG_MAPPING alone lies after pip w/o kernel restart."""
+    try:
+        from transformers import DiffusionGemmaForBlockDiffusion  # noqa: F401
+
+        return True
+    except ImportError:
+        pass
+    try:
+        from transformers.models.diffusion_gemma import DiffusionGemmaConfig  # noqa: F401
+
+        return True
+    except ImportError:
+        pass
+    try:
+        from transformers.models.auto.auto_mappings import CONFIG_MAPPING_NAMES
+
+        if "diffusion_gemma" in CONFIG_MAPPING_NAMES:
+            return True
+    except Exception:
+        pass
     try:
         from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-        return "diffusion_gemma" in CONFIG_MAPPING
+        if "diffusion_gemma" in CONFIG_MAPPING:
+            return True
     except Exception:
-        return False
+        pass
+    tfm_ver = _package_version("transformers")
+    if model_path and _version_at_least(tfm_ver, TRANSFORMERS_MIN_VERSION):
+        info = _checkpoint_model_info(model_path)
+        if info.get("is_diffusion_gemma"):
+            return True
+    return False
 
 
-def _hf_diffusiongemma_deps_ok() -> Tuple[bool, str]:
+def _hf_diffusiongemma_deps_ok(
+    *, model_path: Optional[str] = None
+) -> Tuple[bool, str]:
     tfm_ver = _package_version("transformers")
     if not _version_at_least(tfm_ver, TRANSFORMERS_MIN_VERSION):
         return False, f"transformers={tfm_ver} need>={TRANSFORMERS_MIN_VERSION}"
-    if not _transformers_supports_diffusion_gemma():
+    if not _transformers_supports_diffusion_gemma(model_path=model_path):
+        if model_path and _checkpoint_model_info(model_path).get("is_diffusion_gemma"):
+            return (
+                False,
+                f"transformers={tfm_ver} has DiffusionGemma checkpoint but arch not "
+                "importable — restart kernel after pip upgrade",
+            )
         return False, f"transformers={tfm_ver} missing diffusion_gemma arch"
     return True, ""
 
@@ -1999,29 +2036,50 @@ def check_diffusiongemma_runtime_deps(*, model_path: Optional[str] = None) -> No
     """Fail fast with actionable guidance when transformers lacks diffusion_gemma."""
     torch_ver = _package_version("torch")
     tfm_ver = _package_version("transformers")
-    has_diffusion_arch = _transformers_supports_diffusion_gemma()
-    ok, reason = _hf_diffusiongemma_deps_ok()
+    has_diffusion_arch = _transformers_supports_diffusion_gemma(model_path=model_path)
+    ok, reason = _hf_diffusiongemma_deps_ok(model_path=model_path)
+    ckpt_ok = bool(
+        model_path and _checkpoint_model_info(model_path).get("is_diffusion_gemma")
+    )
     print(
         f"[DEPS] backend=hf | torch={torch_ver} | "
         f"transformers={tfm_ver} diffusion_gemma={has_diffusion_arch}"
+        + (f" | checkpoint=diffusion_gemma" if ckpt_ok else "")
     )
+    if ok:
+        if not has_diffusion_arch and ckpt_ok:
+            print(
+                "[DEPS] [WARN] Live import check failed but transformers version + "
+                "checkpoint OK — proceeding (restart kernel if model load fails)."
+            )
+    elif (
+        ckpt_ok
+        and _version_at_least(tfm_ver, TRANSFORMERS_MIN_VERSION)
+        and "restart kernel" in reason
+    ):
+        print(
+            "[DEPS] [WARN] transformers upgraded in-session without kernel restart — "
+            "proceeding with DiffusionGemma checkpoint load."
+        )
+        ok = True
     if not ok:
         on_kaggle = os.path.isdir("/kaggle/input")
-        if AUTO_UPGRADE_TRANSFORMERS_ON_KAGGLE and on_kaggle and _pypi_reachable():
+        version_low = not _version_at_least(tfm_ver, TRANSFORMERS_MIN_VERSION)
+        if (
+            AUTO_UPGRADE_TRANSFORMERS_ON_KAGGLE
+            and on_kaggle
+            and _pypi_reachable()
+            and version_low
+        ):
             _install_hf_diffusiongemma_deps()
-            ok2, reason2 = _hf_diffusiongemma_deps_ok()
+            ok2, reason2 = _hf_diffusiongemma_deps_ok(model_path=model_path)
             print(
                 f"[DEPS] pip finished — transformers={_package_version('transformers')}, "
-                f"diffusion_gemma={_transformers_supports_diffusion_gemma()}"
+                f"diffusion_gemma={_transformers_supports_diffusion_gemma(model_path=model_path)}"
             )
-            if ok2:
-                raise RuntimeError(
-                    "[DEPS] Pip upgrade complete — restart the Kaggle kernel, then re-run.\n"
-                    + _diffusiongemma_runtime_help()
-                )
             raise RuntimeError(
-                f"[DEPS] Stack still broken after pip: {reason2}\n"
-                + _diffusiongemma_runtime_help(extra=reason2)
+                "[DEPS] Pip upgrade complete — restart the Kaggle kernel, then re-run.\n"
+                + _diffusiongemma_runtime_help(extra=reason2 if not ok2 else None)
             )
         raise RuntimeError(_diffusiongemma_runtime_help(extra=reason))
     if model_path:
