@@ -13,7 +13,7 @@ Kaggle: attach Models input google/diffusiongemma, run as script or notebook cel
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-19-diffusion-d"  # single-engine ARC (no voter pool)
+SCRIPT_VERSION = "2026-06-19-diffusion-d-hf"  # single-engine ARC, HuggingFace-only inference
 # --- DiffusionGemma core (default engine) ---
 # Kaggle: Add Input -> Models -> google/diffusiongemma -> diffusiongemma-26b-a4b-it
 KAGGLE_DIFFUSIONGEMMA_DIR = (
@@ -22,17 +22,17 @@ KAGGLE_DIFFUSIONGEMMA_DIR = (
 LOCAL_DIFFUSIONGEMMA_DIR = KAGGLE_DIFFUSIONGEMMA_DIR  # override for local dev if needed
 DIFFUSIONGEMMA_MODEL_PRIMARY = "google/diffusiongemma-26B-A4B-it"  # HF id (offline fallback)
 DIFFUSIONGEMMA_MODEL_FALLBACK = "RedHatAI/diffusiongemma-26B-A4B-it-NVFP4"  # NVFP4 variant
-DIFFUSION_CANVAS_LENGTH = 256  # vLLM diffusion_config canvas block size
-DIFFUSION_MAX_NUM_SEQS = 4  # vLLM recipe: keep low (diffusion state ∝ max_seqs × canvas × vocab)
+DIFFUSION_CANVAS_LENGTH = 256  # block-diffusion canvas block size
+DIFFUSION_MAX_NUM_SEQS = 4  # parallel denoise trajectories cap (diffusion state ∝ max_seqs × canvas × vocab)
 DIFFUSION_ENTROPY_BOUND = 0.1  # entropy-bound denoising sampler
 DIFFUSION_GPU_UTIL = 0.85  # headroom for denoising activations on H100/A100/L4
 DIFFUSION_MAX_MODEL_LEN = 8192  # ARC + chat; raise on A100 if VRAM allows
 DIFFUSION_DENOISE_CHUNK = 6  # tokens committed per denoise step (= legacy BLOCK_SIZE)
 K = 4  # Million-Brains parallel trajectories per denoise step (not ARC hypothesis count)
-ARC_HYPOTHESIS_SLOTS = 8  # ARC eval: batched hypothesis proposals per engine (vLLM shows N/N)
+ARC_HYPOTHESIS_SLOTS = 8  # ARC eval: batched hypothesis proposals per engine
 NUM_PERSONALITY_FEATURES = 12  # personality / spatial primitive bank for allocator
 ARC_FORCE_ENABLE_THINKING = False  # Step 2: never emit Qwen3.5 </think> chains in ARC
-ARC_GUIDED_JSON_DECODING = True  # Step 3: vLLM guided JSON for grid outputs
+ARC_GUIDED_JSON_DECODING = False  # HF uses greedy decode + JSON parse fallback (no guided decoding)
 ARC_SPATIAL_GRID_ENSEMBLE = True  # Step 4: Phase1=8 grid hypotheses, Phase2=pixel majority vote
 BLOCK_SIZE = DIFFUSION_DENOISE_CHUNK  # tokens committed per denoise step / super-block
 MAX_SUPERBLOCKS = 32  # safety cap on super-blocks
@@ -65,13 +65,7 @@ ANCHOR_SLOT = 0  # slot 0 receives extra smoothing inertia (stable chain scribe)
 PREFER_LOCAL_MODELS = True  # try /kaggle/input + /kaggle/working before any HuggingFace request
 # Local model path override (optional; DiffusionGemma resolved via KAGGLE_DIFFUSIONGEMMA_DIR)
 LOCAL_MODEL_PATH = KAGGLE_DIFFUSIONGEMMA_DIR
-VLLM_ENFORCE_EAGER = False  # prefer CUDA graphs; load loop retries enforce_eager=True on failure
-VLLM_RUNNER = "generate"  # do not let vLLM pick pooling/embedding runner
-VLLM_FALLBACK_TO_HF = True  # HuggingFace wrapper if vLLM still cannot load the checkpoint
-VLLM_GPU_MEMORY_UTILIZATION = 0.88  # HF fallback only; DiffusionGemma uses DIFFUSION_GPU_UTIL
-VLLM_TENSOR_PARALLEL_SIZE = 0  # 0=auto (retry with tp=2 when 2+ GPUs visible)
-PREFER_HF_INFERENCE = False  # L4/A10+: prefer vLLM fast kernels; HF only on load failure
-SKIP_VLLM_FOR_QWEN35 = False  # attempt vLLM for Qwen3.5-4B (set True on broken vLLM hosts)
+INFERENCE_BACKEND = "hf"  # HuggingFace only (DiffusionGemma via transformers)
 AUTO_PREFETCH_TO_WORKING = True  # when online, try to cache DiffusionGemma into /kaggle/working
 PREFETCH_MODEL_ID = DIFFUSIONGEMMA_MODEL_PRIMARY
 KAGGLEHUB_MODEL_HANDLE = ""  # set if you publish DiffusionGemma on Kaggle Models
@@ -85,6 +79,16 @@ KAGGLE_DATASET_HANDLE = ""  # optional dataset fallback on Kaggle
 # ---------------------------------------------------------------------------
 ARC_DATA_PROFILE = "auto"  # "auto" | "kaggle" | "local" | "off"
 ARC_DATA_SPLIT = "evaluation"  # "training" | "evaluation"
+ARC_SPLIT_FILES = {
+    "training": (
+        "arc-agi_training_challenges.json",
+        "arc-agi_training_solutions.json",
+    ),
+    "evaluation": (
+        "arc-agi_evaluation_challenges.json",
+        "arc-agi_evaluation_solutions.json",
+    ),
+}
 KAGGLE_ARC_COMPETITION_DIR = (
     "/kaggle/input/competitions/arc-prize-2026-arc-agi-2"
 )
@@ -112,10 +116,8 @@ ARC_ASSISTANT_PREFILL = "[["  # chat prefill anchors JSON grid (skipped when thi
 ARC_GENERATION_TEMPERATURE = 0.0  # greedy JSON for grid tasks
 EVAL_SMOKE_TASK_ID = None  # e.g. "0934a4d8" — run only this task (overrides max_tasks slice)
 ARC_FAST_INFERENCE = True  # ARC eval: compact prompts, batched gen, no per-token streaming
-ARC_TRY_VLLM = True  # ARC eval requires vLLM for speed; HF fallback if load fails
-# Qwen3.5-4B native context is 150k+ (YaRN); vLLM max_model_len is a VRAM budget we set at load.
 # KV cache grows with max_model_len — 4k was only to fit L4 OOM; ARC 30x30 tasks need ~8k+.
-VLLM_MAX_MODEL_LEN = 0  # 0 = auto (ARC prompt + output budget); set e.g. 16384 if VRAM allows
+HF_MAX_MODEL_LEN = 0  # 0 = auto (ARC prompt + output budget); set e.g. 16384 if VRAM allows
 ARC_MAX_PROMPT_TOKENS = 6144  # tighter input budget; resolver shrinks further; lowers KV bandwidth on decode
 ARC_SLOT_HYPOTHESIS_MODE = True  # ARC eval uses slot pipeline (spatial grids when ARC_SPATIAL_GRID_ENSEMBLE)
 ARC_MBR_OUTPUT_TOKEN_BUDGET = 14000  # total OUTPUT tokens per test (hyp slots + final grid combined)
@@ -128,8 +130,8 @@ ARC_FINAL_HYP_CHAR_CAPS = (360, 200, 120, 60, 0)  # shrink hypothesis text in fi
 ARC_HYPOTHESIS_ENABLE_THINKING = False  # False = fast text rules (True + thinking can stall tqdm at 0/N for minutes)
 ARC_HYPOTHESIS_THINKING_TOKEN_CAP = 512  # per-slot cap when hypothesis thinking is enabled
 ARC_FINAL_ENABLE_THINKING = False  # final grid: [[ prefill + greedy JSON (much faster than thinking pass)
-ARC_PHASE1_PROMPT_PARALLELISM = False  # False = 1 hypothesis slot per vLLM generate()
-ARC_VLLM_MAX_NUM_SEQS = 1  # max Phase-1 slots batched per vLLM call when parallelism on
+ARC_PHASE1_PROMPT_PARALLELISM = False  # False = 1 hypothesis slot per generate() call
+ARC_HF_MAX_NUM_SEQS = 1  # max Phase-1 slots batched per generate() call when parallelism on
 ARC_CHAT_TEMPLATE_SLACK = 2048  # system + chat template overhead beyond raw task body
 ARC_SAVE_GRADE_IMAGES = True  # save PNG grade cards (arc_grades/ or /kaggle/working/arc_grades/)
 ARC_SHOW_TRAIN_EXAMPLES = True  # include train pair thumbnails on each grade card
@@ -161,9 +163,21 @@ from collections import Counter
 import warnings
 import logging
 import numpy as np
+
+# DiffusionGemma + device_map forwards fail under torch.compile/dynamo (meta vs cuda mismatch).
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    import torch._dynamo
+
+    torch._dynamo.config.disable = True
+except Exception:
+    pass
 
 
 def _suppress_noisy_third_party_logs() -> None:
@@ -183,8 +197,6 @@ def _suppress_noisy_third_party_logs() -> None:
         "transformers",
         "transformers.image_processing_utils",
         "transformers.processing_utils",
-        "vllm",
-        "vllm.model_executor",
     ):
         logging.getLogger(logger_name).setLevel(logging.ERROR)
 
@@ -193,7 +205,20 @@ _suppress_noisy_third_party_logs()
 
 # Heavy libraries (installed above)
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from vllm import LLM, SamplingParams
+
+
+@dataclass
+class SamplingParams:
+    """Lightweight sampling config (HF engine generate API)."""
+
+    temperature: float = 1.0
+    max_tokens: int = 16
+    top_p: float = 1.0
+    prompt_logprobs: bool = False
+    verify_only: bool = False
+    verify_tail_tokens: Optional[int] = None
+    repetition_penalty: float = 1.0
+    logprobs: Optional[int] = None
 
 # =============================================================================
 # FIXED BANK OF 12 PERSONALITY FEATURES
@@ -1025,46 +1050,6 @@ def _hf_hub_snapshot_path(model_id: str) -> Optional[str]:
     return None
 
 
-def _build_diffusiongemma_vllm_kwargs(
-    model_path: str,
-    *,
-    gpu_memory_utilization: float,
-    max_model_len: Optional[int] = None,
-    max_num_seqs: Optional[int] = None,
-) -> Dict[str, Any]:
-    """
-    vLLM-native DiffusionGemma serving config (recipes.vllm.ai/Google/diffusiongemma-26B-A4B-it).
-    diffusion_config + entropy_bound sampler + low max_num_seqs to avoid diffusion-state OOM.
-    """
-    ctx = int(max_model_len or DIFFUSION_MAX_MODEL_LEN)
-    seqs = int(max_num_seqs or DIFFUSION_MAX_NUM_SEQS)
-    util = min(float(gpu_memory_utilization), float(DIFFUSION_GPU_UTIL))
-    kwargs: Dict[str, Any] = {
-        "model": model_path,
-        "trust_remote_code": True,
-        "dtype": "auto",
-        "tensor_parallel_size": 1,
-        "max_model_len": ctx,
-        "max_num_seqs": seqs,
-        "max_num_batched_tokens": min(ctx, DIFFUSION_CANVAS_LENGTH * 2),
-        "gpu_memory_utilization": util,
-        "hf_overrides": {
-            "diffusion_sampler": "entropy_bound",
-            "diffusion_entropy_bound": float(DIFFUSION_ENTROPY_BOUND),
-        },
-        "diffusion_config": {"canvas_length": int(DIFFUSION_CANVAS_LENGTH)},
-    }
-    # vLLM >= gemma image: ignore checkpoint generation_config.json max_tokens cap
-    try:
-        import inspect
-
-        if "generation_config" in inspect.signature(LLM).parameters:
-            kwargs["generation_config"] = "vllm"
-    except Exception:
-        pass
-    return kwargs
-
-
 def _build_diffusion_conditioned_prompt(
     base_prompt: str,
     feature_name: str,
@@ -1099,7 +1084,7 @@ def _build_diffusion_conditioned_prompt(
 
 
 def million_brains_diffusion_denoise_generate(
-    vllm_llm: LLM,
+    vllm_llm: Any,
     tokenizer: Any,
     prompt: str,
     max_new_tokens: int = 128,
@@ -1425,7 +1410,7 @@ def million_brains_diffusion_denoise_generate(
 # ONE-MILLION-BRAINS GENERATE (public API — DiffusionGemma conditioned denoising)
 # =============================================================================
 def million_brains_dflash_generate(
-    vllm_llm: LLM,
+    vllm_llm: Any,
     tokenizer: Any,
     prompt: str,
     max_new_tokens: int = 128,
@@ -1714,7 +1699,7 @@ def prefetch_via_huggingface(target_dir: str) -> Optional[str]:
 
 def ensure_model_available() -> Optional[str]:
     """
-    Ensure a usable on-disk checkpoint exists before vLLM load.
+    Ensure a usable on-disk checkpoint exists before HF load.
     Order: existing local -> HF hub cache -> Kaggle Models -> Kaggle Dataset -> HuggingFace.
     """
     existing = resolve_local_model_path()
@@ -1756,7 +1741,7 @@ def maybe_prefetch_model_to_working() -> Optional[str]:
 def pick_model_name() -> Tuple[str, str]:
     """Resolve DiffusionGemma checkpoint."""
     path = resolve_diffusiongemma_model_path()
-    return path, "vllm-diffusion"
+    return path, "hf-diffusion"
 
 def _read_hf_config(model_path: str) -> Dict[str, Any]:
     cfg_path = os.path.join(model_path, "config.json")
@@ -1835,17 +1820,30 @@ def _checkpoint_model_info(model_path: str) -> Dict[str, Any]:
         pass
     archs = [str(a) for a in (cfg.get("architectures") or [])]
     model_type = str(cfg.get("model_type", ""))
+    is_diffusion_gemma = model_type == "diffusion_gemma" or any(
+        "DiffusionGemma" in a for a in archs
+    )
     return {
         "architectures": archs,
         "model_type": model_type,
         "vocab_size": _checkpoint_vocab_size(cfg),
+        "is_diffusion_gemma": is_diffusion_gemma,
         "is_qwen35": model_type == "qwen3_5"
         or any("Qwen3_5" in a for a in archs),
-        "is_multimodal": bool(cfg.get("vision_config") or cfg.get("video_token_id")),
-        "is_text_generator": any(
+        "is_multimodal": (
+            not is_diffusion_gemma
+            and bool(cfg.get("vision_config") or cfg.get("video_token_id"))
+        ),
+        "is_text_generator": is_diffusion_gemma
+        or any(
             tag in a
             for a in archs
-            for tag in ("CausalLM", "ConditionalGeneration", "ImageTextToText")
+            for tag in (
+                "CausalLM",
+                "ConditionalGeneration",
+                "ImageTextToText",
+                "BlockDiffusion",
+            )
         ),
     }
 
@@ -1922,6 +1920,62 @@ def resolve_generation_model_path(requested_path: str) -> str:
     print(f"[LOAD] DiffusionGemma checkpoint: {resolved}")
     return resolved
 
+def _purge_stale_transformers_modules() -> None:
+    """Drop cached transformers imports so a pip-upgraded wheel is visible."""
+    for name in list(sys.modules):
+        if name == "transformers" or name.startswith("transformers."):
+            del sys.modules[name]
+
+
+def _transformers_has_diffusion_gemma() -> bool:
+    try:
+        from transformers.models.auto.auto_mappings import CONFIG_MAPPING_NAMES
+
+        return "diffusion_gemma" in CONFIG_MAPPING_NAMES
+    except Exception:
+        return False
+
+
+def _ensure_diffusiongemma_transformers() -> str:
+    """
+    Require transformers>=5.12 with diffusion_gemma (install wheel cell first).
+
+    Re-imports transformers when the kernel still holds a pre-upgrade cache.
+    """
+    from importlib.metadata import version as pkg_version
+
+    if not _transformers_has_diffusion_gemma():
+        _purge_stale_transformers_modules()
+    if not _transformers_has_diffusion_gemma():
+        raise RuntimeError(
+            "transformers lacks diffusion_gemma mapping. "
+            "Run the vllm-gemma wheel cell first (transformers==5.12.1), "
+            "then re-run this script in the same kernel."
+        )
+    return pkg_version("transformers")
+
+
+def _resolve_diffusiongemma_imports() -> Tuple[Optional[Any], Optional[Any], str]:
+    """Runtime import of AutoProcessor + DiffusionGemmaForBlockDiffusion (never cached as None)."""
+    tfm_ver = _ensure_diffusiongemma_transformers()
+    import importlib
+
+    tfm = importlib.import_module("transformers")
+
+    proc_cls = getattr(tfm, "AutoProcessor", None)
+    model_cls = getattr(tfm, "DiffusionGemmaForBlockDiffusion", None)
+    if model_cls is None:
+        try:
+            modeling = importlib.import_module(
+                "transformers.models.diffusion_gemma.modeling_diffusion_gemma"
+            )
+            model_cls = getattr(modeling, "DiffusionGemmaForBlockDiffusion", None)
+        except Exception:
+            model_cls = None
+
+    return proc_cls, model_cls, tfm_ver
+
+
 def _guess_causal_lm_architecture(config: Dict[str, Any]) -> Optional[str]:
     model_type = str(config.get("model_type", "")).lower()
     archs = [str(a) for a in (config.get("architectures") or [])]
@@ -1944,17 +1998,42 @@ def _guess_causal_lm_architecture(config: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _should_skip_vllm(model_path: str) -> bool:
-    """Qwen3.5 multimodal checkpoints routinely fail vLLM on Kaggle; prefer HF."""
-    if PREFER_HF_INFERENCE and not ARC_TRY_VLLM:
-        return True
-    if not SKIP_VLLM_FOR_QWEN35:
-        return False
-    try:
-        info = _checkpoint_model_info(model_path)
-        return info["is_qwen35"] or info["is_multimodal"]
-    except Exception:
-        return False
+def _load_hf_tokenizer_or_processor(
+    model_path: str,
+    *,
+    local_only: bool,
+) -> Any:
+    """Load AutoProcessor for DiffusionGemma, else AutoTokenizer."""
+    info = _checkpoint_model_info(model_path)
+    common: Dict[str, Any] = {
+        "trust_remote_code": True,
+        "local_files_only": local_only and os.path.isdir(model_path),
+    }
+    if info["is_diffusion_gemma"]:
+        proc_cls, _, tfm_ver = _resolve_diffusiongemma_imports()
+        if proc_cls is not None:
+            try:
+                processor = proc_cls.from_pretrained(model_path, **common)
+                tok = getattr(processor, "tokenizer", processor)
+                if getattr(tok, "pad_token", None) is None:
+                    tok.pad_token = tok.eos_token
+                print(f"[LOAD] DiffusionGemma processor ready (transformers={tfm_ver})")
+                return processor
+            except Exception as exc:
+                print(
+                    f"[LOAD] AutoProcessor unavailable ({type(exc).__name__}: {exc}); "
+                    "falling back to AutoTokenizer"
+                )
+        tokenizer = AutoTokenizer.from_pretrained(model_path, **common)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        print(f"[LOAD] DiffusionGemma tokenizer ready (transformers={tfm_ver})")
+        return tokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, **common)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
 
 
 def _load_hf_generation_model(
@@ -1963,7 +2042,7 @@ def _load_hf_generation_model(
     dtype: torch.dtype,
     local_only: bool,
 ) -> Any:
-    """Load the correct HF class for plain LMs and Qwen3.5 multimodal text generation."""
+    """Load DiffusionGemma block-diffusion, Qwen3.5 multimodal, or causal LMs."""
     info = _checkpoint_model_info(model_path)
     common: Dict[str, Any] = {
         "torch_dtype": dtype,
@@ -1974,6 +2053,33 @@ def _load_hf_generation_model(
         "attn_implementation": "sdpa",
     }
     errors: List[str] = []
+
+    if info["is_diffusion_gemma"]:
+        print(
+            f"[LOAD][HF] DiffusionGemma checkpoint: "
+            f"arch={info['architectures']} — block-diffusion path"
+        )
+        _, model_cls, tfm_ver = _resolve_diffusiongemma_imports()
+        if model_cls is None:
+            raise RuntimeError(
+                f"[LOAD] DiffusionGemmaForBlockDiffusion not found in transformers={tfm_ver}. "
+                "Install transformers==5.12.1 (vllm-gemma wheel bundle) before running."
+            )
+        try:
+            return _load_diffusiongemma_sharded(
+                model_cls,
+                model_path,
+                dtype=dtype,
+                local_only=local_only,
+            )
+        except Exception as exc:
+            errors.append(
+                f"DiffusionGemmaForBlockDiffusion: {type(exc).__name__}: {exc}"
+            )
+            raise RuntimeError(
+                "[LOAD][HF] Failed to load DiffusionGemma from "
+                f"{model_path}.\n  " + "\n  ".join(errors)
+            ) from exc
 
     if info["is_qwen35"] or info["is_multimodal"]:
         print(
@@ -2003,22 +2109,6 @@ def _load_hf_generation_model(
         ) from exc
 
 
-def _needs_custom_vllm_handling(model_path: str) -> bool:
-    path_l = model_path.lower()
-    if any(tag in path_l for tag in ("diffusiongemma", "qwen3", "custom")):
-        return True
-    try:
-        cfg = _read_hf_config(model_path)
-    except Exception:
-        return False
-    archs = [str(a) for a in (cfg.get("architectures") or [])]
-    if any("Embedding" in a or "Pooling" in a for a in archs):
-        return True
-    if cfg.get("is_embedding_model") or cfg.get("pooler_config"):
-        return True
-    return False
-
-
 def _cuda_vram_snapshot(device: int = 0) -> Dict[str, float]:
     """Return total/free GiB on a CUDA device (0 if unavailable)."""
     if not torch.cuda.is_available():
@@ -2035,22 +2125,6 @@ def _cuda_vram_snapshot(device: int = 0) -> Dict[str, float]:
     }
 
 
-def _adaptive_vllm_gpu_util(requested: float) -> float:
-    """Cap gpu_memory_utilization so vLLM's requested slice fits in free VRAM."""
-    snap = _cuda_vram_snapshot()
-    if snap["total_gib"] <= 0:
-        return requested
-    safe = (snap["free_gib"] / snap["total_gib"]) * 0.88
-    util = min(float(requested), safe)
-    util = max(0.38, min(0.88, util))
-    print(
-        f"[LOAD] VRAM cuda:0 "
-        f"free {snap['free_gib']:.2f}/{snap['total_gib']:.2f} GiB "
-        f"(allocated {snap['allocated_gib']:.2f}) "
-        f"-> gpu_memory_utilization={util:.2f}"
-    )
-    return util
-
 def _release_cuda_cache() -> None:
     import gc
 
@@ -2061,16 +2135,6 @@ def _release_cuda_cache() -> None:
             torch.cuda.synchronize()
         except Exception:
             pass
-
-
-def _build_vllm_attempts(
-    model_path: str,
-    gpu_memory_utilization: float,
-) -> List[Dict[str, Any]]:
-    kwargs = _build_diffusiongemma_vllm_kwargs(
-        model_path, gpu_memory_utilization=gpu_memory_utilization
-    )
-    return [kwargs]
 
 
 @dataclass
@@ -2151,8 +2215,332 @@ def _top_p_sample_logits(logits: torch.Tensor, temperature: float, top_p: float)
     return next_id, logp
 
 
+def _ensure_accelerate_for_sharded_load() -> str:
+    """
+    DiffusionGemma 26B device_map loading requires accelerate.
+
+    The vllm-gemma wheel cell uses ``pip install --no-deps``; install accelerate too.
+    """
+    try:
+        import accelerate
+
+        ver = getattr(accelerate, "__version__", "unknown")
+    except ImportError as exc:
+        raise RuntimeError(
+            "[LOAD] DiffusionGemma 26B requires `accelerate` for multi-GPU device_map.\n"
+            "  Your transformers wheel cell uses --no-deps, so also run:\n"
+            "    pip install 'accelerate>=0.26.0'\n"
+            "  (or add accelerate to the wheel bundle / drop --no-deps)."
+        ) from exc
+    return ver
+
+
+def _diffusiongemma_offload_dir() -> str:
+    """Writable offload dir (required for big-model dispatch on Kaggle read-only inputs)."""
+    base = "/kaggle/working" if os.path.isdir("/kaggle/working") else os.getcwd()
+    path = os.path.join(base, "diffusiongemma_offload")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _diffusiongemma_max_memory() -> Dict[Any, str]:
+    """Per-device VRAM budget for accelerate device_map (leave decode headroom)."""
+    budget: Dict[Any, str] = {}
+    if not torch.cuda.is_available():
+        budget["cpu"] = "48GiB"
+        return budget
+    for idx in range(torch.cuda.device_count()):
+        try:
+            free_b, _total_b = torch.cuda.mem_get_info(idx)
+            gib = max(1, int(free_b * 0.88 / (1024**3)))
+        except Exception:
+            gib = 20
+        budget[idx] = f"{gib}GiB"
+    budget["cpu"] = "48GiB"
+    return budget
+
+
+def _log_hf_device_map(model: Any, *, label: str = "model") -> None:
+    hf_map = getattr(model, "hf_device_map", None)
+    if not hf_map:
+        return
+    devices: Counter[str] = Counter(str(v) for v in hf_map.values())
+    print(
+        f"[LOAD][HF] {label} device_map: {len(hf_map)} module(s) -> "
+        + ", ".join(f"{k}={v}" for k, v in sorted(devices.items()))
+    )
+
+
+def _count_meta_tensors(model: Any) -> Tuple[int, int]:
+    meta_params = sum(1 for p in model.parameters() if p.device.type == "meta")
+    meta_bufs = sum(1 for b in model.buffers() if b.device.type == "meta")
+    return meta_params, meta_bufs
+
+
+def _ensure_safetensors_for_load() -> str:
+    try:
+        import safetensors
+
+        return getattr(safetensors, "__version__", "unknown")
+    except ImportError as exc:
+        raise RuntimeError(
+            "[LOAD] DiffusionGemma shard loading requires `safetensors`.\n"
+            "  Install: pip install safetensors"
+        ) from exc
+
+
+def _model_dispatch_ready(model: Any) -> bool:
+    if getattr(model, "hf_device_map", None):
+        return True
+    for module in model.modules():
+        if hasattr(module, "_hf_hook"):
+            return True
+    meta_params, _meta_bufs = _count_meta_tensors(model)
+    return meta_params == 0
+
+
+def _finalize_diffusiongemma_load(model: Any, *, label: str) -> Any:
+    meta_params, _meta_bufs = _count_meta_tensors(model)
+    if meta_params and getattr(model, "hf_device_map", None):
+        print(
+            f"[LOAD][HF] {meta_params} parameter(s) report device=meta "
+            "(accelerate lazy hooks — OK when hf_device_map is set)"
+        )
+    elif meta_params:
+        print(f"[LOAD][HF][WARN] {meta_params} parameter(s) still on meta after load")
+    _log_hf_device_map(model, label=label)
+    return model.eval()
+
+
+def _load_diffusiongemma_via_accelerate_dispatch(
+    model_cls: Any,
+    model_path: str,
+    *,
+    dtype: torch.dtype,
+    local_files_only: bool,
+    max_memory: Dict[Any, str],
+    offload_folder: str,
+) -> Any:
+    """accelerate load_checkpoint_and_dispatch with writable offload (Kaggle-safe)."""
+    from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+    from accelerate.utils import infer_auto_device_map
+
+    config = model_cls.config_class.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        local_files_only=local_files_only,
+    )
+    no_split = getattr(model_cls, "_no_split_modules", None)
+    with init_empty_weights():
+        shell = model_cls(config)
+        if hasattr(shell, "tie_weights"):
+            shell.tie_weights()
+    device_map = infer_auto_device_map(
+        shell,
+        max_memory=max_memory,
+        no_split_module_classes=no_split,
+        dtype=dtype,
+    )
+    print(
+        f"[LOAD][HF] accelerate load_checkpoint_and_dispatch: "
+        f"{len(device_map)} modules | offload={offload_folder}"
+    )
+    model = load_checkpoint_and_dispatch(
+        shell,
+        checkpoint=model_path,
+        device_map=device_map,
+        dtype=dtype,
+        offload_folder=offload_folder,
+        offload_state_dict=True,
+    )
+    if not getattr(model, "hf_device_map", None):
+        setattr(model, "hf_device_map", device_map)
+    return model
+
+
+def _load_diffusiongemma_bnb_4bit(
+    model_cls: Any,
+    model_path: str,
+    *,
+    dtype: torch.dtype,
+    local_files_only: bool,
+    max_memory: Dict[Any, str],
+) -> Optional[Any]:
+    """Optional 4-bit path (fits 26B MoE on 1–4 consumer GPUs when sharding works)."""
+    try:
+        import bitsandbytes  # noqa: F401
+    except ImportError:
+        return None
+    qconfig = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=dtype,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+    )
+    return model_cls.from_pretrained(
+        model_path,
+        quantization_config=qconfig,
+        device_map="auto",
+        max_memory=max_memory,
+        trust_remote_code=True,
+        local_files_only=local_files_only,
+        attn_implementation="eager",
+    )
+
+
+def _device_from_hf_device_map(hf_map: Dict[str, Any]) -> Optional[torch.device]:
+    """First CUDA (or CPU) execution device from accelerate's hf_device_map."""
+    for val in hf_map.values():
+        if val in ("cpu", "disk"):
+            continue
+        if isinstance(val, int):
+            return torch.device(f"cuda:{val}")
+        if isinstance(val, str):
+            if val.startswith("cuda"):
+                return torch.device(val)
+            if val.isdigit():
+                return torch.device(f"cuda:{val}")
+    if "cpu" in hf_map.values():
+        return torch.device("cpu")
+    return None
+
+
+def _load_diffusiongemma_sharded(
+    model_cls: Any,
+    model_path: str,
+    *,
+    dtype: torch.dtype,
+    local_only: bool,
+) -> Any:
+    """Load DiffusionGemma 26B across GPUs (transformers + accelerate)."""
+    accel_ver = _ensure_accelerate_for_sharded_load()
+    st_ver = _ensure_safetensors_for_load()
+    max_memory = _diffusiongemma_max_memory()
+    offload_folder = _diffusiongemma_offload_dir()
+    local_files_only = local_only and os.path.isdir(model_path)
+    print(
+        f"[LOAD][HF] accelerate={accel_ver} | safetensors={st_ver} | "
+        f"max_memory={max_memory} | offload={offload_folder}"
+    )
+
+    common: Dict[str, Any] = {
+        "torch_dtype": dtype,
+        "device_map": "auto",
+        "trust_remote_code": True,
+        "local_files_only": local_files_only,
+        "attn_implementation": "eager",
+        "offload_folder": offload_folder,
+        "offload_state_dict": True,
+    }
+    errors: List[str] = []
+
+    # Strategy 0: 4-bit bitsandbytes (most reliable on 4×22GB when bf16 sharding fails).
+    try:
+        print("[LOAD][HF] strategy 0: bitsandbytes 4-bit NF4")
+        model = _load_diffusiongemma_bnb_4bit(
+            model_cls,
+            model_path,
+            dtype=dtype,
+            local_files_only=local_files_only,
+            max_memory=max_memory,
+        )
+        if model is not None and _model_dispatch_ready(model):
+            return _finalize_diffusiongemma_load(model, label="DiffusionGemma-4bit")
+        if model is None:
+            errors.append("strategy 0: bitsandbytes not installed (pip install bitsandbytes)")
+        else:
+            meta_p, _ = _count_meta_tensors(model)
+            errors.append(f"strategy 0: dispatch not ready (meta params={meta_p})")
+    except Exception as exc:
+        errors.append(f"strategy 0: {type(exc).__name__}: {exc}")
+
+    # Strategy A: materialize on CPU, shard with writable offload.
+    try:
+        print("[LOAD][HF] strategy A: from_pretrained low_cpu_mem_usage=False + offload")
+        model = model_cls.from_pretrained(
+            model_path,
+            max_memory=max_memory,
+            low_cpu_mem_usage=False,
+            **common,
+        )
+        if _model_dispatch_ready(model):
+            return _finalize_diffusiongemma_load(model, label="DiffusionGemma")
+        meta_p, _ = _count_meta_tensors(model)
+        errors.append(f"strategy A: dispatch not ready (meta params={meta_p})")
+    except Exception as exc:
+        errors.append(f"strategy A: {type(exc).__name__}: {exc}")
+
+    # Strategy B: accelerate load_checkpoint_and_dispatch + offload.
+    try:
+        print("[LOAD][HF] strategy B: load_checkpoint_and_dispatch + offload")
+        model = _load_diffusiongemma_via_accelerate_dispatch(
+            model_cls,
+            model_path,
+            dtype=dtype,
+            local_files_only=local_files_only,
+            max_memory=max_memory,
+            offload_folder=offload_folder,
+        )
+        if _model_dispatch_ready(model):
+            return _finalize_diffusiongemma_load(model, label="DiffusionGemma")
+        meta_p, _ = _count_meta_tensors(model)
+        errors.append(f"strategy B: dispatch not ready (meta params={meta_p})")
+    except Exception as exc:
+        errors.append(f"strategy B: {type(exc).__name__}: {exc}")
+
+    # Strategy C: lazy meta + hooks + offload.
+    try:
+        print("[LOAD][HF] strategy C: from_pretrained low_cpu_mem_usage=True + offload")
+        model = model_cls.from_pretrained(
+            model_path,
+            max_memory=max_memory,
+            low_cpu_mem_usage=True,
+            **common,
+        )
+        if _model_dispatch_ready(model):
+            return _finalize_diffusiongemma_load(model, label="DiffusionGemma")
+        meta_p, _ = _count_meta_tensors(model)
+        errors.append(f"strategy C: dispatch not ready (meta params={meta_p})")
+    except Exception as exc:
+        errors.append(f"strategy C: {type(exc).__name__}: {exc}")
+
+    raise RuntimeError(
+        "[LOAD][HF] All DiffusionGemma load strategies failed.\n  "
+        + "\n  ".join(errors)
+        + "\n  Try Cell 1: pip install bitsandbytes accelerate safetensors"
+    )
+
+
+def _resolve_hf_input_device(model: Any) -> torch.device:
+    """Pick a materialized (non-meta) device for input tensors on sharded HF models."""
+    hf_map = getattr(model, "hf_device_map", None)
+    if hf_map:
+        mapped = _device_from_hf_device_map(hf_map)
+        if mapped is not None and mapped.type != "meta":
+            return mapped
+    model_device = getattr(model, "device", None)
+    if model_device is not None:
+        dev = torch.device(model_device)
+        if dev.type != "meta":
+            return dev
+    try:
+        emb = model.get_input_embeddings()
+        if emb is not None and getattr(emb, "weight", None) is not None:
+            wdev = emb.weight.device
+            if wdev.type != "meta":
+                return wdev
+    except Exception:
+        pass
+    for param in model.parameters():
+        if param.device.type != "meta":
+            return param.device
+    if torch.cuda.is_available():
+        return torch.device("cuda", 0)
+    return torch.device("cpu")
+
+
 class HFGenerateEngine:
-    """Fallback engine when vLLM cannot load DiffusionGemma."""
+    """HuggingFace DiffusionGemma generate engine (vLLM-compatible generate API)."""
 
     def __init__(
         self,
@@ -2162,21 +2550,30 @@ class HFGenerateEngine:
         local_only: bool = True,
     ):
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        print(f"[LOAD][HF] Loading causal LM from {model_path} ...")
-        self.tokenizer = tokenizer
+        info = _checkpoint_model_info(model_path)
+        self.is_diffusion_gemma = bool(info["is_diffusion_gemma"])
+        if self.is_diffusion_gemma and getattr(tokenizer, "tokenizer", None) is not None:
+            self.processor = tokenizer
+            self.tokenizer = tokenizer.tokenizer
+        else:
+            self.processor = None
+            self.tokenizer = tokenizer
         self.model_path = model_path
         self.model = _load_hf_generation_model(
             model_path,
             dtype=dtype,
             local_only=local_only,
         ).eval()
-        self.device = next(self.model.parameters()).device
+        self.device = _resolve_hf_input_device(self.model)
         emb = self.model.get_input_embeddings()
         if emb is None or emb.weight.numel() == 0:
             raise RuntimeError(
                 f"[LOAD][HF] Model at {model_path} has no usable embed_tokens."
             )
-        print("[LOAD][HF] HuggingFace generate engine ready (vLLM-compatible API).")
+        label = "DiffusionGemma block-diffusion" if self.is_diffusion_gemma else "causal LM"
+        print(
+            f"[LOAD][HF] HuggingFace generate engine ready ({label}, input_device={self.device})."
+        )
 
     def _encode(self, text: str) -> torch.Tensor:
         prompt = text if text and str(text).strip() else " "
@@ -2185,7 +2582,7 @@ class HFGenerateEngine:
             return_tensors="pt",
             add_special_tokens=True,
             truncation=True,
-            max_length=max(4096, arc_vllm_context_budget()),
+            max_length=max(4096, arc_context_budget()),
         )
         input_ids = encoded["input_ids"].to(self.device)
         if input_ids.shape[1] == 0:
@@ -2200,6 +2597,76 @@ class HFGenerateEngine:
     def _decode_ids(self, ids: List[int]) -> str:
         return self.tokenizer.decode(ids, skip_special_tokens=True)
 
+    def _diffusion_generate_kwargs(
+        self,
+        max_tokens: int,
+        temperature: float,
+    ) -> Dict[str, Any]:
+        """Map SamplingParams to DiffusionGemma entropy-bound denoising."""
+        kwargs: Dict[str, Any] = {"max_new_tokens": int(max_tokens)}
+        if temperature > 0:
+            temp = float(temperature)
+            t_min = max(0.01, temp * 0.4)
+            t_max = min(1.0, max(t_min + 0.05, temp))
+            kwargs["t_min"] = t_min
+            kwargs["t_max"] = t_max
+        # temperature<=0: omit t_min/t_max — use checkpoint defaults (0.8→0.4 schedule)
+        try:
+            from transformers.models.diffusion_gemma.generation_diffusion_gemma import (
+                EntropyBoundSamplerConfig,
+            )
+
+            kwargs["sampler_config"] = EntropyBoundSamplerConfig(
+                entropy_bound=float(DIFFUSION_ENTROPY_BOUND)
+            )
+        except Exception:
+            pass
+        return kwargs
+
+    def _sample_ids_diffusion(
+        self,
+        input_ids: torch.Tensor,
+        max_tokens: int,
+        temperature: float,
+        *,
+        stream_label: str,
+    ) -> Tuple[List[int], List[Dict[int, float]]]:
+        """Block-diffusion generate (no per-token streaming)."""
+        if STREAM_GENERATION and not ARC_FAST_INFERENCE:
+            stream_begin(stream_label)
+            stream_log(
+                f"[HF-DIFFUSION] denoising up to {max_tokens} tokens "
+                f"(entropy_bound={DIFFUSION_ENTROPY_BOUND})"
+            )
+        device = self.device
+        input_ids = input_ids.to(device)
+        attn = torch.ones_like(input_ids, device=device)
+        gen_kwargs = self._diffusion_generate_kwargs(max_tokens, temperature)
+        with torch.inference_mode():
+            try:
+                import torch._dynamo
+
+                with torch._dynamo.config.patch(disable=True):
+                    output = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attn,
+                        **gen_kwargs,
+                    )
+            except Exception:
+                output = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attn,
+                    **gen_kwargs,
+                )
+        sequences = output.sequences if hasattr(output, "sequences") else output
+        prompt_len = int(input_ids.shape[1])
+        new_ids = sequences[0, prompt_len:].tolist()
+        if STREAM_GENERATION and not ARC_FAST_INFERENCE:
+            stream_emit(self._decode_ids(new_ids))
+            stream_end(stream_label)
+        step_logprobs = [{tid: -0.5} for tid in new_ids]
+        return new_ids, step_logprobs
+
     def _prompt_logprobs_for_ids(
         self,
         input_ids: torch.Tensor,
@@ -2207,6 +2674,21 @@ class HFGenerateEngine:
         tail_count: Optional[int] = None,
     ) -> List[Optional[Dict[int, float]]]:
         """Target logprobs for prompt tokens. tail_count limits work to draft suffix."""
+        if self.is_diffusion_gemma:
+            seq_len = int(input_ids.shape[1])
+            if seq_len < 2:
+                return [None]
+            tail_n = (
+                max(1, min(int(tail_count), seq_len - 1))
+                if tail_count is not None and HF_FAST_VERIFY
+                else seq_len - 1
+            )
+            start_pos = seq_len - tail_n
+            out: List[Optional[Dict[int, float]]] = [None] * start_pos
+            for tid in input_ids[0, start_pos:seq_len].tolist():
+                out.append({tid: -0.5})
+            return out
+
         seq_len = int(input_ids.shape[1])
         if seq_len < 2:
             return [None]
@@ -2313,6 +2795,14 @@ class HFGenerateEngine:
     ) -> Tuple[List[int], List[Dict[int, float]]]:
         if input_ids.shape[1] == 0:
             raise ValueError("Refusing to generate from empty input_ids")
+
+        if self.is_diffusion_gemma:
+            return self._sample_ids_diffusion(
+                input_ids,
+                max_tokens,
+                temperature,
+                stream_label=stream_label,
+            )
 
         if STREAM_GENERATION and stream and not ARC_FAST_INFERENCE:
             return self._sample_ids_streaming(
@@ -2442,58 +2932,28 @@ def create_inference_engine(
     tokenizer: Any,
     *,
     gpu_memory_utilization: Optional[float] = None,
-) -> Any:
-    """Create DiffusionGemma vLLM engine (HF fallback on load failure)."""
+) -> HFGenerateEngine:
+    """Create DiffusionGemma HuggingFace inference engine."""
+    del gpu_memory_utilization
     gen_path = resolve_generation_model_path(model_path)
     local_only = os.path.isdir(gen_path)
-    gpu_mem = (
-        float(gpu_memory_utilization)
-        if gpu_memory_utilization is not None
-        else float(DIFFUSION_GPU_UTIL)
-    )
-
-    kwargs = _build_diffusiongemma_vllm_kwargs(gen_path, gpu_memory_utilization=gpu_mem)
+    ctx = int(HF_MAX_MODEL_LEN or DIFFUSION_MAX_MODEL_LEN)
     print(
-        f"[LOAD] DiffusionGemma vLLM: canvas={DIFFUSION_CANVAS_LENGTH} "
-        f"max_seqs={kwargs.get('max_num_seqs')} "
-        f"max_len={kwargs.get('max_model_len')} "
-        f"gpu_util={kwargs.get('gpu_memory_utilization')}",
+        f"[LOAD] DiffusionGemma HF ({INFERENCE_BACKEND}): canvas={DIFFUSION_CANVAS_LENGTH} "
+        f"max_len={ctx}",
         flush=True,
     )
-    attempts: List[Dict[str, Any]] = [kwargs]
-
-    last_err: Optional[BaseException] = None
     _release_cuda_cache()
-    for attempt_idx, attempt_kwargs in enumerate(attempts, start=1):
-        try:
-            print(
-                f"[LOAD] vLLM attempt {attempt_idx}/{len(attempts)}: "
-                f"max_model_len={attempt_kwargs.get('max_model_len')} "
-                f"gpu_util={attempt_kwargs.get('gpu_memory_utilization')}"
-            )
-            llm = LLM(**attempt_kwargs)
-            ctx = int(attempt_kwargs.get("max_model_len", DIFFUSION_MAX_MODEL_LEN))
-            setattr(llm, "max_model_len", ctx)
-            setattr(llm, "diffusiongemma_enabled", True)
-            print(f"[LOAD] DiffusionGemma engine ready (max_model_len={ctx})")
-            return llm
-        except Exception as exc:
-            last_err = exc
-            print(f"[LOAD] vLLM attempt {attempt_idx} failed: {type(exc).__name__}: {exc}")
-            _release_cuda_cache()
-
-    if VLLM_FALLBACK_TO_HF:
-        print("[LOAD] All vLLM attempts failed; using HuggingFace generate fallback.")
-        return HFGenerateEngine(gen_path, tokenizer, local_only=local_only)
-
-    raise RuntimeError(f"Failed to load inference engine for {gen_path}") from last_err
+    engine = HFGenerateEngine(gen_path, tokenizer, local_only=local_only)
+    setattr(engine, "max_model_len", ctx)
+    setattr(engine, "diffusiongemma_enabled", True)
+    print(f"[LOAD] DiffusionGemma engine ready (max_model_len={ctx})")
+    return engine
 
 def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
     """Fail fast before ARC eval if the engine cannot tokenize/generate."""
-    engine_label = (
-        "HF-fallback"
-        if isinstance(llm, HFGenerateEngine)
-        else getattr(type(llm), "__name__", str(type(llm)))
+    engine_label = "HF" if isinstance(llm, HFGenerateEngine) else getattr(
+        type(llm), "__name__", str(type(llm))
     )
     gen_path = getattr(llm, "model_path", None)
     print("\n[VERIFY] Inference engine smoke test (parent/coordinator engine)")
@@ -2512,16 +2972,11 @@ def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
     if gen_path:
         print(f"    generate : {gen_path}")
     ctx = get_inference_max_context(llm)
-    print(f"    max_ctx  : {ctx} tokens (vLLM max_model_len / HF cap)")
-    if isinstance(llm, HFGenerateEngine) and ARC_TRY_VLLM:
+    print(f"    max_ctx  : {ctx} tokens (HF max_model_len cap)")
+    if ctx < arc_context_budget():
         print(
-            "    [WARN] HF fallback active — ARC eval will be ~10-50x slower than vLLM. "
-            "Fix vLLM load or set ARC_TRY_VLLM=False if intentional."
-        )
-    if ctx < arc_vllm_context_budget():
-        print(
-            f"    [WARN] Engine context {ctx} < ARC budget {arc_vllm_context_budget()} — "
-            "30x30 tasks may fail. Restart kernel and let vLLM load with max_model_len>=8192."
+            f"    [WARN] Engine context {ctx} < ARC budget {arc_context_budget()} — "
+            "30x30 tasks may fail. Raise HF_MAX_MODEL_LEN or DIFFUSION_MAX_MODEL_LEN."
         )
 
     probe = "ARC smoke test."
@@ -2567,26 +3022,6 @@ def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
     except Exception as exc:
         print(f"    bench    : skipped ({type(exc).__name__}: {exc})")
 
-    if not isinstance(llm, HFGenerateEngine):
-        long_tokens = 64
-        long_prompt = "ARC final-pass decode probe. " + ("context " * 800)
-        long_sp = SamplingParams(temperature=0.0, max_tokens=long_tokens)
-        setattr(long_sp, "stream_label", "VERIFY-long-bench")
-        t1 = time.perf_counter()
-        try:
-            long_out = llm.generate([long_prompt], long_sp)[0]
-            long_elapsed = time.perf_counter() - t1
-            long_n = len(long_out.outputs[0].token_ids) if long_out.outputs else 0
-            long_tps = long_n / max(long_elapsed, 1e-6)
-            long_in = count_prompt_tokens(tokenizer, long_prompt)
-            print(
-                f"    long_bench: {long_n} tok in {long_elapsed:.2f}s "
-                f"({long_tps:.1f} tok/s, prompt~{long_in}tok)"
-            )
-        except Exception as exc:
-            print(f"    long_bench: skipped ({type(exc).__name__}: {exc})")
-
-
 def load_models(model_name: str):
     """Load DiffusionGemma inference engine + tokenizer."""
     local_only = os.path.isdir(model_name) and local_dir_exists(model_name)
@@ -2596,15 +3031,10 @@ def load_models(model_name: str):
         f"\n[LOAD] Initializing DiffusionGemma engine for {load_label}"
         + ("" if local_only else " (this can take 30-120s on first download)...")
     )
-    tokenizer = AutoTokenizer.from_pretrained(
-        gen_path,
-        trust_remote_code=True,
-        local_files_only=local_only,
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tok_or_proc = _load_hf_tokenizer_or_processor(gen_path, local_only=local_only)
+    tokenizer = getattr(tok_or_proc, "tokenizer", tok_or_proc)
 
-    llm = create_inference_engine(gen_path, tokenizer)
+    llm = create_inference_engine(gen_path, tok_or_proc)
     if isinstance(llm, HFGenerateEngine):
         setattr(llm, "model_path", gen_path)
     setattr(llm, "generation_model_path", gen_path)
@@ -2614,7 +3044,7 @@ def load_models(model_name: str):
         hf_model = llm.model
     return llm, tokenizer, hf_model
 
-def load_local_models() -> Tuple[LLM, Any, Optional[LLM], Optional[Any]]:
+def load_local_models() -> Tuple[HFGenerateEngine, Any, None, None]:
     """Load local DiffusionGemma without network access."""
     print("\n[LOCAL-LOAD] DiffusionGemma paths:")
     for tag, raw in (
@@ -2636,21 +3066,17 @@ def load_local_models() -> Tuple[LLM, Any, Optional[LLM], Optional[Any]]:
         )
 
     gen_path = resolve_generation_model_path(primary)
-    tokenizer = AutoTokenizer.from_pretrained(
-        gen_path, trust_remote_code=True, local_only=True
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tok_or_proc = _load_hf_tokenizer_or_processor(gen_path, local_only=True)
+    tokenizer = getattr(tok_or_proc, "tokenizer", tok_or_proc)
     llm = create_inference_engine(
         gen_path,
-        tokenizer,
+        tok_or_proc,
         gpu_memory_utilization=DIFFUSION_GPU_UTIL,
     )
     if isinstance(llm, HFGenerateEngine):
         setattr(llm, "model_path", gen_path)
     setattr(llm, "generation_model_path", gen_path)
-    backend = "HF-fallback" if isinstance(llm, HFGenerateEngine) else "vLLM"
-    print(f"[LOCAL-LOAD] {os.path.basename(gen_path)} engine ready ({backend}).")
+    print(f"[LOCAL-LOAD] {os.path.basename(gen_path)} engine ready ({INFERENCE_BACKEND}).")
     return llm, tokenizer, None, None
 
 def discover_kaggle_arc_competition_dir() -> Optional[str]:
@@ -2871,10 +3297,10 @@ def _arc_task_needs_compact_prompt(
 
 
 def arc_phase1_slot_batch_size(k: int) -> int:
-    """How many Phase-1 slots to pass per vLLM generate() call."""
+    """How many Phase-1 slots to pass per generate() call."""
     if not ARC_PHASE1_PROMPT_PARALLELISM:
         return 1
-    return min(max(1, int(k)), max(1, int(ARC_VLLM_MAX_NUM_SEQS)))
+    return min(max(1, int(k)), max(1, int(ARC_HF_MAX_NUM_SEQS)))
 
 
 def _arc_phase1_generate_slots(
@@ -2892,7 +3318,7 @@ def _arc_phase1_generate_slots(
         end = min(start + slot_batch, k)
         arc_eval_log(f"{label} generate slots {start + 1}-{end}/{k}")
         outs.extend(
-            _vllm_generate_arc(
+            _engine_generate_arc(
                 vllm_llm,
                 prompts[start:end],
                 sp_list[start:end],
@@ -2908,7 +3334,7 @@ def format_arc_task_body_minimal(
     task: Dict[str, Any],
     test_index: int = 0,
 ) -> str:
-    """Test input only — last resort when full train context exceeds vLLM ctx."""
+    """Test input only — last resort when full train context exceeds engine ctx."""
     tests = task.get("test") or []
     if test_index >= len(tests):
         raise IndexError(f"test_index {test_index} out of range for {task_id}")
@@ -2957,8 +3383,8 @@ def arc_mbr_final_output_budget(
     return max(int(ARC_FINAL_GRID_MIN_TOKENS), min(ceiling, remaining))
 
 
-def arc_vllm_context_budget() -> int:
-    """Minimum vLLM max_model_len: ARC grids + generation + chat-template slack."""
+def arc_context_budget() -> int:
+    """Minimum HF max_model_len: ARC grids + generation + chat-template slack."""
     raw = (
         int(ARC_MAX_PROMPT_TOKENS)
         + int(ARC_MBR_OUTPUT_TOKEN_BUDGET)
@@ -2968,21 +3394,11 @@ def arc_vllm_context_budget() -> int:
 
 
 def get_inference_max_context(llm: Any) -> int:
-    """Effective max context tokens for the loaded engine (vLLM max_model_len or HF cap)."""
+    """Effective max context tokens for the loaded HF engine."""
     stored = getattr(llm, "max_model_len", None)
     if stored is not None:
         return int(stored)
-    try:
-        engine = getattr(llm, "llm_engine", None) or getattr(
-            getattr(llm, "llm", None), "llm_engine", None
-        )
-        if engine is not None:
-            cfg = getattr(engine, "model_config", None)
-            if cfg is not None and hasattr(cfg, "max_model_len"):
-                return int(cfg.max_model_len)
-    except Exception:
-        pass
-    return max(4096, int(ARC_MAX_PROMPT_TOKENS))
+    return max(4096, int(DIFFUSION_MAX_MODEL_LEN), int(ARC_MAX_PROMPT_TOKENS))
 
 
 def format_arc_task_body(
@@ -3332,7 +3748,7 @@ def resolve_arc_final_prompt_bundle(
         stream_log(
             f"[MBR-WARN] final prompt {n_in}tok > input cap {max_input}tok "
             f"(engine={engine_ctx}, output_reserved={final_output_tokens}). "
-            "Using tightest encoding; raise VLLM_MAX_MODEL_LEN if generation truncates."
+            "Using tightest encoding; raise HF_MAX_MODEL_LEN if generation truncates."
         )
     return prompt, n_in, body_tok, fmt
 
@@ -3390,56 +3806,17 @@ def _arc_guided_json_enabled() -> bool:
 
 
 def _apply_arc_guided_decoding(sp: Any) -> Any:
-    """Step 3: attach vLLM guided JSON decoding when available (Outlines/xgrammar)."""
-    if not _arc_guided_json_enabled():
-        return sp
-    try:
-        from vllm.sampling_params import GuidedDecodingParams
-
-        schema = _arc_json_grid_schema()
-        guided = None
-        for factory in (
-            lambda: GuidedDecodingParams(json=schema),
-            lambda: GuidedDecodingParams(json_object=schema),
-            lambda: GuidedDecodingParams(json_schema=schema),
-        ):
-            try:
-                guided = factory()
-                break
-            except TypeError:
-                continue
-        if guided is not None:
-            sp.guided_decoding = guided
-            setattr(sp, "arc_guided_json", True)
-    except Exception as exc:
-        if ARC_EVAL_VERBOSE:
-            stream_log(f"[ARC-GUIDED] guided decoding unavailable ({exc}); greedy parse fallback")
+    """HF engine uses greedy decode + JSON parse fallback (no guided decoding)."""
     return sp
 
 
-def _vllm_generate_arc(
-    vllm_llm: Any,
+def _engine_generate_arc(
+    engine: Any,
     prompts: List[str],
     sp_list: List[Any],
 ) -> List[Any]:
-    """Stock vLLM generate with thinking disabled and optional guided JSON."""
-    gen_kwargs: Dict[str, Any] = {}
-    if arc_resolve_enable_thinking() is False:
-        gen_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
-    try:
-        return vllm_llm.generate(
-            prompts, sp_list, use_tqdm=False, **gen_kwargs
-        )
-    except TypeError:
-        try:
-            return vllm_llm.generate(
-                prompts,
-                sp_list,
-                use_tqdm=False,
-                tokenization_kwargs=gen_kwargs.get("chat_template_kwargs"),
-            )
-        except TypeError:
-            return vllm_llm.generate(prompts, sp_list, use_tqdm=False)
+    """HF generate for ARC Phase-1/2 (thinking disabled via prompt template)."""
+    return engine.generate(prompts, sp_list)
 
 
 def apply_arc_chat_prompt_custom(
@@ -4151,11 +4528,10 @@ def collect_feature_slot_hypotheses(
     if max_needed > engine_ctx:
         need_ctx = int(math.ceil(max_needed / 256.0) * 256)
         raise ValueError(
-            f"ARC hypothesis needs {max_needed} tokens (input+output) but vLLM "
+            f"ARC hypothesis needs {max_needed} tokens (input+output) but engine "
             f"max_model_len={engine_ctx}. Restart kernel and set "
-            f"VLLM_MAX_MODEL_LEN={need_ctx} at the top of the script "
-            f"(auto budget is {arc_vllm_context_budget()}). "
-            f"Qwen native context is 150k+; only GPU KV cache limits vLLM."
+            f"HF_MAX_MODEL_LEN={need_ctx} at the top of the script "
+            f"(auto budget is {arc_context_budget()})."
         )
 
     total_prompt_tok = sum(count_prompt_tokens(tokenizer, p) for p in prompts)
@@ -4174,7 +4550,7 @@ def collect_feature_slot_hypotheses(
         f"[ARC-PHASE-1] Generate start: max_out={hyp_max_tokens}/slot | thinking={hyp_thinking} | "
         f"prompt~{avg_prompt_tok}tok/slot ({total_prompt_tok} in total) | "
         f"greedy={ARC_FAST_INFERENCE and ARC_GENERATION_TEMPERATURE == 0.0} — "
-        f"first slot may take 30-120s on L4; vLLM tqdm stays 0/{k} until one slot finishes"
+        f"first slot may take 30-120s on L4"
     )
     t_gen = time.perf_counter()
     outs = _arc_phase1_generate_slots(
@@ -4413,8 +4789,8 @@ def collect_spatial_grid_hypotheses(
     if not fitted:
         need_ctx = int(math.ceil(max_needed / 256.0) * 256)
         raise ValueError(
-            f"ARC spatial grid needs {max_needed} tokens but vLLM "
-            f"max_model_len={engine_ctx}. Set VLLM_MAX_MODEL_LEN={need_ctx} "
+            f"ARC spatial grid needs {max_needed} tokens but engine "
+            f"max_model_len={engine_ctx}. Set HF_MAX_MODEL_LEN={need_ctx} "
             f"or raise DIFFUSION_MAX_MODEL_LEN."
         )
     if shrink_note:
@@ -4643,7 +5019,7 @@ def arc_mbr_hypothesis_pipeline(
         stream_log(
             f"[MBR-WARN] output budget wants {final_max_tokens} tok for final grid "
             f"but engine_ctx={engine_ctx} with prompt={final_in}tok only allows "
-            f"{ctx_allows}tok output. Increase VLLM_MAX_MODEL_LEN (auto={arc_vllm_context_budget()})."
+            f"{ctx_allows}tok output. Increase HF_MAX_MODEL_LEN (auto={arc_context_budget()})."
         )
         final_max_tokens = ctx_allows
 
@@ -4722,7 +5098,7 @@ def arc_direct_generate(
             f"guided={getattr(sp, 'arc_guided_json', False)}, "
             f"prompt_tokens={prompt_tokens})"
         )
-    out = _vllm_generate_arc(vllm_llm, [prompt], [sp])[0]
+    out = _engine_generate_arc(vllm_llm, [prompt], [sp])[0]
     gen_ids: List[int] = []
     if out.outputs:
         gen_ids = list(out.outputs[0].token_ids)
@@ -5490,19 +5866,41 @@ def print_arc_gradeboard(per_task: List[Dict[str, Any]], split: str) -> None:
 
 
 
+_BANNER_PRINTED = False
+
+
+def print_one_million_brains_banner(force: bool = False) -> None:
+    """Print the canonical startup banner (README / Kaggle log sanity check)."""
+    global _BANNER_PRINTED
+    if _BANNER_PRINTED and not force:
+        return
+    _BANNER_PRINTED = True
+    print("\n" + "=" * 72)
+    print("ONE-MILLION-BRAINS-DIFFUSIONGEMMA INITIALIZED")
+    print("=" * 72)
+    print(f"  SCRIPT_VERSION : {SCRIPT_VERSION}")
+    print(f"  INFERENCE      : {INFERENCE_BACKEND} (DiffusionGemma block-diffusion)")
+    print(
+        f"  CANVAS         : {DIFFUSION_CANVAS_LENGTH} tokens | "
+        f"denoise_k={K} | entropy_bound={DIFFUSION_ENTROPY_BOUND}"
+    )
+    print(
+        f"  ARC            : hyp_slots={ARC_HYPOTHESIS_SLOTS} | "
+        f"spatial_ensemble={ARC_SPATIAL_GRID_ENSEMBLE} | "
+        f"phase1_parallel={ARC_PHASE1_PROMPT_PARALLELISM}"
+    )
+    print("=" * 72 + "\n")
+
+
 def print_post_load_arc_config() -> None:
     """Short cheat-sheet printed right after model load (before ARC eval banner)."""
     hyp_n = arc_hypothesis_k()
     print("\n" + "-" * 72)
     print("RUNTIME ARC CONFIG — QUICK REFERENCE")
     print("-" * 72)
-    print("  Engine       : single DiffusionGemma vLLM")
+    print(f"  Engine       : single DiffusionGemma HF ({INFERENCE_BACKEND})")
     print(f"  Per test     : Phase1:{hyp_n} props -> Phase2:1 grid (pixel vote if spatial ensemble)")
     print(f"  BENCHMARK_K  : {K} (demo benchmark only — NOT used in ARC Phase 1/2)")
-    print(
-        f"  vLLM hints   : Phase1 shows 'Rendering prompts: {hyp_n}/{hyp_n}' | "
-        f"Phase2 shows 'Rendering prompts: 1/1'"
-    )
     print("-" * 72 + "\n")
 
 def print_arc_pipeline_architecture(
@@ -5512,9 +5910,9 @@ def print_arc_pipeline_architecture(
     """One-screen map of ARC eval logging."""
     hyp_n = arc_hypothesis_k()
     phase1_mode = (
-        "1 slot/vLLM call (parallelism off)"
+        "1 slot/generate() call (parallelism off)"
         if not ARC_PHASE1_PROMPT_PARALLELISM
-        else f"up to {ARC_VLLM_MAX_NUM_SEQS} slots/vLLM call"
+        else f"up to {ARC_HF_MAX_NUM_SEQS} slots/generate() call"
     )
     print("\n" + "=" * 80)
     print("ARC PIPELINE — HOW TO READ THE LOGS")
@@ -5533,14 +5931,12 @@ def print_arc_pipeline_architecture(
         )
         phase2_line = (
             "    [ARC-PHASE-2]  Final grid       -> 1 JSON grid synthesis\n"
-            "                   vLLM shows: Rendering prompts: 1/1\n"
         )
     print(
         "  Single engine runs TWO phases per test case:\n"
         f"{phase1_line}"
-        f"                   vLLM shows: Rendering prompts: {hyp_n}/{hyp_n}  (= hypothesis slot count)\n"
         f"{phase2_line}"
-        "  Note: Phase-1 can look idle at 'Processed 0/N' until the first slot fully completes."
+        "  Note: Phase-1 may take 30-120s per slot on L4 before the first result appears."
     )
     print("")
     print(
@@ -5602,10 +5998,9 @@ def evaluate_arc_dataset(
         f"step matrices: {ARC_PRINT_STEP_MATRICES} | final matrices: {ARC_PRINT_FINAL_MATRICES}"
     )
     print(
-        f"Fast inference: {ARC_FAST_INFERENCE} | try vLLM: {ARC_TRY_VLLM} | "
+        f"Fast inference: {ARC_FAST_INFERENCE} | backend: {INFERENCE_BACKEND} | "
         f"max_prompt_tok: {ARC_MAX_PROMPT_TOKENS} | "
-        f"vllm_ctx_budget: {arc_vllm_context_budget()} | "
-        f"engine pref: {'vLLM' if ARC_TRY_VLLM and not PREFER_HF_INFERENCE else 'HF'}"
+        f"ctx_budget: {arc_context_budget()}"
     )
     if EVAL_SMOKE_TASK_ID:
         print(f"Smoke task only: {EVAL_SMOKE_TASK_ID}")
@@ -5961,7 +6356,7 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 # BENCHMARK HARNESS
 # =============================================================================
 def benchmark(
-    vllm_llm: LLM,
+    vllm_llm: Any,
     tokenizer: Any,
     prompt: str,
     max_new: int = TARGET_MAX_TOKENS,

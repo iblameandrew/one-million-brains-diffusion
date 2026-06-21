@@ -16,8 +16,13 @@ SOURCE = SCRIPT.read_text(encoding="utf-8")
 
 
 class TestSourceStructure(unittest.TestCase):
-    def test_version_is_diffusion_d(self):
-        self.assertIn('SCRIPT_VERSION = "2026-06-19-diffusion-d"', SOURCE)
+    def test_version_is_diffusion_d_hf(self):
+        self.assertIn('SCRIPT_VERSION = "2026-06-19-diffusion-d-hf"', SOURCE)
+
+    def test_inference_backend_is_hf_only(self):
+        self.assertIn('INFERENCE_BACKEND = "hf"', SOURCE)
+        self.assertNotIn("from vllm import", SOURCE)
+        self.assertNotIn("ARC_TRY_VLLM", SOURCE)
 
     def test_single_engine_arc_no_voter_pool(self):
         self.assertNotIn("ARC_MULTI_AGENT_REQUIRED", SOURCE)
@@ -28,11 +33,16 @@ class TestSourceStructure(unittest.TestCase):
     def test_hypothesis_thinking_disabled(self):
         self.assertIn("ARC_HYPOTHESIS_ENABLE_THINKING = False", SOURCE)
 
-    def test_phase1_uses_use_tqdm_false(self):
-        self.assertIn("outs = vllm_llm.generate(prompts, sp_list, use_tqdm=False)", SOURCE)
+    def test_phase1_uses_engine_generate(self):
+        self.assertIn("_engine_generate_arc(", SOURCE)
 
-    def test_phase2_uses_use_tqdm_false(self):
-        self.assertIn("out = vllm_llm.generate([prompt], sp, use_tqdm=False)[0]", SOURCE)
+    def test_spatial_ensemble_default(self):
+        self.assertIn("ARC_SPATIAL_GRID_ENSEMBLE = True", SOURCE)
+        self.assertIn("pixel_wise_majority_vote_grids(", SOURCE)
+        self.assertIn("arc_spatial_grid_ensemble_pipeline(", SOURCE)
+
+    def test_legacy_text_phase2_still_has_engine_generate(self):
+        self.assertIn("out = _engine_generate_arc(vllm_llm, [prompt], [sp])[0]", SOURCE)
 
     def test_phase1_timing_logs(self):
         self.assertIn("[ARC-PHASE-1] Generate start:", SOURCE)
@@ -104,32 +114,14 @@ class TestCollectFeatureSlotHypothesesMock(unittest.TestCase):
         import importlib.util
         import types
 
-        # Windows / CPU envs often lack vllm._C — stub vllm before loading the script.
-        class _FakeSamplingParams:
-            def __init__(self, **kwargs):
-                for key, val in kwargs.items():
-                    setattr(self, key, val)
-
-        fake_vllm = types.ModuleType("vllm")
-        fake_vllm.LLM = MagicMock
-        fake_vllm.SamplingParams = _FakeSamplingParams
-        fake_sp_mod = types.ModuleType("vllm.sampling_params")
-        fake_sp_mod.SamplingParams = _FakeSamplingParams
-
         buf = io.StringIO()
         spec = importlib.util.spec_from_file_location("mbr_test", SCRIPT)
         mod = importlib.util.module_from_spec(spec)
-        with patch.dict(
-            sys.modules,
-            {
-                "vllm": fake_vllm,
-                "vllm.sampling_params": fake_sp_mod,
-            },
-        ), patch("sys.stdout", buf), patch("sys.stderr", buf):
+        with patch("sys.stdout", buf), patch("sys.stderr", buf):
             spec.loader.exec_module(mod)
         return mod
 
-    def test_collect_calls_generate_with_use_tqdm_false(self):
+    def test_collect_calls_engine_generate(self):
         try:
             mbr = self._import_module_quiet()
         except Exception as exc:
@@ -141,11 +133,13 @@ class TestCollectFeatureSlotHypothesesMock(unittest.TestCase):
             def __init__(self, n: int):
                 self.outputs = [MagicMock(token_ids=list(range(10)))]
 
-        def fake_generate(prompts, sp_list, use_tqdm=True):
-            captured["use_tqdm"] = use_tqdm
-            captured["n_prompts"] = len(prompts)
-            captured["max_tokens"] = [sp.max_tokens for sp in sp_list]
-            captured["temps"] = [sp.temperature for sp in sp_list]
+        def fake_generate(prompts, sp_list):
+            captured.setdefault("n_prompts", 0)
+            captured["n_prompts"] += len(prompts)
+            captured.setdefault("max_tokens", [])
+            captured.setdefault("temps", [])
+            captured["max_tokens"].extend(sp.max_tokens for sp in sp_list)
+            captured["temps"].extend(sp.temperature for sp in sp_list)
             return [FakeOut(i) for i in range(len(prompts))]
 
         llm = MagicMock()
@@ -188,8 +182,7 @@ class TestCollectFeatureSlotHypothesesMock(unittest.TestCase):
                 verbose=False,
             )
 
-        self.assertFalse(captured.get("use_tqdm", True))
-        self.assertEqual(captured.get("n_prompts"), 8)
+        self.assertEqual(captured.get("n_prompts"), 8)  # sequential=1 slot per generate()
         self.assertEqual(len(hyps), 8)
         self.assertTrue(all(t == 0.0 for t in captured.get("temps", [])))
         self.assertTrue(all(mt == 875 for mt in captured.get("max_tokens", [])))
