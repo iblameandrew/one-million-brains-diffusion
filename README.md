@@ -4,7 +4,7 @@
 
 **Permutation-Gated Feature-Slot Diffusion** on DiffusionGemma — HuggingFace block-diffusion with a Million-Brains orchestration layer (prompt + sampling conditioning, not draft-model speculative decoding).
 
-Single Kaggle script: `tfbd.py` (legacy filename; technique is Million-Brains, not TFBD). `SCRIPT_VERSION = 2026-06-21-diffusion-d-hf`. HuggingFace-only (`DiffusionGemmaForBlockDiffusion`); no vLLM.
+Single Kaggle script: `million_brains_dflash.py`. `SCRIPT_VERSION = 2026-06-21-diffusion-d-hf`. HuggingFace-only (`DiffusionGemmaForBlockDiffusion`); no vLLM.
 
 ## What it is
 
@@ -66,8 +66,8 @@ At each denoise super-block (`DIFFUSION_DENOISE_CHUNK = 6` tokens):
 
 | Path | Purpose |
 |------|---------|
-| `tfbd.py` | Main entry (load, verify, ARC eval, benchmark, CLI) |
-| `million_brains_dflash.py` | Deprecated shim → delegates to `tfbd.py` |
+| `million_brains_dflash.py` | Main entry (load, verify, ARC eval, benchmark, CLI) |
+| `tfbd.py` | Backward-compatible alias → runs `million_brains_dflash.py` |
 | `agent-tools/verify_arc_phase1.py` | CPU-only structure / budget tests |
 | `agent-tools/test_pixel_vote.py` | Pixel vote unit tests |
 
@@ -95,12 +95,12 @@ No bitsandbytes. Loading uses an explicit per-layer `device_map` across your GPU
 ### 3. Run
 
 ```python
-!python tfbd.py --arc-profile auto --arc-split evaluation
+!python million_brains_dflash.py --arc-profile auto --arc-split evaluation
 ```
 
 Expected banner: `ONE-MILLION-BRAINS-DIFFUSIONGEMMA INITIALIZED`.
 
-Benchmark only: `!python tfbd.py --demo-only`
+Benchmark only: `!python million_brains_dflash.py --demo-only`
 
 ### 4. Hardware
 
@@ -109,7 +109,7 @@ Benchmark only: `!python tfbd.py --demo-only`
 
 ## Configuration
 
-All toggles live in the `TOGGLES` block at the top of `tfbd.py`:
+All toggles live in the `TOGGLES` block at the top of `million_brains_dflash.py`:
 
 - `ENABLE_TFBD` — `False` by default; set `True` only for experimental fiber-bundle path (not the documented technique)
 - `ALLOCATOR_MODE` — `"permutation"` by default (`"fiber"` / `"hybrid"` are TFBD experimental)

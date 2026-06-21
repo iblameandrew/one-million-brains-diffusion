@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "tfbd.py"
+SCRIPT = ROOT / "million_brains_dflash.py"
 SOURCE = SCRIPT.read_text(encoding="utf-8")
 
 
