@@ -9,17 +9,19 @@ Architecture (Riemannian base ↔ discrete fiber bundle):
   4. CohomologicalStitcher — K-trajectory sheaf stitch + homology PRM proxy (Betti / χ)
   5. TFBD_Orchestrator — HuggingFace DiffusionGemmaForBlockDiffusion wrapper + KV bias
 
-Kaggle: attach Models input google/diffusiongemma, run as script or notebook cell.
+Kaggle (offline competition):
+  Cell 1 — offline transformers wheels (no Internet):
+    !pip install --force-reinstall --no-index \
+        --find-links=/kaggle/input/notebooks/godelcomplete/vllm-gemma/transformers_latest_wheels/ \
+        transformers==5.12.1
+  Cell 2 — this script. Attach google/diffusiongemma + arc competition inputs.
 Backend: HuggingFace DiffusionGemmaForBlockDiffusion only (no vLLM).
-
-Kaggle cell 1 (run once, then Restart Kernel):
-    !pip install -U "transformers>=5.12.1" "huggingface_hub>=1.5.0,<2.0" accelerate torch
 """
 
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-20-tfbd-h"  # TFBD fiber modules sync to HF model CUDA device
+SCRIPT_VERSION = "2026-06-20-tfbd-u"  # TFBD startup banner (replaces One-Million-Brains)
 HF_FAST_VERIFY = True  # stub tail logprobs on diffusion verify passes (no causal forward)
 HF_TORCH_DTYPE = "bfloat16"  # official recipe; use "float16" if bf16 unsupported
 # --- DiffusionGemma core (default engine) ---
@@ -34,7 +36,8 @@ DIFFUSION_CANVAS_LENGTH = 256  # block-diffusion canvas length
 DIFFUSION_MAX_NUM_SEQS = 4  # max parallel sequences for batched HF generate
 DIFFUSION_ENTROPY_BOUND = 0.1  # entropy-bound denoising sampler
 DIFFUSION_GPU_UTIL = 0.85  # headroom for denoising activations on H100/A100/L4
-DIFFUSION_MAX_MODEL_LEN = 8192  # ARC + chat; raise on A100 if VRAM allows
+DIFFUSION_MAX_MODEL_LEN = 8192  # floor; resolve_diffusion_max_model_len() auto-raises on 4x22GB
+ARC_LARGE_GRID_CELLS = 400  # 20x20+ triggers dense prompts + batch=1 + chunked gen
 DIFFUSION_DENOISE_CHUNK = 6  # tokens committed per denoise step (= legacy BLOCK_SIZE)
 K = 4  # Million-Brains parallel trajectories per denoise step (not ARC hypothesis count)
 ARC_HYPOTHESIS_SLOTS = 8  # ARC eval: batched hypothesis proposals per engine
@@ -85,6 +88,8 @@ TFBD_KV_HEAD_DIM = 128  # attention head width for fiber bias matrices
 TFBD_KV_NUM_HEADS = 8
 TFBD_KV_NUM_LAYERS = 32
 TFBD_PRIMITIVE_BANK_SEED = 42
+TFBD_KEEP_ON_CPU = True  # Kaggle 4x22GB: model fills GPUs; TFBD stays on CPU
+TFBD_GPU_MIN_FREE_GIB = 1.5  # only place TFBD on GPU if a card has this much free
 ALLOCATOR_MODE = "fiber"  # "permutation" | "fiber" | "hybrid" (fiber = TFBD primitive pick)
 TFBD_DOPPLER_TEMPERATURE = 1.0  # softmax over symmetry-group resonance scores
 TFBD_DOPPLER_RERANK_MARGIN = 0.15  # hybrid: swap slot when fiber score disagrees
@@ -103,11 +108,16 @@ SONAR_DEEP_STEP_THRESHOLD = 12
 PREFER_LOCAL_MODELS = True  # try /kaggle/input + /kaggle/working before any HuggingFace request
 # Local model path override (optional; DiffusionGemma resolved via KAGGLE_DIFFUSIONGEMMA_DIR)
 LOCAL_MODEL_PATH = KAGGLE_DIFFUSIONGEMMA_DIR
-TRANSFORMERS_MIN_VERSION = "5.11.0"  # diffusion_gemma architecture in transformers
-HUGGINGFACE_HUB_MIN_VERSION = "1.5.0"  # transformers 5.12+ needs hub>=1.5 for @strict configs
-AUTO_UPGRADE_TRANSFORMERS_ON_KAGGLE = True  # pip upgrade when Internet ON and version too old
-
-AUTO_PREFETCH_TO_WORKING = True  # when online, try to cache DiffusionGemma into /kaggle/working
+TRANSFORMERS_MIN_VERSION = "5.11.0"
+HUGGINGFACE_HUB_MIN_VERSION = "1.5.0"
+KAGGLE_OFFLINE_COMPETITION = True  # ARC Prize: Internet OFF — use /kaggle/input wheel bundle
+KAGGLE_OFFLINE_TRANSFORMERS_WHEEL_DIR = (
+    "/kaggle/input/notebooks/godelcomplete/vllm-gemma/transformers_latest_wheels"
+)
+OFFLINE_TRANSFORMERS_WHEEL_VERSION = "5.12.1"
+AUTO_INSTALL_OFFLINE_TRANSFORMERS_WHEELS = False  # keep False: use your deps cell; tfbd only checks
+AUTO_UPGRADE_TRANSFORMERS_ON_KAGGLE = False  # never pip from PyPI on Kaggle
+AUTO_PREFETCH_TO_WORKING = False
 PREFETCH_MODEL_ID = DIFFUSIONGEMMA_MODEL_PRIMARY
 KAGGLEHUB_MODEL_HANDLE = ""  # set if you publish DiffusionGemma on Kaggle Models
 KAGGLE_DATASET_HANDLE = ""  # optional dataset fallback on Kaggle
@@ -138,7 +148,7 @@ LOCAL_ARC_DATA_DIR = "data"
 EVAL_CHALLENGES_PATH = None
 EVAL_SOLUTIONS_PATH = None
 EVAL_MAX_TASKS = None  # cap tasks for smoke tests; None = all tasks in challenges file
-EVAL_MAX_NEW_TOKENS = 512  # per-task generation budget for ARC eval
+EVAL_MAX_NEW_TOKENS = 1024  # per-task generation budget for ARC eval (2x)
 ARC_VISUAL_GRADING = True  # print + display a grade card for every test case
 ARC_PRINT_ALL_ANSWERS = True  # print every prediction vs ground-truth JSON for every test case
 # Real-time streaming — prints every token and all model/MBR activity as it happens
@@ -160,15 +170,16 @@ ARC_FAST_INFERENCE = True  # ARC eval: compact prompts, batched gen, no per-toke
 # ARC context budget is DIFFUSION_MAX_MODEL_LEN; raise on A100 if 30x30 tasks truncate.
 ARC_MAX_PROMPT_TOKENS = 6144  # tighter input budget; resolver shrinks further; lowers KV bandwidth on decode
 ARC_SLOT_HYPOTHESIS_MODE = True  # ARC eval uses slot pipeline (spatial grids when ARC_SPATIAL_GRID_ENSEMBLE)
-ARC_MBR_OUTPUT_TOKEN_BUDGET = 14000  # total OUTPUT tokens per test (hyp slots + final grid combined)
-ARC_FINAL_GRID_MIN_TOKENS = 512  # floor for final JSON grid pass
+ARC_OUTPUT_TOKEN_MULTIPLIER = 2  # scale all per-test generation caps (~2x wall time per problem)
+ARC_MBR_OUTPUT_TOKEN_BUDGET = 14000 * ARC_OUTPUT_TOKEN_MULTIPLIER  # total OUTPUT tok/test
+ARC_FINAL_GRID_MIN_TOKENS = 512 * ARC_OUTPUT_TOKEN_MULTIPLIER  # floor for final JSON grid pass
 ARC_FINAL_GRID_MAX_FRACTION = 0.85  # final may use up to 85% of output budget for large grids
 ARC_FINAL_GRID_MIN_FRACTION = 0.50  # always reserve 50% of output budget for final grid synthesis
 ARC_HYPOTHESIS_MAX_TOKENS = ARC_MBR_OUTPUT_TOKEN_BUDGET * 3 // 4 // 8  # legacy default; task-aware below
 ARC_FINAL_GRID_MAX_TOKENS = ARC_MBR_OUTPUT_TOKEN_BUDGET // 4  # legacy default; task-aware below
 ARC_FINAL_HYP_CHAR_CAPS = (360, 200, 120, 60, 0)  # shrink hypothesis text in final prompt if needed
 ARC_HYPOTHESIS_ENABLE_THINKING = True  # text-hypothesis path: reason in </think> before prose rules
-ARC_HYPOTHESIS_THINKING_TOKEN_CAP = 512  # target reasoning reserve within each slot's generation budget
+ARC_HYPOTHESIS_THINKING_TOKEN_CAP = 512 * ARC_OUTPUT_TOKEN_MULTIPLIER  # reasoning reserve per slot
 ARC_SPATIAL_ENABLE_THINKING = False  # spatial slots emit JSON only (DiffusionGemma has no Qwen thinking)
 ARC_FINAL_ENABLE_THINKING = False  # final grid: [[ prefill + greedy JSON (much faster than thinking pass)
 ARC_PHASE1_PROMPT_PARALLELISM = True  # batch K slots per HF generate() call
@@ -207,6 +218,7 @@ import logging
 def _suppress_noisy_third_party_logs() -> None:
     """Kaggle notebooks spam transformers deprecation lines every worker spawn."""
     os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     warnings.filterwarnings(
         "ignore",
@@ -273,25 +285,125 @@ def _diffusion_gemma_in_mapping_names() -> bool:
         return False
 
 
+def _kaggle_offline_mode() -> bool:
+    return bool(KAGGLE_OFFLINE_COMPETITION and os.path.isdir("/kaggle/working"))
+
+
+def _discover_offline_transformers_wheel_dir() -> Optional[str]:
+    """Find offline transformers wheel folder under /kaggle/input."""
+    if KAGGLE_OFFLINE_TRANSFORMERS_WHEEL_DIR and os.path.isdir(
+        KAGGLE_OFFLINE_TRANSFORMERS_WHEEL_DIR
+    ):
+        return KAGGLE_OFFLINE_TRANSFORMERS_WHEEL_DIR
+    if not os.path.isdir("/kaggle/input"):
+        return None
+    try:
+        for root, dirs, _files in os.walk("/kaggle/input"):
+            if "transformers_latest_wheels" in dirs:
+                candidate = os.path.join(root, "transformers_latest_wheels")
+                if any(
+                    name.startswith("transformers-") and name.endswith(".whl")
+                    for name in os.listdir(candidate)
+                ):
+                    return candidate
+    except OSError:
+        pass
+    return None
+
+
+def _offline_transformers_wheel_pip_cmd(wheel_dir: str) -> str:
+    return (
+        f"!pip install --force-reinstall --no-index "
+        f"--find-links={wheel_dir}/ transformers=={OFFLINE_TRANSFORMERS_WHEEL_VERSION}"
+    )
+
+
+def _install_offline_transformers_wheels(wheel_dir: str) -> None:
+    print(
+        f"[DEPS] offline wheel install from {wheel_dir} "
+        f"(transformers=={OFFLINE_TRANSFORMERS_WHEEL_VERSION})...",
+        flush=True,
+    )
+    subprocess.check_call(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            "--force-reinstall",
+            "--no-index",
+            f"--find-links={wheel_dir}",
+            f"transformers=={OFFLINE_TRANSFORMERS_WHEEL_VERSION}",
+        ]
+    )
+
+
+def _ensure_offline_transformers_wheels() -> bool:
+    """
+    Install transformers from /kaggle/input wheel bundle when kernel still has 5.0.0.
+    Returns True if package metadata now reports a sufficient version.
+    """
+    tfm_ver = _package_version("transformers")
+    if _version_at_least(tfm_ver, TRANSFORMERS_MIN_VERSION):
+        return True
+    if not _kaggle_offline_mode() or not AUTO_INSTALL_OFFLINE_TRANSFORMERS_WHEELS:
+        return False
+    wheel_dir = _discover_offline_transformers_wheel_dir()
+    if not wheel_dir:
+        return False
+    try:
+        _install_offline_transformers_wheels(wheel_dir)
+    except Exception as exc:
+        print(
+            f"[DEPS] [WARN] offline wheel install failed ({type(exc).__name__}: {exc})"
+        )
+        return False
+    return _version_at_least(_package_version("transformers"), TRANSFORMERS_MIN_VERSION)
+
+
 def _diffusiongemma_runtime_help(*, extra: Optional[str] = None) -> str:
     tfm_ver = _package_version("transformers")
     torch_ver = _package_version("torch")
-    msg = (
-        f"DiffusionGemma HF backend needs transformers>={TRANSFORMERS_MIN_VERSION} "
-        f"with diffusion_gemma support (have transformers={tfm_ver}, torch={torch_ver}).\n"
-        "  1. Notebook Settings -> Internet ON.\n"
-        "  2. Run in the first cell, then Restart Kernel:\n"
-        f"       !pip install -U \"transformers>=5.12.1\" "
-        "\"huggingface_hub>=1.5.0,<2.0\" accelerate torch\n"
-        "  3. Re-run this script.\n"
-        "  GPU: A100 80GB recommended for 26B block-diffusion."
-    )
+    wheel_dir = _discover_offline_transformers_wheel_dir()
+    if _kaggle_offline_mode():
+        msg = (
+            f"Offline Kaggle mode (transformers={tfm_ver}, torch={torch_ver}).\n"
+            "  Run your offline deps cell FIRST (before this script), then re-run:\n"
+        )
+        if wheel_dir:
+            msg += f"    {_offline_transformers_wheel_pip_cmd(wheel_dir)}\n"
+        else:
+            msg += (
+                "    !pip install --force-reinstall --no-index "
+                f"--find-links=<transformers_latest_wheels>/ "
+                f"transformers=={OFFLINE_TRANSFORMERS_WHEEL_VERSION}\n"
+            )
+        msg += (
+            "  Attach Models input: google/diffusiongemma -> diffusiongemma-26b-a4b-it/1"
+        )
+    else:
+        msg = (
+            f"DiffusionGemma HF backend needs transformers>={TRANSFORMERS_MIN_VERSION} "
+            f"(have transformers={tfm_ver}, torch={torch_ver}).\n"
+            "  pip install -U \"transformers>=5.12.1\" "
+            "\"huggingface_hub>=1.5.0,<2.0\" accelerate torch"
+        )
     if extra:
         msg += f"\nDetail: {extra}"
     return msg
 
 
 def _install_hf_diffusiongemma_deps() -> None:
+    if _kaggle_offline_mode():
+        wheel_dir = _discover_offline_transformers_wheel_dir()
+        if wheel_dir:
+            _install_offline_transformers_wheels(wheel_dir)
+            return
+        raise RuntimeError(
+            "[DEPS] Offline mode: no transformers_latest_wheels found under /kaggle/input.\n"
+            + _diffusiongemma_runtime_help()
+        )
     print(
         f"[DEPS] pip installing transformers>={TRANSFORMERS_MIN_VERSION}, accelerate, torch ..."
     )
@@ -669,9 +781,7 @@ class TopologicalFiberEmbedding(nn.Module):
             z = torch.zeros(1, self.fiber_dim)
             return z.to(device) if device else z
         rows, cols = len(grid), len(grid[0])
-        dev = device or self.value_emb.weight.device
-        if device is not None and self.value_emb.weight.device != device:
-            self.to(device)
+        dev = self.value_emb.weight.device
         flat_vals: List[int] = []
         flat_rows: List[int] = []
         flat_cols: List[int] = []
@@ -696,7 +806,10 @@ class TopologicalFiberEmbedding(nn.Module):
             ],
             dim=-1,
         )
-        return self.out_proj(e)
+        out = self.out_proj(e)
+        if device is not None and device != dev:
+            return out.to(device, non_blocking=True)
+        return out
 
 
 class CosmosSparsifier(nn.Module):
@@ -1051,7 +1164,8 @@ class TFBD_Orchestrator(nn.Module):
             internal_dim=fiber_dim, num_features=NUM_PERSONALITY_FEATURES, k=k
         )
 
-    def _resolve_engine_device(self, engine: Optional[Any] = None) -> torch.device:
+    def _resolve_model_input_device(self, engine: Optional[Any] = None) -> torch.device:
+        """Embed / input_ids device for DiffusionGemma generate (often cuda:1)."""
         model = self.model
         if model is None and engine is not None:
             model = getattr(engine, "model", None)
@@ -1066,13 +1180,35 @@ class TFBD_Orchestrator(nn.Module):
             for param in model.parameters():
                 if param.device.type != "meta":
                     return param.device
+        if engine is not None:
+            eng_dev = getattr(engine, "device", None)
+            if eng_dev is not None and getattr(eng_dev, "type", "") != "meta":
+                return torch.device(eng_dev)
         if torch.cuda.is_available():
             return torch.device("cuda:0")
         return torch.device("cpu")
 
+    def _resolve_engine_device(self, engine: Optional[Any] = None) -> torch.device:
+        """TFBD compute device — CPU by default so we do not OOM the embed GPU."""
+        return self._resolve_tfbd_device(engine)
+
+    def _resolve_tfbd_device(self, engine: Optional[Any] = None) -> torch.device:
+        if TFBD_KEEP_ON_CPU or not torch.cuda.is_available():
+            return torch.device("cpu")
+        best_i = 0
+        best_free = -1.0
+        for i in range(torch.cuda.device_count()):
+            snap = _cuda_vram_snapshot(i)
+            if float(snap["free_gib"]) > best_free:
+                best_free = float(snap["free_gib"])
+                best_i = i
+        if best_free < float(TFBD_GPU_MIN_FREE_GIB):
+            return torch.device("cpu")
+        return torch.device(f"cuda:{best_i}")
+
     def sync_modules_to_model_device(self, engine: Optional[Any] = None) -> torch.device:
-        """Move TFBD fiber/allocator weights off CPU onto the DiffusionGemma input device."""
-        device = self._resolve_engine_device(engine)
+        """Place TFBD aux modules on CPU (or the least-loaded GPU if headroom exists)."""
+        device = self._resolve_tfbd_device(engine)
         if next(self.fiber_embed.parameters()).device != device:
             self.to(device)
         return device
@@ -1088,15 +1224,24 @@ class TFBD_Orchestrator(nn.Module):
         KV-cache / attention spatial bias from fiber coordinates.
         B[i,j] ~ <fiber_i, fiber_j> restricted to seq_len (Morse-Smale locality).
         """
-        device = self._resolve_engine_device(engine)
         self.sync_modules_to_model_device(engine)
-        nodes = self.fiber_embed(grid, device=device)
+        nodes = self.fiber_embed(grid)
         n = min(seq_len, nodes.shape[0])
         if n < 1:
             return torch.zeros(1, 1)
         patch = nodes[:n]
         bias = patch @ patch.T
         return bias * TFBD_KV_BIAS_SCALE
+
+    def _model_needs_input_ids_for_generate(self) -> bool:
+        """DiffusionGemma HF generate() dereferences input_ids.shape — no embeds-only path."""
+        model = self.model
+        if model is None:
+            return False
+        cfg = getattr(model, "config", None)
+        if cfg is not None and getattr(cfg, "model_type", "") == "diffusion_gemma":
+            return True
+        return "DiffusionGemma" in type(model).__name__
 
     def inject_fiber_into_inputs(
         self,
@@ -1105,6 +1250,8 @@ class TFBD_Orchestrator(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Add fiber embeddings to token inputs (training-free residual injection)."""
         if grid is None or "input_ids" not in inputs:
+            return inputs
+        if self._model_needs_input_ids_for_generate():
             return inputs
         ids = inputs["input_ids"]
         emb_layer = None
@@ -1119,9 +1266,11 @@ class TFBD_Orchestrator(nn.Module):
         with torch.no_grad():
             tok_emb = emb_layer(ids)
             self.sync_modules_to_model_device()
-            fiber_nodes = self.fiber_embed(grid, device=tok_emb.device)
+            fiber_nodes = self.fiber_embed(grid)
             if fiber_nodes.shape[0] > 0:
-                fiber_mean = fiber_nodes.mean(dim=0)
+                fiber_mean = fiber_nodes.mean(dim=0).to(
+                    tok_emb.device, non_blocking=True
+                )
                 d = min(tok_emb.shape[-1], fiber_mean.shape[0])
                 tok_emb[..., :d] = tok_emb[..., :d] + 0.05 * fiber_mean[:d]
             inputs = dict(inputs)
@@ -1156,14 +1305,28 @@ class TFBD_Orchestrator(nn.Module):
         if hasattr(engine, "_encode") and self.model is not None and context_grid:
             inputs = engine._encode(prompt)
             inputs = self.inject_fiber_into_inputs(inputs, context_grid)
-            new_ids, step_lps = engine._generate_new_ids(
-                inputs,
-                max_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=1.0,
-                stream_label=stream_label,
-                stream=STREAM_GENERATION and not ARC_FAST_INFERENCE,
-            )
+            do_stream = STREAM_GENERATION and not ARC_FAST_INFERENCE
+            if hasattr(engine, "_hf_should_chunk_generate") and engine._hf_should_chunk_generate(
+                max_new_tokens, prompt
+            ):
+                new_ids, step_lps = engine._generate_new_ids_chunked(
+                    inputs,
+                    max_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=1.0,
+                    stream_label=stream_label,
+                    stream=do_stream,
+                    stop_on_grid=True,
+                )
+            else:
+                new_ids, step_lps = engine._generate_new_ids(
+                    inputs,
+                    max_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=1.0,
+                    stream_label=stream_label,
+                    stream=do_stream,
+                )
             text = engine._decode_ids(new_ids)
             conf = self.denoiser.token_confidence([-0.7] * len(new_ids))
             locked, remasked = self.denoiser.partial_remask_indices(conf, step=0)
@@ -1250,7 +1413,10 @@ class TFBD_Orchestrator(nn.Module):
         self.model = model
         self.processor = processor
         self.tokenizer = getattr(processor, "tokenizer", processor)
-        self.sync_modules_to_model_device()
+        tfbd_dev = self.sync_modules_to_model_device()
+        print(
+            f"[TFBD] aux_modules={tfbd_dev} | model_input={self._resolve_model_input_device()}"
+        )
 
 
 # Back-compat aliases (deprecated)
@@ -2026,6 +2192,8 @@ def _arc_engine_max_num_seqs() -> int:
 
 def check_diffusiongemma_runtime_deps(*, model_path: Optional[str] = None) -> None:
     """Warn-only gate — never imports DiffusionGemma modules (importing them can crash)."""
+    if _kaggle_offline_mode():
+        _ensure_offline_transformers_wheels()
     torch_ver = _package_version("torch")
     tfm_ver = _package_version("transformers")
     hub_ver = _package_version("huggingface_hub")
@@ -2035,34 +2203,44 @@ def check_diffusiongemma_runtime_deps(*, model_path: Optional[str] = None) -> No
     )
     tfm_ok = _version_at_least(tfm_ver, TRANSFORMERS_MIN_VERSION)
     hub_ok = _version_at_least(hub_ver, HUGGINGFACE_HUB_MIN_VERSION)
+    offline = _kaggle_offline_mode()
+    wheel_dir = _discover_offline_transformers_wheel_dir()
     print(
-        f"[DEPS] backend=hf | torch={torch_ver} | transformers={tfm_ver} | "
-        f"hub={hub_ver} | mapping={in_mapping}"
+        f"[DEPS] backend=hf | offline={offline} | torch={torch_ver} | "
+        f"transformers={tfm_ver} | hub={hub_ver} | mapping={in_mapping}"
+        + (f" | wheels={wheel_dir}" if wheel_dir else "")
         + (" | checkpoint=diffusion_gemma" if ckpt_ok else "")
     )
     if not tfm_ok:
-        on_kaggle = os.path.isdir("/kaggle/input")
-        if AUTO_UPGRADE_TRANSFORMERS_ON_KAGGLE and on_kaggle and _pypi_reachable():
-            _install_hf_diffusiongemma_deps()
-            print(
-                f"[DEPS] pip finished — transformers={_package_version('transformers')}, "
-                f"hub={_package_version('huggingface_hub')}"
-            )
+        if offline and wheel_dir:
             raise RuntimeError(
-                "[DEPS] Pip upgrade complete — restart the Kaggle kernel, then re-run.\n"
-                + _diffusiongemma_runtime_help()
+                "[DEPS] transformers={0} — run your offline deps cell FIRST, then this script.\n"
+                "  {1}\n".format(tfm_ver, _offline_transformers_wheel_pip_cmd(wheel_dir))
+                + _diffusiongemma_runtime_help(extra=f"transformers={tfm_ver}")
             )
-        raise RuntimeError(_diffusiongemma_runtime_help(extra=f"transformers={tfm_ver}"))
+        if not offline and AUTO_UPGRADE_TRANSFORMERS_ON_KAGGLE:
+            try:
+                _install_hf_diffusiongemma_deps()
+                raise RuntimeError(
+                    "[DEPS] Pip upgrade complete — restart kernel, then re-run.\n"
+                    + _diffusiongemma_runtime_help()
+                )
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                print(f"[DEPS] [WARN] pip upgrade failed ({type(exc).__name__}: {exc})")
+        print(
+            f"[DEPS] [WARN] transformers={tfm_ver} < {TRANSFORMERS_MIN_VERSION}\n"
+            + _diffusiongemma_runtime_help(extra=f"transformers={tfm_ver}")
+        )
+    elif offline:
+        print(
+            f"[DEPS] Offline wheels OK — transformers={tfm_ver}, mapping={in_mapping}"
+        )
     if not hub_ok:
         print(
             f"[DEPS] [WARN] huggingface_hub={hub_ver} < {HUGGINGFACE_HUB_MIN_VERSION} — "
-            "DiffusionGemma config load may fail (StrictDataclass). "
-            f"pip install -U \"huggingface_hub>={HUGGINGFACE_HUB_MIN_VERSION},<2.0\" then restart kernel."
-        )
-    if not in_mapping and not ckpt_ok:
-        print(
-            f"[DEPS] [WARN] diffusion_gemma not in CONFIG_MAPPING_NAMES "
-            f"(transformers={tfm_ver}) — proceeding to model load."
+            "may still work with bundled transformers wheel."
         )
     if model_path:
         info = _checkpoint_model_info(model_path)
@@ -3054,19 +3232,26 @@ def _release_cuda_cache(model: Any = None) -> None:
             pass
 
 
-def print_one_million_brains_banner(success: bool = True) -> None:
+def _tfbd_ascii_banner() -> str:
+    """Large ascii_shadow banner: TFBD | FIBER | BUNDLE | DIFFUSION (offline-safe)."""
+    art = r"""
+ ████████╗███████╗██████╗ ██████╗    ███████╗██╗██████╗ ███████╗██████╗    ██████╗ ██╗   ██╗███╗   ██╗██████╗ ██╗     ███████╗    ██████╗ ██╗███████╗███████╗██╗   ██╗███████╗██╗ ██████╗ ███╗   ██╗
+ ╚══██╔══╝██╔════╝██╔══██╗██╔══██╗    ██╔════╝██║██╔══██╗██╔════╝██╔══██╗    ██╔══██╗██║   ██║████╗  ██║██╔══██╗██║     ██╔════╝    ██╔══██╗██║██╔════╝██╔════╝██║   ██║██╔════╝██║██╔═══██╗████╗  ██║
+    ██║   █████╗  ██████╔╝██║  ██║    █████╗  ██║██████╔╝█████╗  ██████╔╝    ██████╔╝██║   ██║██╔██╗ ██║██║  ██║██║     █████╗    ██║  ██║██║█████╗  █████╗  ██║   ██║███████╗██║██║   ██║██╔██╗ ██║
+    ██║   ██╔══╝  ██╔══██╗██║  ██║    ██╔══╝  ██║██╔══██╗██╔══╝  ██╔══██╗    ██╔══██╗██║   ██║██║╚██╗██║██║  ██║██║     ██╔══╝    ██║  ██║██║██╔══╝  ██╔══╝  ██║   ██║╚════██║██║██║   ██║██║╚██╗██║
+    ██║   ██║     ██████╔╝██████╔╝    ██║     ██║██████╔╝███████╗██║  ██║    ██████╔╝╚██████╔╝██║ ╚████║██████╔╝███████╗███████╗    ██████╔╝██║██║     ██║     ╚██████╔╝███████║██║╚██████╔╝██║ ╚████║
+    ╚═╝   ╚═╝     ╚═════╝ ╚═════╝    ╚═╝     ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝    ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚═════╝ ╚══════╝╚══════╝    ╚═════╝ ╚═╝╚═╝     ╚═╝      ╚═════╝ ╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝
+""".strip("\n")
+    return (
+        "================================================================================\n"
+        f"{art}\n"
+        "================================================================================"
+    )
+
+
+def print_tfbd_banner(success: bool = True) -> None:
     """ASCII startup banner — must appear in Kaggle logs after engine load."""
-    banner = r"""
-================================================================================
- ██████╗ ███╗   ██╗███████╗    ███╗   ███╗██╗██╗     ██╗     ██╗ ██████╗ ███╗   ██╗    ██████╗ ██████╗  █████╗ ██╗███╗   ██╗███████╗    ███████╗██╗      █████╗ ███████╗██╗  ██╗
-██╔═══██╗████╗  ██║██╔════╝    ████╗ ████║██║██║     ██║     ██║██╔═══██╗████╗  ██║    ██╔══██╗██╔══██╗██╔══██╗██║████╗  ██║██╔════╝    ██╔════╝██║     ██╔══██╗██╔════╝██║  ██║
-██║   ██║██╔██╗ ██║█████╗      ██╔████╔██║██║██║     ██║     ██║██║   ██║██╔██╗ ██║    ██████╔╝██████╔╝███████║██║██╔██╗ ██║███████╗    █████╗  ██║     ███████║███████╗███████║
-██║   ██║██║╚██╗██║██╔══╝      ██║╚██╔╝██║██║██║     ██║     ██║██║   ██║██║╚██╗██║    ██╔══██╗██╔══██╗██╔══██║██║██║╚██╗██║╚════██║    ██╔══╝  ██║     ██╔══██║╚════██║██╔══██║
-╚██████╔╝██║ ╚████║███████╗    ██║ ╚═╝ ██║██║███████╗███████╗██║╚██████╔╝██║ ╚████║    ██████╔╝██║  ██║██║  ██║██║██║ ╚████║███████║    ██║     ███████╗██║  ██║███████║██║  ██║
- ╚═════╝ ╚═╝  ╚═══╝╚══════╝    ╚═╝     ╚═╝╚═╝╚══════╝╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝    ╚═╝     ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝
-================================================================================
-"""
-    print(banner)
+    print(_tfbd_ascii_banner())
     if success:
         print(
             " TOPOLOGICAL-FIBER-BUNDLE-DIFFUSION INITIALIZED  |  "
@@ -3084,8 +3269,11 @@ def print_one_million_brains_banner(success: bool = True) -> None:
         )
         print(f" Script version: {SCRIPT_VERSION}")
     else:
-        print(" ONE-MILLION-BRAINS-DIFFUSIONGEMMA LOAD FAILED")
+        print(" TOPOLOGICAL-FIBER-BUNDLE-DIFFUSION LOAD FAILED")
     print("================================================================================\n")
+
+
+print_one_million_brains_banner = print_tfbd_banner  # backward-compatible alias
 
 
 _STREAM_IN_THINKING = False
@@ -3156,26 +3344,96 @@ def _hf_resolve_dtype() -> torch.dtype:
 
 
 def _hf_max_memory_map() -> Dict[Union[int, str], str]:
+    util = float(DIFFUSION_GPU_UTIL)
     mem: Dict[Union[int, str], str] = {"cpu": "64GiB"}
     if not torch.cuda.is_available():
         return mem
     for i in range(torch.cuda.device_count()):
         snap = _cuda_vram_snapshot(i)
-        gib = max(14, int(snap["total_gib"] * 0.90))
+        gib = max(14, int(snap["total_gib"] * util))
         mem[i] = f"{gib}GiB"
     return mem
 
 
+def _hf_vram_snapshot_lines() -> List[str]:
+    lines: List[str] = []
+    if not torch.cuda.is_available():
+        return lines
+    for i in range(torch.cuda.device_count()):
+        snap = _cuda_vram_snapshot(i)
+        lines.append(
+            f"  cuda:{i} pytorch_allocated={snap['allocated_gib']:.1f}GiB "
+            f"free={snap['free_gib']:.1f}/{snap['total_gib']:.1f}GiB"
+        )
+    return lines
+
+
+def _hf_vram_preflight(*, min_free_gib: float = 3.0) -> None:
+    """Fail fast when VRAM is still dirty after stale-engine release."""
+    if not torch.cuda.is_available():
+        return
+    dirty: List[str] = []
+    for i in range(torch.cuda.device_count()):
+        snap = _cuda_vram_snapshot(i)
+        if float(snap["allocated_gib"]) > min_free_gib:
+            dirty.append(
+                f"  cuda:{i} pytorch_allocated={snap['allocated_gib']:.1f}GiB "
+                f"free={snap['free_gib']:.1f}/{snap['total_gib']:.1f}GiB"
+            )
+    if not dirty:
+        return
+    raise RuntimeError(
+        "[LOAD][HF] CUDA memory is not clean before weight load "
+        f"(need <={min_free_gib:.0f}GiB allocated per GPU).\n"
+        + "\n".join(dirty)
+        + "\n  Restart the Kaggle kernel (Session -> Restart Session), then run "
+        "pip cell + tfbd cell once.\n"
+        "  If you re-ran without restart, a prior DiffusionGemma copy may still "
+        "be referenced in the notebook namespace."
+    )
+
+
+def _hf_prompt_seq_len(inputs: Dict[str, torch.Tensor]) -> int:
+    """Sequence length for slicing new tokens after model.generate."""
+    if "input_ids" in inputs:
+        return int(inputs["input_ids"].shape[1])
+    if "inputs_embeds" in inputs:
+        return int(inputs["inputs_embeds"].shape[1])
+    raise KeyError(
+        "HF generate inputs need input_ids or inputs_embeds "
+        f"(got keys={sorted(inputs.keys())})"
+    )
+
+
 def _resolve_hf_input_device(model: Any) -> torch.device:
-    """Device for input_ids — first CUDA shard in hf_device_map, not meta."""
-    model_device = getattr(model, "device", None)
-    if model_device is not None and getattr(model_device, "type", "") != "meta":
-        return torch.device(model_device)
+    """Device for input_ids — must match get_input_embeddings().weight (not model.device)."""
+    emb = model.get_input_embeddings()
+    if emb is not None and getattr(emb.weight, "device", None) is not None:
+        if emb.weight.device.type != "meta":
+            return emb.weight.device
+
+    for path in (
+        "model.encoder.language_model.embed_tokens",
+        "model.decoder.embed_tokens",
+    ):
+        mod: Any = model
+        try:
+            for part in path.split("."):
+                mod = getattr(mod, part)
+            weight = getattr(mod, "weight", None)
+            if weight is not None and weight.device.type != "meta":
+                return weight.device
+        except AttributeError:
+            continue
 
     hf_map = getattr(model, "hf_device_map", None) or {}
-    for key in sorted(hf_map.keys(), key=lambda k: (k != "", k)):
-        target = hf_map[key]
-        if target in ("cpu", "disk", "meta"):
+    for key in (
+        "model.encoder.language_model.embed_tokens",
+        "model.decoder.embed_tokens",
+        "lm_head",
+    ):
+        target = hf_map.get(key)
+        if target in (None, "cpu", "disk", "meta"):
             continue
         if isinstance(target, int):
             return torch.device(f"cuda:{target}")
@@ -3185,10 +3443,6 @@ def _resolve_hf_input_device(model: Any) -> torch.device:
             if target.isdigit():
                 return torch.device(f"cuda:{int(target)}")
 
-    emb = model.get_input_embeddings()
-    if emb is not None and getattr(emb.weight, "device", None) is not None:
-        if emb.weight.device.type != "meta":
-            return emb.weight.device
     for param in model.parameters():
         if param.device.type != "meta":
             return param.device
@@ -3223,31 +3477,69 @@ def _hf_smoke_generate(model: Any, processor: Any, device: torch.device) -> None
         model.generate(**inputs, max_new_tokens=1, do_sample=False)
 
 
+def _hf_layer_chunk_plan(
+    n_layers: int, n_gpu: int, start_gpu: int
+) -> List[Tuple[int, int, int]]:
+    """Contiguous layer ranges per GPU in pipeline order [(gpu, start, end), ...]."""
+    order = [(int(start_gpu) + k) % n_gpu for k in range(n_gpu)]
+    base, rem = divmod(n_layers, n_gpu)
+    chunks: List[Tuple[int, int, int]] = []
+    idx = 0
+    for j, gpu in enumerate(order):
+        size = base + (1 if j < rem else 0)
+        if size < 1:
+            continue
+        chunks.append((gpu, idx, idx + size))
+        idx += size
+    return chunks
+
+
+def _hf_layer_gpu(i: int, chunks: List[Tuple[int, int, int]]) -> int:
+    for gpu, start, end in chunks:
+        if start <= i < end:
+            return gpu
+    return chunks[-1][0]
+
+
 def _hf_build_manual_device_map(config: Any, n_gpu: int) -> Dict[str, int]:
     """
     DiffusionGemma ties encoder.language_model.layers <-> decoder.layers.
     accelerate.infer_auto_device_map crashes on those ties (IndexError).
-    Build an explicit per-layer map instead — tied pairs share the same GPU.
+
+    Use contiguous layer shards (pipeline order) so norm/rotary sit on the
+    same GPUs as the layer blocks they border. embed_tokens and lm_head are
+    weight-tied and must share one GPU.
     """
     text_cfg = getattr(config, "text_config", config)
     n_layers = int(getattr(text_cfg, "num_hidden_layers", 0) or 0)
     if n_layers < 1:
         raise ValueError("DiffusionGemma config missing text_config.num_hidden_layers")
 
-    dm: Dict[str, int] = {
-        "model.decoder.embed_tokens": 0,
-        "lm_head": 0,
-        "model.encoder.language_model.embed_tokens": 0,
-        "model.encoder.language_model.norm": 0,
-        "model.encoder.language_model.rotary_emb": 0,
-        "model.decoder.norm": 0,
-        "model.decoder.rotary_emb": 0,
-        "model.decoder.self_conditioning": 0,
-        "model.encoder.vision_tower": 0,
-        "model.encoder.embed_vision": 0,
-    }
+    n_gpu = max(1, int(n_gpu))
+    dm: Dict[str, int] = {}
+
+    embed_gpu = 1 if n_gpu >= 2 else 0
+    chunks = _hf_layer_chunk_plan(n_layers, n_gpu, embed_gpu)
+    first_gpu = chunks[0][0]
+    last_gpu = chunks[-1][0]
+    vision_gpu = (embed_gpu + max(1, n_gpu // 2)) % n_gpu
+
+    dm["model.decoder.embed_tokens"] = embed_gpu
+    dm["model.encoder.language_model.embed_tokens"] = embed_gpu
+    dm["lm_head"] = embed_gpu
+
+    dm["model.encoder.language_model.rotary_emb"] = first_gpu
+    dm["model.decoder.rotary_emb"] = first_gpu
+    dm["model.decoder.self_conditioning"] = first_gpu
+
+    dm["model.encoder.language_model.norm"] = last_gpu
+    dm["model.decoder.norm"] = last_gpu
+
+    dm["model.encoder.vision_tower"] = vision_gpu
+    dm["model.encoder.embed_vision"] = vision_gpu
+
     for i in range(n_layers):
-        gpu = i % max(1, n_gpu)
+        gpu = _hf_layer_gpu(i, chunks)
         dm[f"model.encoder.language_model.layers.{i}"] = gpu
         dm[f"model.decoder.layers.{i}"] = gpu
     return dm
@@ -3259,52 +3551,177 @@ def _hf_total_vram_gib() -> float:
     return sum(_cuda_vram_snapshot(i)["total_gib"] for i in range(torch.cuda.device_count()))
 
 
+def _hf_from_pretrained_compat(cls: Any, model_path: str, dtype: torch.dtype, **kwargs: Any) -> Any:
+    """Call from_pretrained with dtype= or torch_dtype= depending on transformers version."""
+    base = dict(kwargs)
+    last_exc: Optional[Exception] = None
+    for extra in ({"dtype": dtype}, {"torch_dtype": dtype}, {}):
+        try:
+            return cls.from_pretrained(model_path, **base, **extra)
+        except TypeError as exc:
+            last_exc = exc
+            if "dtype" in str(exc) or "torch_dtype" in str(exc):
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    return cls.from_pretrained(model_path, **base)
+
+
+def _hf_remote_code_class_refs(config: Any) -> List[str]:
+    refs: List[str] = []
+    auto_map = getattr(config, "auto_map", None) or {}
+    for key in (
+        "AutoModel",
+        "AutoModelForCausalLM",
+        "AutoModelForImageTextToText",
+    ):
+        val = auto_map.get(key)
+        if val and val not in refs:
+            refs.append(str(val))
+    for arch in getattr(config, "architectures", None) or []:
+        arch = str(arch)
+        if not arch:
+            continue
+        if "." in arch:
+            refs.append(arch)
+        else:
+            for stem in (
+                "modeling_diffusion_gemma",
+                "modeling_diffusion_gemma_block",
+            ):
+                refs.append(f"{stem}.{arch}")
+    return refs
+
+
+def _hf_load_diffusiongemma_weights(
+    model_path: str,
+    *,
+    config: Any,
+    dtype: torch.dtype,
+    local_files_only: bool,
+    device_map: Dict[str, int],
+) -> Any:
+    """Load DiffusionGemma: installed class, checkpoint remote code, or AutoModel."""
+    common: Dict[str, Any] = {
+        "trust_remote_code": True,
+        "local_files_only": local_files_only,
+        "device_map": device_map,
+        "max_memory": _hf_max_memory_map(),
+        "low_cpu_mem_usage": True,
+    }
+    errors: List[str] = []
+
+    try:
+        from transformers import DiffusionGemmaForBlockDiffusion
+
+        print("[LOAD][HF] loader=transformers.DiffusionGemmaForBlockDiffusion")
+        return _hf_from_pretrained_compat(
+            DiffusionGemmaForBlockDiffusion, model_path, dtype, **common
+        )
+    except Exception as exc:
+        errors.append(f"DiffusionGemmaForBlockDiffusion: {type(exc).__name__}: {exc}")
+
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        seen: set = set()
+        for class_ref in _hf_remote_code_class_refs(config):
+            if class_ref in seen:
+                continue
+            seen.add(class_ref)
+            try:
+                cls = get_class_from_dynamic_module(class_ref, model_path)
+                print(f"[LOAD][HF] loader=checkpoint remote_code ({class_ref})")
+                return _hf_from_pretrained_compat(cls, model_path, dtype, **common)
+            except Exception as inner:
+                errors.append(f"{class_ref}: {type(inner).__name__}: {inner}")
+    except Exception as exc:
+        errors.append(f"dynamic_module: {type(exc).__name__}: {exc}")
+
+    try:
+        from transformers import AutoModel
+
+        print("[LOAD][HF] loader=AutoModel (trust_remote_code)")
+        return _hf_from_pretrained_compat(AutoModel, model_path, dtype, **common)
+    except Exception as exc:
+        errors.append(f"AutoModel: {type(exc).__name__}: {exc}")
+
+    raise RuntimeError(
+        "[LOAD][HF] Failed to load DiffusionGemma from local checkpoint.\n  "
+        + "\n  ".join(errors)
+        + "\n  "
+        + _diffusiongemma_runtime_help()
+    )
+
+
 def _load_hf_diffusiongemma_model(
     model_path: str, *, local_only: bool, processor: Any = None
 ) -> Any:
-    try:
-        from transformers import AutoConfig, DiffusionGemmaForBlockDiffusion
-    except Exception as exc:
-        err_name = type(exc).__name__
-        if "StrictDataclass" in err_name or "strict" in str(exc).lower():
-            raise RuntimeError(
-                "[LOAD][HF] transformers/huggingface_hub version mismatch "
-                f"({err_name}).\n"
-                "  Run in first cell, then Restart Kernel:\n"
-                '    !pip install -U "transformers>=5.12.1" '
-                '"huggingface_hub>=1.5.0,<2.0" accelerate torch\n'
-                f"  Detail: {exc}"
-            ) from exc
-        raise
+    from transformers import AutoConfig
 
     local_files_only = bool(local_only and os.path.isdir(model_path))
     dtype = _hf_resolve_dtype()
     n_gpu = max(1, torch.cuda.device_count() if torch.cuda.is_available() else 0)
     total_vram = _hf_total_vram_gib()
 
-    config = AutoConfig.from_pretrained(
-        model_path, trust_remote_code=True, local_files_only=local_files_only
-    )
+    try:
+        config = AutoConfig.from_pretrained(
+            model_path, trust_remote_code=True, local_files_only=local_files_only
+        )
+    except Exception as exc:
+        err_name = type(exc).__name__
+        if "StrictDataclass" in err_name or "strict" in str(exc).lower():
+            raise RuntimeError(
+                "[LOAD][HF] Config load failed — attach google/diffusiongemma Models input "
+                f"or set LOCAL_OFFLINE_TRANSFORMERS_SITE_PACKAGES.\n  Detail: {exc}"
+            ) from exc
+        raise
+
     device_map = _hf_build_manual_device_map(config, n_gpu)
     n_layers = sum(1 for k in device_map if k.startswith("model.decoder.layers."))
+    embed_gpu = 1 if n_gpu >= 2 else 0
+    chunks = _hf_layer_chunk_plan(n_layers, n_gpu, embed_gpu)
+    chunk_desc = ", ".join(f"cuda:{g}[{s}:{e})" for g, s, e in chunks)
+    print(f"[LOAD][HF] layer chunks: {chunk_desc}")
+
+    _release_cuda_cache()
+    _hf_vram_preflight()
+    if torch.cuda.is_available():
+        vram_lines = []
+        for i in range(torch.cuda.device_count()):
+            snap = _cuda_vram_snapshot(i)
+            vram_lines.append(
+                f"cuda:{i} free {snap['free_gib']:.1f}/{snap['total_gib']:.1f}GiB"
+            )
+        print(f"[LOAD][HF] VRAM preflight: {', '.join(vram_lines)}")
 
     print(
-        f"[LOAD][HF] DiffusionGemmaForBlockDiffusion from {model_path}\n"
+        f"[LOAD][HF] DiffusionGemma from {model_path}\n"
         f"         dtype={dtype}, gpus={n_gpu}, vram={total_vram:.1f}GiB, "
-        f"layers={n_layers}, device_map=explicit_round_robin"
+        f"layers={n_layers}, device_map=explicit_contiguous_chunks"
     )
     print("[LOAD][HF] loading weights (real shard read — expect several minutes)...")
 
-    model = DiffusionGemmaForBlockDiffusion.from_pretrained(
+    model = _hf_load_diffusiongemma_weights(
         model_path,
-        trust_remote_code=True,
-        local_files_only=local_files_only,
+        config=config,
         dtype=dtype,
+        local_files_only=local_files_only,
         device_map=device_map,
     )
     _hf_log_device_map(model)
     input_dev = _resolve_hf_input_device(model)
-    print(f"[LOAD][HF] weights loaded; input device={input_dev}")
+    emb = model.get_input_embeddings()
+    emb_dev = getattr(getattr(emb, "weight", None), "device", None)
+    print(
+        f"[LOAD][HF] weights loaded; input device={input_dev}"
+        + (f" embed_weight={emb_dev}" if emb_dev is not None else "")
+    )
+    if emb_dev is not None and input_dev != emb_dev:
+        raise RuntimeError(
+            f"[LOAD][HF] input device {input_dev} != embed weight {emb_dev}"
+        )
     return model
 
 
@@ -3323,7 +3740,9 @@ class HFGenerateEngine:
         self.tokenizer = getattr(processor, "tokenizer", processor)
         self.model_path = model_path
         self.generation_model_path = model_path
-        self.max_model_len = int(max_model_len or DIFFUSION_MAX_MODEL_LEN)
+        self.max_model_len = int(
+            max_model_len if max_model_len is not None else resolve_diffusion_max_model_len()
+        )
         self.diffusiongemma_enabled = True
         self.model = _load_hf_diffusiongemma_model(
             model_path, local_only=local_only, processor=processor
@@ -3375,7 +3794,7 @@ class HFGenerateEngine:
         stream_label: str,
         stream: bool,
     ) -> Tuple[List[int], List[Dict[int, float]]]:
-        prompt_len = int(inputs["input_ids"].shape[1])
+        prompt_len = _hf_prompt_seq_len(inputs)
         gen_kwargs: Dict[str, Any] = {"max_new_tokens": int(max_tokens)}
         if float(temperature) <= 0:
             gen_kwargs["do_sample"] = False
@@ -3386,6 +3805,12 @@ class HFGenerateEngine:
 
         if stream:
             stream_begin(stream_label)
+
+        input_dev = _resolve_hf_input_device(self.model)
+        inputs = {
+            k: v.to(input_dev) if torch.is_tensor(v) else v
+            for k, v in inputs.items()
+        }
 
         with torch.inference_mode():
             output = self.model.generate(**inputs, **gen_kwargs)
@@ -3402,6 +3827,78 @@ class HFGenerateEngine:
 
         step_logprobs = [{tid: -0.7} for tid in new_ids]
         return new_ids, step_logprobs
+
+    def _hf_chunk_token_cap(self) -> int:
+        return max(48, int(DIFFUSION_CANVAS_LENGTH) - 16)
+
+    def _hf_should_chunk_generate(self, max_tokens: int, prompt: str) -> bool:
+        if int(max_tokens) <= self._hf_chunk_token_cap():
+            return False
+        if ARC_ASSISTANT_PREFILL and ARC_ASSISTANT_PREFILL in prompt:
+            return True
+        return int(max_tokens) > int(DIFFUSION_CANVAS_LENGTH)
+
+    def _generate_new_ids_chunked(
+        self,
+        inputs: Dict[str, torch.Tensor],
+        *,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        stream_label: str,
+        stream: bool,
+        stop_on_grid: bool = False,
+    ) -> Tuple[List[int], List[Dict[int, float]]]:
+        """Continue past block-diffusion canvas via input_ids extension."""
+        chunk_cap = self._hf_chunk_token_cap()
+        all_new_ids: List[int] = []
+        all_logprobs: List[Dict[int, float]] = []
+        work_inputs = {
+            k: v.to(self.device) if torch.is_tensor(v) else v
+            for k, v in inputs.items()
+        }
+        if stream:
+            stream_begin(stream_label)
+
+        while len(all_new_ids) < int(max_tokens):
+            want = min(chunk_cap, int(max_tokens) - len(all_new_ids))
+            new_ids, step_lps = self._generate_new_ids(
+                work_inputs,
+                max_tokens=want,
+                temperature=temperature,
+                top_p=top_p,
+                stream_label=stream_label,
+                stream=stream and not ARC_FAST_INFERENCE,
+            )
+            if not new_ids:
+                break
+            all_new_ids.extend(new_ids)
+            all_logprobs.extend(step_lps)
+            if stop_on_grid:
+                tail = self._decode_ids(all_new_ids)
+                if parse_arc_answer_grid(tail) is not None:
+                    break
+            if len(new_ids) < want:
+                break
+            if len(all_new_ids) >= int(max_tokens):
+                break
+            input_ids = work_inputs.get("input_ids")
+            if input_ids is None:
+                break
+            ext = torch.tensor(
+                [new_ids], device=input_ids.device, dtype=input_ids.dtype
+            )
+            work_inputs = dict(work_inputs)
+            work_inputs["input_ids"] = torch.cat([input_ids, ext], dim=1)
+            if work_inputs["input_ids"].shape[1] > self.max_model_len - 32:
+                break
+
+        if stream and all_new_ids and ARC_FAST_INFERENCE:
+            stream_emit(self._decode_ids(all_new_ids))
+            stream_end(stream_label)
+        elif stream and all_new_ids and not ARC_FAST_INFERENCE:
+            stream_end(stream_label)
+        return all_new_ids, all_logprobs
 
     def generate(
         self,
@@ -3447,14 +3944,33 @@ class HFGenerateEngine:
             do_stream = STREAM_GENERATION and not (
                 verify_only or (not STREAM_VERIFY_PASSES and want_prompt_logprobs)
             )
-            new_ids, step_logprobs = self._generate_new_ids(
-                inputs,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                stream_label=stream_label,
-                stream=do_stream and not ARC_FAST_INFERENCE,
+            chunk_grid = bool(
+                getattr(sp, "chunk_until_grid", False)
+                or (
+                    ARC_SPATIAL_GRID_ENSEMBLE
+                    and ARC_ASSISTANT_PREFILL
+                    and max_tokens > self._hf_chunk_token_cap()
+                )
             )
+            if self._hf_should_chunk_generate(max_tokens, prompt):
+                new_ids, step_logprobs = self._generate_new_ids_chunked(
+                    inputs,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stream_label=stream_label,
+                    stream=do_stream,
+                    stop_on_grid=chunk_grid,
+                )
+            else:
+                new_ids, step_logprobs = self._generate_new_ids(
+                    inputs,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stream_label=stream_label,
+                    stream=do_stream and not ARC_FAST_INFERENCE,
+                )
             results.append(
                 _HFRequestOutput(
                     outputs=[
@@ -3468,6 +3984,165 @@ class HFGenerateEngine:
                 )
             )
         return results
+
+
+_HF_SESSION_ENGINE_KEY = "_tfbd_hf_session_engine"
+
+
+def _hf_get_session_engine() -> Optional[Any]:
+    import builtins
+
+    return getattr(builtins, _HF_SESSION_ENGINE_KEY, None)
+
+
+def _hf_set_session_engine(engine: Any) -> None:
+    import builtins
+
+    setattr(builtins, _HF_SESSION_ENGINE_KEY, engine)
+
+
+def _hf_clear_session_engine() -> None:
+    import builtins
+
+    if hasattr(builtins, _HF_SESSION_ENGINE_KEY):
+        delattr(builtins, _HF_SESSION_ENGINE_KEY)
+
+
+def _hf_is_inference_engine(obj: Any) -> bool:
+    if obj is None:
+        return False
+    if isinstance(obj, HFGenerateEngine):
+        return True
+    return (
+        hasattr(obj, "model")
+        and hasattr(obj, "generate")
+        and hasattr(obj, "processor")
+        and getattr(obj, "diffusiongemma_enabled", False)
+    )
+
+
+def _hf_teardown_engine(engine: Any) -> None:
+    import gc
+
+    model = getattr(engine, "model", None)
+    for attr in ("model", "processor", "tokenizer", "device"):
+        try:
+            setattr(engine, attr, None)
+        except Exception:
+            pass
+    del engine
+    if model is not None:
+        del model
+    gc.collect()
+
+
+def _hf_clear_notebook_engine_refs(engine_ids: set) -> None:
+    try:
+        ip = get_ipython()  # type: ignore[name-defined]
+    except Exception:
+        return
+    if ip is None:
+        return
+    for name in (
+        "llm",
+        "engine",
+        "hf_engine",
+        "inference_engine",
+        "tfbd_orch",
+        "orch",
+    ):
+        obj = ip.user_ns.get(name)
+        if obj is None:
+            continue
+        if name in ("tfbd_orch", "orch"):
+            try:
+                obj.model = None
+                obj.processor = None
+            except Exception:
+                pass
+            ip.user_ns[name] = None
+            continue
+        if id(obj) in engine_ids:
+            ip.user_ns[name] = None
+
+
+def _hf_release_stale_engines() -> None:
+    """Drop prior HF engines held by this kernel (notebook re-run safe)."""
+    import gc
+
+    engines: List[Any] = []
+    seen: set = set()
+
+    stored = _hf_get_session_engine()
+    if stored is not None and _hf_is_inference_engine(stored):
+        engines.append(stored)
+        seen.add(id(stored))
+
+    try:
+        ip = get_ipython()  # type: ignore[name-defined]
+    except Exception:
+        ip = None
+    if ip is not None:
+        for name in ("llm", "engine", "hf_engine", "inference_engine"):
+            obj = ip.user_ns.get(name)
+            if obj is None or id(obj) in seen:
+                continue
+            if _hf_is_inference_engine(obj):
+                engines.append(obj)
+                seen.add(id(obj))
+        for name in ("tfbd_orch", "orch"):
+            obj = ip.user_ns.get(name)
+            if obj is None:
+                continue
+            try:
+                obj.model = None
+                obj.processor = None
+            except Exception:
+                pass
+
+    if not engines:
+        _release_cuda_cache()
+        return
+
+    print(
+        f"[LOAD][HF] releasing {len(engines)} stale inference engine(s) "
+        "from prior notebook run...",
+        flush=True,
+    )
+    for eng in engines:
+        _hf_teardown_engine(eng)
+    _hf_clear_session_engine()
+    _hf_clear_notebook_engine_refs(seen)
+    for _ in range(3):
+        gc.collect()
+    _release_cuda_cache()
+    if torch.cuda.is_available():
+        print(
+            "[LOAD][HF] VRAM after release: " + ", ".join(
+                line.strip()
+                for line in _hf_vram_snapshot_lines()
+            ),
+            flush=True,
+        )
+
+
+def release_inference_engine(engine: Optional[Any] = None) -> None:
+    """Public hook: free a loaded HF engine before reloading in the same kernel."""
+    if engine is None:
+        _hf_release_stale_engines()
+        return
+    if _hf_is_inference_engine(engine):
+        print("[LOAD][HF] releasing inference engine...", flush=True)
+        _hf_teardown_engine(engine)
+        stored = _hf_get_session_engine()
+        if stored is engine:
+            _hf_clear_session_engine()
+        _hf_clear_notebook_engine_refs({id(engine)})
+        import gc
+
+        for _ in range(3):
+            gc.collect()
+        _release_cuda_cache()
 
 
 def create_inference_engine(
@@ -3491,18 +4166,21 @@ def create_inference_engine(
             trust_remote_code=True,
             local_files_only=bool(local_only and os.path.isdir(gen_path)),
         )
+    resolved_max_len = resolve_diffusion_max_model_len()
     print(
         f"[LOAD] DiffusionGemma HF: canvas={DIFFUSION_CANVAS_LENGTH} "
-        f"max_len={DIFFUSION_MAX_MODEL_LEN} multi_gpu=explicit_layer_map",
+        f"max_len={resolved_max_len} multi_gpu=explicit_layer_map",
         flush=True,
     )
-    _release_cuda_cache()
-    return HFGenerateEngine(
+    _hf_release_stale_engines()
+    engine = HFGenerateEngine(
         gen_path,
         processor,
         local_only=local_only or os.path.isdir(gen_path),
-        max_model_len=DIFFUSION_MAX_MODEL_LEN,
+        max_model_len=resolved_max_len,
     )
+    _hf_set_session_engine(engine)
+    return engine
 
 def verify_inference_engine(llm: Any, tokenizer: Any) -> None:
     """Fail fast before ARC eval if the engine cannot tokenize/generate."""
@@ -3823,6 +4501,23 @@ def _format_grid_minified_json(grid: List[List[int]]) -> str:
     return json.dumps(grid, separators=(",", ":"))
 
 
+def _format_grid_dense(grid: List[List[int]]) -> str:
+    """Ultra-compact: one digit per cell, rows joined by ';' (best for 30x30 prompts)."""
+    if not grid:
+        return ""
+    return ";".join("".join(str(int(c)) for c in row) for row in grid)
+
+
+def _estimate_grid_dense_tokens(grid: List[List[int]]) -> int:
+    """Rough token count for dense row encoding."""
+    if not grid or not grid[0]:
+        return 32
+    rows = len(grid)
+    cols = len(grid[0])
+    cells = rows * cols
+    return max(48, int(cells * 1.15 + rows * 4 + 48))
+
+
 def _estimate_grid_json_tokens(grid: List[List[int]]) -> int:
     """Rough token count for a minified JSON 2D grid."""
     if not grid or not grid[0]:
@@ -3852,23 +4547,36 @@ def arc_final_grid_max_tokens(task: Dict[str, Any]) -> int:
 def arc_spatial_slot_max_tokens(task: Dict[str, Any], test_index: int = 0) -> int:
     """
     Per-slot generation budget for spatial Phase-1 (one full JSON grid per slot).
-    Spatial ensemble has no LLM final pass — split the full output budget across slots.
+    Spatial ensemble has no LLM final pass — each slot may use the full output budget.
     """
     est = 256
     for ex in task.get("train", []):
         for key in ("input", "output"):
             grid = ex.get(key) or []
             if grid:
-                est = max(est, _estimate_grid_json_tokens(grid))
+                est = max(
+                    est,
+                    _estimate_grid_json_tokens(grid),
+                    _estimate_grid_dense_tokens(grid),
+                )
     tests = task.get("test") or []
     if test_index < len(tests):
         inp = (tests[test_index].get("input") or [])
         if inp:
-            est = max(est, _estimate_grid_json_tokens(inp))
-    est = est + 128
+            est = max(
+                est,
+                _estimate_grid_json_tokens(inp),
+                _estimate_grid_dense_tokens(inp),
+            )
+    est = est + 192
     budget = int(ARC_MBR_OUTPUT_TOKEN_BUDGET)
-    per_slot_share = max(256, budget // max(1, arc_hypothesis_k()))
-    return max(64, min(est, per_slot_share))
+    if ARC_SPATIAL_GRID_ENSEMBLE:
+        per_slot_ceiling = max(512, budget)
+    else:
+        per_slot_ceiling = max(256, budget // max(1, arc_hypothesis_k()))
+    base = max(128, min(est, per_slot_ceiling))
+    scaled = int(base * float(ARC_OUTPUT_TOKEN_MULTIPLIER))
+    return max(128, min(scaled, per_slot_ceiling))
 
 
 def _arc_task_with_train_limit(task: Dict[str, Any], n_train: int) -> Dict[str, Any]:
@@ -3897,15 +4605,22 @@ def _arc_largest_grid_cells(task: Dict[str, Any], test_index: int = 0) -> int:
 
 
 def _arc_task_needs_compact_prompt(
-    task: Dict[str, Any], test_index: int = 0, *, cell_threshold: int = 400
+    task: Dict[str, Any], test_index: int = 0, *, cell_threshold: Optional[int] = None
 ) -> bool:
-    """True for 20x20+ grids — skip verbose encodings and train-pair sweeps."""
-    return _arc_largest_grid_cells(task, test_index) >= int(cell_threshold)
+    """True for 20x20+ grids — dense encoding, batch=1, chunked generation."""
+    thresh = int(ARC_LARGE_GRID_CELLS if cell_threshold is None else cell_threshold)
+    return _arc_largest_grid_cells(task, test_index) >= thresh
 
 
-def arc_phase1_slot_batch_size(k: int) -> int:
+def arc_phase1_slot_batch_size(
+    k: int,
+    task: Optional[Dict[str, Any]] = None,
+    test_index: int = 0,
+) -> int:
     """How many Phase-1 slots to pass per HF generate() call."""
     if not ARC_PHASE1_PROMPT_PARALLELISM:
+        return 1
+    if task is not None and _arc_task_needs_compact_prompt(task, test_index):
         return 1
     return min(max(1, int(k)), max(1, int(ARC_PHASE1_BATCH_SIZE)))
 
@@ -3917,10 +4632,12 @@ def _arc_phase1_generate_slots(
     *,
     label: str = "phase1",
     enable_thinking: Optional[bool] = None,
+    task: Optional[Dict[str, Any]] = None,
+    test_index: int = 0,
 ) -> List[Any]:
     """Run Phase-1 slot generation; serial (batch=1) or batched per ARC_PHASE1_PROMPT_PARALLELISM."""
     k = len(prompts)
-    slot_batch = arc_phase1_slot_batch_size(k)
+    slot_batch = arc_phase1_slot_batch_size(k, task, test_index)
     outs: List[Any] = []
     for start in range(0, k, slot_batch):
         end = min(start + slot_batch, k)
@@ -3950,9 +4667,14 @@ def format_arc_task_body_minimal(
     test_inp = tests[test_index]["input"]
     n_train = len(task.get("train") or [])
     sh = f"{len(test_inp)}x{len(test_inp[0]) if test_inp else 0}"
+    fmt_grid = (
+        _format_grid_dense(test_inp)
+        if _arc_grid_cell_count(test_inp) >= int(ARC_LARGE_GRID_CELLS)
+        else _format_grid_minified_json(test_inp)
+    )
     return (
         f"ARC {task_id} ({n_train} train pairs omitted). "
-        f"Test input {sh}: {_format_grid_minified_json(test_inp)}"
+        f"Test input {sh}: {fmt_grid}"
     )
 
 
@@ -4008,6 +4730,34 @@ def arc_context_budget() -> int:
     return int(math.ceil(raw / 256.0) * 256)
 
 
+def resolve_diffusion_max_model_len() -> int:
+    """
+    Auto-raise HF context on multi-GPU Kaggle boxes when the toggle is still at 8192.
+    Keeps user overrides when DIFFUSION_MAX_MODEL_LEN is already >= arc_context_budget().
+    """
+    configured = int(DIFFUSION_MAX_MODEL_LEN)
+    need = int(arc_context_budget())
+    if configured >= need:
+        return configured
+    total_vram = _hf_total_vram_gib()
+    n_gpu = max(1, torch.cuda.device_count() if torch.cuda.is_available() else 0)
+    if total_vram >= 80.0 and n_gpu >= 4:
+        target = min(need, 36608)  # 2x output budget needs ~36k ctx on 4x22GB
+    elif total_vram >= 40.0 and n_gpu >= 2:
+        target = min(need, 32768)
+    else:
+        target = min(need, max(configured, 12288))
+    target = int(math.ceil(target / 256.0) * 256)
+    if target > configured:
+        print(
+            f"[CONFIG] DIFFUSION_MAX_MODEL_LEN {configured} -> {target} "
+            f"(vram={total_vram:.0f}GiB gpus={n_gpu} arc_need={need})",
+            flush=True,
+        )
+        return target
+    return configured
+
+
 def get_inference_max_context(llm: Any) -> int:
     """Effective max context tokens for the loaded engine (HF max_model_len)."""
     stored = getattr(llm, "max_model_len", None)
@@ -4038,11 +4788,32 @@ def format_arc_task_body(
         grid_format = "minified" if ARC_FAST_INFERENCE else "ascii"
 
     def _fmt_grid(grid: List[List[int]]) -> str:
+        if grid_format == "dense":
+            return _format_grid_dense(grid)
         if grid_format in ("minified", "terse"):
             return _format_grid_minified_json(grid)
         if grid_format == "rows":
             return ";".join(" ".join(str(c) for c in row) for row in grid)
         return _format_grid_ascii_compact(grid)
+
+    if grid_format == "dense":
+        lines = [f"ARC {task_id} colors0-9 dense=;rows digits0-9"]
+        for i, example in enumerate(task.get("train", []), start=1):
+            inp, out = example["input"], example["output"]
+            in_shape = f"{len(inp)}x{len(inp[0]) if inp else 0}"
+            out_shape = f"{len(out)}x{len(out[0]) if out else 0}"
+            lines.append(f"T{i}i{in_shape}:{_fmt_grid(inp)}")
+            lines.append(f"T{i}o{out_shape}:{_fmt_grid(out)}")
+        test_inputs = task.get("test", [])
+        if test_index >= len(test_inputs):
+            raise IndexError(
+                f"Task {task_id} has {len(test_inputs)} test inputs; "
+                f"requested index {test_index}."
+            )
+        test_inp = test_inputs[test_index]["input"]
+        test_shape = f"{len(test_inp)}x{len(test_inp[0]) if test_inp else 0}"
+        lines.append(f"Xi{test_shape}:{_fmt_grid(test_inp)}")
+        return "\n".join(lines)
 
     if grid_format == "rows":
         lines = [f"ARC {task_id} colors0-9 rows=semicolon cols=space"]
@@ -4128,11 +4899,12 @@ def resolve_arc_task_body(
     Pick the most detailed grid encoding that fits max_prompt_tokens.
     Returns (body_text, token_count, format_label).
     """
-    formats = (
-        ("terse", "minified", "ascii")
-        if ARC_FAST_INFERENCE
-        else ("ascii", "minified", "terse")
-    )
+    if _arc_task_needs_compact_prompt(task, test_index):
+        formats: Tuple[str, ...] = ("dense", "rows", "terse", "minified")
+    elif ARC_FAST_INFERENCE:
+        formats = ("dense", "rows", "terse", "minified", "ascii")
+    else:
+        formats = ("ascii", "minified", "terse", "rows", "dense")
     best_body = ""
     best_tok = 0
     best_fmt = "minified"
@@ -4176,11 +4948,11 @@ def resolve_arc_spatial_task_body(
             "ARC spatial solver. Output one JSON 2D int array (0-9). No prose."
         )
     if _arc_task_needs_compact_prompt(task, test_index):
-        formats: Tuple[str, ...] = ("rows",)
+        formats = ("dense", "rows", "terse", "minified")
     elif ARC_FAST_INFERENCE:
-        formats = ("rows", "terse", "minified", "ascii")
+        formats = ("dense", "rows", "terse", "minified", "ascii")
     else:
-        formats = ("ascii", "minified", "terse", "rows")
+        formats = ("ascii", "minified", "terse", "rows", "dense")
     best: Tuple[str, str, int, str] = ("", system_content, 10**9, "minified")
 
     for sys_msg in systems:
@@ -5335,14 +6107,11 @@ def collect_spatial_grid_hypotheses(
     max_needed = engine_ctx + 1
     task_for_prompt = task
     n_train_full = len(task.get("train") or [])
-    if _arc_task_needs_compact_prompt(task, test_index):
-        train_limits = [0] + [
-            n for n in (1, 2, 3, n_train_full) if 0 < n <= n_train_full
-        ]
-    else:
-        train_limits = [n_train_full] + [
-            n for n in (3, 2, 1, 0) if n < n_train_full
-        ]
+    train_candidates = [n_train_full, 3, 2, 1, 0]
+    train_limits: List[int] = []
+    for n in train_candidates:
+        if 0 <= n <= n_train_full and n not in train_limits:
+            train_limits.append(n)
     fitted = False
     shrink_note = ""
     arc_eval_log(f"phase1 prompt fit start ({task_id})")
@@ -5428,6 +6197,8 @@ def collect_spatial_grid_hypotheses(
                     )
                 if body_fmt == "minimal":
                     shrink_note = f"{shrink_note} body=minimal".strip()
+                elif body_fmt == "dense":
+                    shrink_note = f"{shrink_note} body=dense".strip()
                 break
             slot_max_tokens = max(128, int(slot_max_tokens * 0.68))
         if fitted:
@@ -5435,18 +6206,20 @@ def collect_spatial_grid_hypotheses(
 
     if not fitted:
         need_ctx = int(math.ceil(max_needed / 256.0) * 256)
-        raise ValueError(
-            f"ARC spatial grid needs {max_needed} tokens but HF "
-            f"max_model_len={engine_ctx}. Set DIFFUSION_MAX_MODEL_LEN={need_ctx} "
-            f"or raise DIFFUSION_MAX_MODEL_LEN."
+        arc_eval_log(
+            f"[ARC-PHASE-1][WARN] Prompt budget tight: need~{max_needed}tok > "
+            f"engine_ctx={engine_ctx}. Proceeding best-effort "
+            f"(dense/minimal, chunked gen). Raise DIFFUSION_MAX_MODEL_LEN>={need_ctx} "
+            f"for full train pairs (arc_budget={arc_context_budget()})."
         )
+        shrink_note = f"{shrink_note} best_effort=1".strip()
     if shrink_note:
         arc_eval_log(
             f"[ARC-PHASE-1] Prompt budget fit: {shrink_note} "
             f"(need={max_needed}/{engine_ctx})"
         )
 
-    slot_batch = arc_phase1_slot_batch_size(k)
+    slot_batch = arc_phase1_slot_batch_size(k, task, test_index)
     guided_on = _arc_guided_json_enabled()
     parallel_tag = (
         f"batch={slot_batch}"
@@ -5487,7 +6260,13 @@ def collect_spatial_grid_hypotheses(
             slot_outputs.append(res)
     else:
         outs = _arc_phase1_generate_slots(
-            llm, prompts, sp_list, label="phase1-spatial", enable_thinking=False
+            llm,
+            prompts,
+            sp_list,
+            label="phase1-spatial",
+            enable_thinking=False,
+            task=task,
+            test_index=test_index,
         )
         for out in outs:
             gen_ids = list(out.outputs[0].token_ids) if out.outputs else []
@@ -6700,7 +7479,8 @@ def evaluate_arc_dataset(
     print(
         f"ARC generation: chat_template={ARC_USE_CHAT_TEMPLATE}, "
         f"temp={ARC_GENERATION_TEMPERATURE}, "
-        f"output_budget={ARC_MBR_OUTPUT_TOKEN_BUDGET} tok/test, "
+        f"output_budget={ARC_MBR_OUTPUT_TOKEN_BUDGET} tok/test "
+        f"(x{ARC_OUTPUT_TOKEN_MULTIPLIER}), "
         f"hyp_thinking={ARC_HYPOTHESIS_ENABLE_THINKING}, "
         f"final_thinking={ARC_FINAL_ENABLE_THINKING}"
     )
@@ -7173,7 +7953,7 @@ if __name__ == "__main__":
         llm, tokenizer, _ = load_models(model_name)
 
     # 4) Sanity: force the banner again so it is unmistakable in the log
-    print_one_million_brains_banner(True)
+    print_tfbd_banner(True)
 
     verify_inference_engine(llm, tokenizer)
 
