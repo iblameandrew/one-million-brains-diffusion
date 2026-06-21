@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-tfbd.py — Topological Fiber-Bundle Diffusion (TFBD) × DiffusionGemma for ARC-AGI
+tfbd.py — ONE-MILLION-BRAINS-DIFFUSIONGEMMA (legacy filename)
 
-Architecture (Riemannian base ↔ discrete fiber bundle):
-  1. TopologicalFiberEmbedding  — E = E_value + E_row + E_col + E_symmetry (GSDM sharing)
-  2. CosmosSparsifier + TorusCache — latent sparsification + T^2 measure dispersion
-  3. FiberBundleDenoiser — partial re-masking (lock logic skeleton, explore fiber stalks)
-  4. CohomologicalStitcher — K-trajectory sheaf stitch + homology PRM proxy (Betti / χ)
-  5. TFBD_Orchestrator — HuggingFace DiffusionGemmaForBlockDiffusion wrapper + KV bias
+Permutation-Gated Feature-Slot Diffusion on DiffusionGemma block-diffusion:
+  - ARC eval: 8 spatial-primitive JSON grids → pixel majority vote (default)
+  - Demo: K=4 Million-Brains conditioned trajectories per denoise super-block
+  - Conditioning: prompt + sampling params (no draft-model speculative decoding)
 
 Kaggle (offline competition):
   Cell 1 — offline transformers wheels (no Internet):
     !pip install --force-reinstall --no-index \
         --find-links=/kaggle/input/notebooks/godelcomplete/vllm-gemma/transformers_latest_wheels/ \
         transformers==5.12.1
+    !pip install -q "accelerate>=0.26.0" "safetensors>=0.4.0"
   Cell 2 — this script. Attach google/diffusiongemma + arc competition inputs.
-Backend: HuggingFace DiffusionGemmaForBlockDiffusion only (no vLLM).
+Backend: HuggingFace DiffusionGemmaForBlockDiffusion only (no vLLM, no bitsandbytes).
+ENABLE_TFBD=False by default (experimental fiber-bundle code kept but off).
 """
 
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-20-tfbd-v"  # TFBD startup banner (replaces One-Million-Brains)
+SCRIPT_VERSION = "2026-06-21-diffusion-d-hf"  # Million-Brains spatial ensemble, HF-only
 HF_FAST_VERIFY = True  # stub tail logprobs on diffusion verify passes (no causal forward)
 HF_TORCH_DTYPE = "bfloat16"  # official recipe; use "float16" if bf16 unsupported
 # --- DiffusionGemma core (default engine) ---
@@ -63,7 +63,7 @@ BENCHMARK_PROMPT = (  # a single hard prompt that benefits from combinatorial di
 SEED = (
     42  # for reproducibility of permutation hashing + sampling inside active features
 )
-ENABLE_TFBD = True  # master switch: TFBD_Orchestrator replaces 1D Sonar/CTSB path
+ENABLE_TFBD = False  # experimental fiber-bundle path (off = Million-Brains spatial ensemble default)
 ENABLE_CIRCUIT_SMOOTHING = True  # fiber-bundle transition smoothing (legacy CTSB compat)
 CTSB_BLEND_TAU = 0.35  # acceptance-gated blend on base-space logic skeleton
 CTSB_MAX_SLOT_SWAPS = 2  # max primitive-slot geodesic swaps per denoise step
@@ -90,7 +90,7 @@ TFBD_KV_NUM_LAYERS = 32
 TFBD_PRIMITIVE_BANK_SEED = 42
 TFBD_KEEP_ON_CPU = True  # Kaggle 4x22GB: model fills GPUs; TFBD stays on CPU
 TFBD_GPU_MIN_FREE_GIB = 1.5  # only place TFBD on GPU if a card has this much free
-ALLOCATOR_MODE = "fiber"  # "permutation" | "fiber" | "hybrid" (fiber = TFBD primitive pick)
+ALLOCATOR_MODE = "permutation"  # "permutation" | "fiber" | "hybrid" (fiber/hybrid = TFBD experimental)
 TFBD_DOPPLER_TEMPERATURE = 1.0  # softmax over symmetry-group resonance scores
 TFBD_DOPPLER_RERANK_MARGIN = 0.15  # hybrid: swap slot when fiber score disagrees
 # Legacy aliases (deprecated 1D sonar toggles — kept for log compat)
@@ -3249,31 +3249,27 @@ def _tfbd_ascii_banner() -> str:
     )
 
 
-def print_tfbd_banner(success: bool = True) -> None:
-    """ASCII startup banner — must appear in Kaggle logs after engine load."""
-    print(_tfbd_ascii_banner())
+def print_one_million_brains_banner(success: bool = True) -> None:
+    """Startup banner — must appear in Kaggle logs after engine load."""
+    print("=" * 72)
+    print("  ONE-MILLION-BRAINS-DIFFUSIONGEMMA")
     if success:
         print(
-            " TOPOLOGICAL-FIBER-BUNDLE-DIFFUSION INITIALIZED  |  "
-            "CANVAS=%d  |  K=%d  |  FIBER_DIM=%d  |  TFBD=%s"
-            % (
-                DIFFUSION_CANVAS_LENGTH,
-                K,
-                TFBD_FIBER_DIM,
-                str(ENABLE_TFBD).upper(),
-            )
+            f"  INITIALIZED | canvas={DIFFUSION_CANVAS_LENGTH} | "
+            f"benchmark_k={K} | arc_slots={ARC_HYPOTHESIS_SLOTS} | "
+            f"spatial_ensemble={ARC_SPATIAL_GRID_ENSEMBLE}"
         )
         print(
-            f" Engine: DiffusionGemma (hf) + TFBD_Orchestrator "
-            f"(fiber_dim={TFBD_FIBER_DIM}, sparsity_p={TFBD_SPARSITY_P})"
+            f"  Engine: DiffusionGemma (hf) | "
+            f"allocator={ALLOCATOR_MODE} | tfbd_experimental={ENABLE_TFBD}"
         )
-        print(f" Script version: {SCRIPT_VERSION}")
+        print(f"  SCRIPT_VERSION: {SCRIPT_VERSION}")
     else:
-        print(" TOPOLOGICAL-FIBER-BUNDLE-DIFFUSION LOAD FAILED")
-    print("================================================================================\n")
+        print("  LOAD FAILED")
+    print("=" * 72 + "\n")
 
 
-print_one_million_brains_banner = print_tfbd_banner  # backward-compatible alias
+print_tfbd_banner = print_one_million_brains_banner  # backward-compatible alias
 
 
 _STREAM_IN_THINKING = False
@@ -7480,9 +7476,8 @@ def print_post_load_arc_config() -> None:
     print("\n" + "-" * 72)
     print("RUNTIME ARC CONFIG — QUICK REFERENCE")
     print("-" * 72)
-    print(f"  Engine       : TFBD + DiffusionGemma (hf)")
-    print(f"  TFBD         : enabled={ENABLE_TFBD} fiber_dim={TFBD_FIBER_DIM}")
-    print(f"  Per test     : Phase1:{hyp_n} props -> Phase2:1 grid (pixel vote if spatial ensemble)")
+    print(f"  Engine       : DiffusionGemma (hf) — Million-Brains spatial ensemble")
+    print(f"  Per test     : Phase1:{hyp_n} spatial grids -> Phase2: pixel majority vote")
     print(f"  BENCHMARK_K  : {K} (demo benchmark only — NOT used in ARC Phase 1/2)")
     print(
         f"  ARC hints   : Phase1 shows 'Rendering prompts: {hyp_n}/{hyp_n}' | "
@@ -8070,7 +8065,7 @@ if __name__ == "__main__":
         llm, tokenizer, _ = load_models(model_name)
 
     # 4) Sanity: force the banner again so it is unmistakable in the log
-    print_tfbd_banner(True)
+    print_one_million_brains_banner(True)
 
     verify_inference_engine(llm, tokenizer)
 

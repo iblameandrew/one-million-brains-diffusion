@@ -1,76 +1,75 @@
-# Topological Fiber-Bundle Diffusion (TFBD)
+# one-million-brains-diffusiongemma
 
 <img width="784" height="1168" alt="image" src="https://github.com/user-attachments/assets/41dd8f5d-7fb1-4437-acd5-ddc00146e6d9" />
 
-**TFBD × DiffusionGemma** — ARC-AGI matrix completion with structured 2D fiber embeddings over HuggingFace block-diffusion.
+**Permutation-Gated Feature-Slot Diffusion** on DiffusionGemma — HuggingFace block-diffusion with a Million-Brains orchestration layer (prompt + sampling conditioning, not draft-model speculative decoding).
 
-Single Kaggle script: `tfbd.py` (`SCRIPT_VERSION = 2026-06-20-tfbd-u`). HuggingFace-only (`DiffusionGemmaForBlockDiffusion`); no vLLM, no draft-model speculative decoding.
+Single Kaggle script: `tfbd.py` (legacy filename; technique is Million-Brains, not TFBD). `SCRIPT_VERSION = 2026-06-21-diffusion-d-hf`. HuggingFace-only (`DiffusionGemmaForBlockDiffusion`); no vLLM.
 
 ## What it is
 
-| Layer | Role |
-|-------|------|
+| Component | Role |
+|-----------|------|
 | **DiffusionGemma (HF)** | Block-diffusion engine: 256-token canvas, iterative denoise + commit |
-| **TopologicalFiberEmbedding** | Per-cell `E = E_value + E_row + E_col + E_symmetry` |
-| **CosmosSparsifier + TorusCache** | Latent sparsification + `T²` base-space projection |
-| **FiberBundleDenoiser** | Partial re-masking: lock logic skeleton, explore fiber stalks |
-| **CohomologicalStitcher** | K-trajectory copresheaf stitch + homology PRM proxy (β₀, β₁, χ) |
-| **TFBD_Orchestrator** | Wraps DiffusionGemma; fiber KV bias + `inputs_embeds` injection |
+| **PermutationFeatureSlotAllocator** | Hash pooled state → permutation of K features from 12 spatial primitives |
+| **CTSB circuit smoothing** | Limits primitive-slot swaps between denoise super-blocks |
+| **Cross-stream fusion + cumprod verify** | Accept/reject parallel trajectories before canvas commit |
+| **ARC spatial ensemble** | Phase 1: 8 primitive-conditioned JSON grids; Phase 2: pixel majority vote |
 
-Training-free orchestration only — no backward passes.
+Conditioning is **prompt + greedy sampling params** only. No hidden-state injection, no fiber embeddings, no cohomological stitch in the default path (`ENABLE_TFBD = False`).
 
 ## Two execution pipelines
 
 | Pipeline | When | Technique |
 |----------|------|-----------|
-| **ARC eval** (default with data mounted) | Competition/local ARC JSON present | Phase 1: 8 spatial-primitive JSON grids → Phase 2: stitch or vote |
-| **Demo benchmark** | `--demo-only` or `ARC_DATA_PROFILE=off` | `K=4` TFBD fiber-bundle trajectories per denoise super-block |
+| **ARC eval** (default with data mounted) | Competition/local ARC JSON present | Two-phase **spatial grid ensemble** — no Million-Brains denoise loop |
+| **Demo benchmark** | `--demo-only` or `ARC_DATA_PROFILE=off` | **K=4** parallel conditioned trajectories per denoise super-block |
 
 `K=4` (benchmark) and `ARC_HYPOTHESIS_SLOTS=8` (ARC Phase 1) are independent.
 
-## ARC eval technique (default: `ENABLE_TFBD=True`)
+## ARC eval technique (default path)
+
+When competition data is attached, the script evaluates ARC-AGI **without** the benchmark denoise loop:
 
 **Phase 1 — spatial hypothesis pool** (`ARC_HYPOTHESIS_SLOTS = 8`)
 
-1. `FiberPrimitiveAllocator` (or permutation/hybrid via `ALLOCATOR_MODE`) picks 8 primitives from the 12-lens bank.
+1. `PermutationFeatureSlotAllocator` permutes 8 primitives from the 12-lens bank.
 2. Per slot: spatial-lens prompt (train pairs + test input + primitive instruction).
-3. Batched HF `generate()` when `ARC_PHASE1_PROMPT_PARALLELISM = True` (serial fallback for huge grids).
-4. `ARC_SPATIAL_ENABLE_THINKING = False` — slots emit JSON grids only (`[[` prefill, greedy decode).
-5. TFBD injects `TopologicalFiberEmbedding` from test input into `inputs_embeds` when `ENABLE_TFBD=True`.
-6. Parse each response into a 2D integer grid.
+3. HF `generate()` calls (`ARC_PHASE1_PROMPT_PARALLELISM` controls batching vs sequential).
+4. `ARC_SPATIAL_ENABLE_THINKING = False` — greedy JSON decode, `[[` prefill, thinking off.
+5. Parse each response into a 2D integer grid.
 
-**Phase 2 — grid fusion** (`ARC_SPATIAL_GRID_ENSEMBLE = True`)
+**Phase 2 — pixel majority vote** (`ARC_SPATIAL_GRID_ENSEMBLE = True`)
 
-| `ENABLE_TFBD` | Phase 2 method |
-|---------------|----------------|
-| `True` (default) | **CohomologicalStitcher** — PRM/Betti-proxy copresheaf row stitch across parsed grids |
-| `False` | **Pixel majority vote** — per-cell plurality (no LLM synthesis) |
+- Per-cell plurality across parsed Phase-1 grids → final output grid.
+- **No LLM synthesis**; Phase 2 is deterministic voting only.
 
 Outputs: PNG grade cards (`arc_grades/`), `tfbd_results.json`, accuracy summary.
 
-## Demo benchmark technique
+## Demo benchmark technique (Million-Brains denoise)
 
-When ARC data is off, `tfbd_generate()` runs TFBD-orchestrated block diffusion:
+Only when running `--demo-only` or when ARC paths are unavailable:
 
-1. Fiber primitive resonance picks **K=4** trajectories.
-2. Fiber-bundle transition smoothing on the torus discourse buffer.
-3. K parallel conditioned `generate()` calls with per-slot lens prompts.
-4. Verification + cumprod acceptance commits tokens into the canvas.
-5. Doppler-guided reallocation on weak slots.
+At each denoise super-block (`DIFFUSION_DENOISE_CHUNK = 6` tokens):
+
+1. Hash history → permutation of **K=4** features from 12 primitives.
+2. **CTSB** circuit smoothing limits slot swaps between super-blocks.
+3. **K** parallel `generate()` calls with per-slot lens prompts.
+4. Cross-stream fusion + cumprod logprob verification + adaptive reallocation.
+5. Accepted tokens commit into the 256-token block-diffusion canvas; loop continues.
 
 ## The 12 spatial primitives
 
-`Rotate90`, `Rotate180`, `ReflectH`, `ReflectV`, `Transpose`, `CropBBox`, `TileRepeat`, `ColorMap`, `SymmetryComplete`, `FloodFill`, `ComponentExtract`, `GravityShift` — each has a prompt lens and fiber-space fingerprint in `FiberPrimitiveAllocator`.
+`Rotate90`, `Rotate180`, `ReflectH`, `ReflectV`, `Transpose`, `CropBBox`, `TileRepeat`, `ColorMap`, `SymmetryComplete`, `FloodFill`, `ComponentExtract`, `GravityShift` — each has a per-slot prompt lens in `SPATIAL_PRIMITIVE_LENSES`.
 
 ## Key files
 
 | Path | Purpose |
 |------|---------|
 | `tfbd.py` | Main entry (load, verify, ARC eval, benchmark, CLI) |
+| `million_brains_dflash.py` | Deprecated shim → delegates to `tfbd.py` |
 | `agent-tools/verify_arc_phase1.py` | CPU-only structure / budget tests |
 | `agent-tools/test_pixel_vote.py` | Pixel vote unit tests |
-
-Legacy alias: `million_brains_dflash_generate = tfbd_generate` in `tfbd.py`.
 
 ## Quick start (Kaggle)
 
@@ -91,9 +90,7 @@ Legacy alias: `million_brains_dflash_generate = tfbd_generate` in `tfbd.py`.
 !pip install -q "accelerate>=0.26.0" "safetensors>=0.4.0"
 ```
 
-The wheel cell uses `--no-deps`; `accelerate` and `safetensors` are required for sharded HF load. **No bitsandbytes** — loading uses an explicit per-layer `device_map` across your GPUs.
-
-> If your notebook still pastes an old `million_brains_dflash.py` cell that mentions `strategy 0: bitsandbytes`, replace it with `tfbd.py` from this repo (or run `million_brains_dflash.py`, which delegates to `tfbd.py`).
+No bitsandbytes. Loading uses an explicit per-layer `device_map` across your GPUs.
 
 ### 3. Run
 
@@ -101,24 +98,24 @@ The wheel cell uses `--no-deps`; `accelerate` and `safetensors` are required for
 !python tfbd.py --arc-profile auto --arc-split evaluation
 ```
 
-Expected banner: `TOPOLOGICAL-FIBER-BUNDLE-DIFFUSION INITIALIZED`.
+Expected banner: `ONE-MILLION-BRAINS-DIFFUSIONGEMMA INITIALIZED`.
 
 Benchmark only: `!python tfbd.py --demo-only`
 
 ### 4. Hardware
 
 - **26B MoE** uses manual per-layer `device_map` (avoids accelerate tie-weight crashes on DiffusionGemma).
-- **4×22GB** works with sequential/batched Phase 1; **A100 80GB** is more comfortable.
-- `TFBD_KEEP_ON_CPU = True` keeps fiber modules on CPU when GPUs are full.
+- **4×22GB** works with batched/sequential Phase 1; **A100 80GB** is more comfortable.
 
 ## Configuration
 
 All toggles live in the `TOGGLES` block at the top of `tfbd.py`:
 
-- `ENABLE_TFBD` — fiber injection + cohomological stitch vs legacy pixel vote
+- `ENABLE_TFBD` — `False` by default; set `True` only for experimental fiber-bundle path (not the documented technique)
+- `ALLOCATOR_MODE` — `"permutation"` by default (`"fiber"` / `"hybrid"` are TFBD experimental)
 - `ARC_DATA_PROFILE` — `"auto"` | `"kaggle"` | `"local"` | `"off"`
 - `ARC_HYPOTHESIS_SLOTS` — Phase-1 pool size (default 8)
-- `ARC_SPATIAL_GRID_ENSEMBLE` — grid hypotheses + Phase-2 fusion
+- `ARC_SPATIAL_GRID_ENSEMBLE` — grid hypotheses + pixel majority Phase 2
 - `EVAL_MAX_TASKS` / `EVAL_SMOKE_TASK_ID` — smoke-test scope
 - `K` — demo benchmark parallel trajectories only
 
@@ -126,10 +123,9 @@ All toggles live in the `TOGGLES` block at the top of `tfbd.py`:
 
 | Prefix | Meaning |
 |--------|---------|
-| `[TFBD-DIFFUSION]` | Benchmark denoise loop |
-| `[TFBD-FIBER]` | Fiber primitive resonance |
+| `[MBR-DIFFUSION]` / `[DIFFUSION]` | Benchmark denoise loop |
 | `[ARC-PHASE-1]` | Spatial hypothesis generation |
-| `[ARC-PHASE-2]` | Cohomological stitch or pixel vote |
+| `[ARC-PHASE-2]` | Pixel majority vote across parsed grids |
 | `[FINAL][arc]` | Dataset accuracy |
 
 ## Verification

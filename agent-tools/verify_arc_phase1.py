@@ -13,8 +13,13 @@ SOURCE = SCRIPT.read_text(encoding="utf-8")
 
 
 class TestSourceStructure(unittest.TestCase):
-    def test_version_is_tfbd_v(self):
-        self.assertIn('SCRIPT_VERSION = "2026-06-20-tfbd-v"', SOURCE)
+    def test_version_is_diffusion_d_hf(self):
+        self.assertIn('SCRIPT_VERSION = "2026-06-21-diffusion-d-hf"', SOURCE)
+
+    def test_million_brains_defaults(self):
+        self.assertIn("ENABLE_TFBD = False", SOURCE)
+        self.assertIn('ALLOCATOR_MODE = "permutation"', SOURCE)
+        self.assertIn("ONE-MILLION-BRAINS-DIFFUSIONGEMMA", SOURCE)
 
     def test_no_quantized_loader(self):
         self.assertNotIn("BitsAndBytesConfig", SOURCE)
