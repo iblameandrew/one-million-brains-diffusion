@@ -21,7 +21,7 @@ Backend: HuggingFace DiffusionGemmaForBlockDiffusion only (no vLLM).
 # =============================================================================
 # TOGGLES - ALL USER CONTROLS LIVE HERE (edit and re-run)
 # =============================================================================
-SCRIPT_VERSION = "2026-06-20-tfbd-u"  # TFBD startup banner (replaces One-Million-Brains)
+SCRIPT_VERSION = "2026-06-20-tfbd-v"  # TFBD startup banner (replaces One-Million-Brains)
 HF_FAST_VERIFY = True  # stub tail logprobs on diffusion verify passes (no causal forward)
 HF_TORCH_DTYPE = "bfloat16"  # official recipe; use "float16" if bf16 unsupported
 # --- DiffusionGemma core (default engine) ---
@@ -3594,31 +3594,37 @@ def _hf_remote_code_class_refs(config: Any) -> List[str]:
     return refs
 
 
-def _hf_load_diffusiongemma_weights(
-    model_path: str,
-    *,
-    config: Any,
-    dtype: torch.dtype,
-    local_files_only: bool,
-    device_map: Dict[str, int],
-) -> Any:
-    """Load DiffusionGemma: installed class, checkpoint remote code, or AutoModel."""
-    common: Dict[str, Any] = {
-        "trust_remote_code": True,
-        "local_files_only": local_files_only,
-        "device_map": device_map,
-        "max_memory": _hf_max_memory_map(),
-        "low_cpu_mem_usage": True,
-    }
-    errors: List[str] = []
+def _hf_offload_folder() -> str:
+    """Writable offload dir (Kaggle model inputs are read-only)."""
+    base = "/kaggle/working" if os.path.isdir("/kaggle/working") else os.getcwd()
+    path = os.path.join(base, "diffusiongemma_offload")
+    os.makedirs(path, exist_ok=True)
+    return path
 
+
+def _hf_count_meta_params(model: Any) -> int:
+    return sum(1 for p in model.parameters() if p.device.type == "meta")
+
+
+def _hf_weights_materialized(model: Any) -> bool:
+    """True when embed/lm_head weights are on a real device (not meta skeleton)."""
+    meta_n = _hf_count_meta_params(model)
+    if meta_n == 0:
+        return True
+    try:
+        dev = _resolve_hf_input_device(model)
+        return dev.type != "meta"
+    except Exception:
+        return False
+
+
+def _hf_resolve_diffusiongemma_class(config: Any, model_path: str) -> Tuple[Any, str]:
+    """Pick DiffusionGemma class: installed transformers, checkpoint code, or AutoModel."""
+    errors: List[str] = []
     try:
         from transformers import DiffusionGemmaForBlockDiffusion
 
-        print("[LOAD][HF] loader=transformers.DiffusionGemmaForBlockDiffusion")
-        return _hf_from_pretrained_compat(
-            DiffusionGemmaForBlockDiffusion, model_path, dtype, **common
-        )
+        return DiffusionGemmaForBlockDiffusion, "transformers.DiffusionGemmaForBlockDiffusion"
     except Exception as exc:
         errors.append(f"DiffusionGemmaForBlockDiffusion: {type(exc).__name__}: {exc}")
 
@@ -3632,8 +3638,7 @@ def _hf_load_diffusiongemma_weights(
             seen.add(class_ref)
             try:
                 cls = get_class_from_dynamic_module(class_ref, model_path)
-                print(f"[LOAD][HF] loader=checkpoint remote_code ({class_ref})")
-                return _hf_from_pretrained_compat(cls, model_path, dtype, **common)
+                return cls, f"checkpoint remote_code ({class_ref})"
             except Exception as inner:
                 errors.append(f"{class_ref}: {type(inner).__name__}: {inner}")
     except Exception as exc:
@@ -3642,15 +3647,127 @@ def _hf_load_diffusiongemma_weights(
     try:
         from transformers import AutoModel
 
-        print("[LOAD][HF] loader=AutoModel (trust_remote_code)")
-        return _hf_from_pretrained_compat(AutoModel, model_path, dtype, **common)
+        return AutoModel, "AutoModel (trust_remote_code)"
     except Exception as exc:
         errors.append(f"AutoModel: {type(exc).__name__}: {exc}")
 
     raise RuntimeError(
-        "[LOAD][HF] Failed to load DiffusionGemma from local checkpoint.\n  "
+        "[LOAD][HF] No DiffusionGemma model class available.\n  "
         + "\n  ".join(errors)
         + "\n  "
+        + _diffusiongemma_runtime_help()
+    )
+
+
+def _hf_load_via_accelerate_dispatch(
+    model_cls: Any,
+    model_path: str,
+    *,
+    config: Any,
+    dtype: torch.dtype,
+    local_files_only: bool,
+    device_map: Dict[str, int],
+) -> Any:
+    """accelerate dispatch with explicit manual device_map (no infer_auto tie crash)."""
+    from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+
+    offload_folder = _hf_offload_folder()
+    with init_empty_weights():
+        shell = model_cls(config)
+        if hasattr(shell, "tie_weights"):
+            shell.tie_weights()
+    print(
+        f"[LOAD][HF] accelerate load_checkpoint_and_dispatch: "
+        f"{len(device_map)} modules | offload={offload_folder}"
+    )
+    model = load_checkpoint_and_dispatch(
+        shell,
+        checkpoint=model_path,
+        device_map=device_map,
+        dtype=dtype,
+        offload_folder=offload_folder,
+        offload_state_dict=True,
+    )
+    if not getattr(model, "hf_device_map", None):
+        setattr(model, "hf_device_map", device_map)
+    return model
+
+
+def _hf_load_diffusiongemma_weights(
+    model_path: str,
+    *,
+    config: Any,
+    dtype: torch.dtype,
+    local_files_only: bool,
+    device_map: Dict[str, int],
+) -> Any:
+    """Load DiffusionGemma via explicit per-layer device_map (no 4-bit quant)."""
+    model_cls, class_label = _hf_resolve_diffusiongemma_class(config, model_path)
+    max_memory = _hf_max_memory_map()
+    offload_folder = _hf_offload_folder()
+    errors: List[str] = []
+
+    strategies: List[Tuple[str, Dict[str, Any]]] = [
+        (
+            "explicit_map_low_mem",
+            {
+                "low_cpu_mem_usage": True,
+                "offload_folder": offload_folder,
+                "offload_state_dict": True,
+            },
+        ),
+        (
+            "explicit_map_materialize",
+            {
+                "low_cpu_mem_usage": False,
+                "offload_folder": offload_folder,
+                "offload_state_dict": True,
+            },
+        ),
+    ]
+
+    for label, extra in strategies:
+        common: Dict[str, Any] = {
+            "trust_remote_code": True,
+            "local_files_only": local_files_only,
+            "device_map": device_map,
+            "max_memory": max_memory,
+            "attn_implementation": "eager",
+            **extra,
+        }
+        try:
+            print(f"[LOAD][HF] strategy {label}: {class_label}")
+            model = _hf_from_pretrained_compat(
+                model_cls, model_path, dtype, **common
+            )
+            if _hf_weights_materialized(model):
+                return model
+            meta_n = _hf_count_meta_params(model)
+            errors.append(f"{label}: weights still meta (meta params={meta_n})")
+        except Exception as exc:
+            errors.append(f"{label}: {type(exc).__name__}: {exc}")
+
+    try:
+        print(f"[LOAD][HF] strategy accelerate_dispatch: {class_label}")
+        model = _hf_load_via_accelerate_dispatch(
+            model_cls,
+            model_path,
+            config=config,
+            dtype=dtype,
+            local_files_only=local_files_only,
+            device_map=device_map,
+        )
+        if _hf_weights_materialized(model):
+            return model
+        meta_n = _hf_count_meta_params(model)
+        errors.append(f"accelerate_dispatch: weights still meta (meta params={meta_n})")
+    except Exception as exc:
+        errors.append(f"accelerate_dispatch: {type(exc).__name__}: {exc}")
+
+    raise RuntimeError(
+        "[LOAD][HF] All DiffusionGemma load strategies failed (explicit device_map).\n  "
+        + "\n  ".join(errors)
+        + "\n  Ensure accelerate + safetensors are installed; restart kernel if VRAM is dirty.\n  "
         + _diffusiongemma_runtime_help()
     )
 

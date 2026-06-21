@@ -91,7 +91,9 @@ Legacy alias: `million_brains_dflash_generate = tfbd_generate` in `tfbd.py`.
 !pip install -q "accelerate>=0.26.0" "safetensors>=0.4.0"
 ```
 
-The wheel cell uses `--no-deps`; `accelerate` and `safetensors` are required for sharded HF load.
+The wheel cell uses `--no-deps`; `accelerate` and `safetensors` are required for sharded HF load. **No bitsandbytes** — loading uses an explicit per-layer `device_map` across your GPUs.
+
+> If your notebook still pastes an old `million_brains_dflash.py` cell that mentions `strategy 0: bitsandbytes`, replace it with `tfbd.py` from this repo (or run `million_brains_dflash.py`, which delegates to `tfbd.py`).
 
 ### 3. Run
 

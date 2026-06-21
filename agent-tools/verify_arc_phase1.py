@@ -13,8 +13,13 @@ SOURCE = SCRIPT.read_text(encoding="utf-8")
 
 
 class TestSourceStructure(unittest.TestCase):
-    def test_version_is_tfbd_u(self):
-        self.assertIn('SCRIPT_VERSION = "2026-06-20-tfbd-u"', SOURCE)
+    def test_version_is_tfbd_v(self):
+        self.assertIn('SCRIPT_VERSION = "2026-06-20-tfbd-v"', SOURCE)
+
+    def test_no_quantized_loader(self):
+        self.assertNotIn("BitsAndBytesConfig", SOURCE)
+        self.assertNotIn("_load_diffusiongemma_bnb", SOURCE)
+        self.assertNotIn("strategy 0: bitsandbytes", SOURCE)
 
     def test_tfbd_orchestrator_present(self):
         self.assertIn("class TFBD_Orchestrator", SOURCE)
