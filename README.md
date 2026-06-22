@@ -8,6 +8,30 @@ Single Kaggle script: `million_brains_dflash.py`. `SCRIPT_VERSION = 2026-06-21-d
 
 **DISCLAIMER: CURRENT PERFORMANCE OF THIS TECHNIQUE IN ARC-AGI-2 IS 2/120 - SO IM ADDING THIS CURIOSITY TO MY COLLECTION OF TOYS AND TRYING SOMETHING ELSE**
 
+## Why "One Million Brains"
+
+The name is not marketing fluff — it is the combinatorics of the **circuit grammar**.
+
+You have a fixed bank of **12 spatial primitives** (`Rotate90`, `ReflectH`, `ColorMap`, …). Each run picks an **ordered injection** of `K` distinct primitives into `K` parallel slots. That assignment is one **circuit**: a specific wiring of “mini-brains,” each with its own prompt lens and sampling personality, all conditioned on the same DiffusionGemma engine.
+
+The allocator does not sample circuits with a neural net. It **unranks** them: hash pooled verification state + step → `rank mod P(n,k)` → factorial-number-system decode into a permutation (`hash_to_feature_permutation`, `unrank_permutation`). Every rank is a different circuit; every super-block or hypothesis pass can land on a different one.
+
+| Mode | Slots (K) | Primitives (n) | Distinct circuits P(n,k) = n!/(n−k)! |
+|------|-------------|----------------|----------------------------------------|
+| **ARC Phase 1** | 8 | 12 | **6,652,800** (~6.7M) |
+| **Demo denoise** | 4 | 12 | **11,880** per super-block |
+| **Hypothetical 12-slot** | 12 | 12 | **479,001,600** |
+
+So a single ARC answer already explores a hypothesis pool drawn from **millions** of possible circuits — not one monolithic prompt, but eight parallel “brains” each wearing a different spatial lens from the same combinatorial menu.
+
+In the **demo benchmark**, that menu is smaller per step (11,880 circuits at K=4), but it **compounds across the denoise run**:
+
+1. Each super-block commits tokens → pooled history changes → **new hash → new circuit**.
+2. **CTSB** does not teleport between circuits; it geodesically **morphs** slot assignments (≤2 swaps per block), so trajectories trace a path through circuit space instead of independent random draws.
+3. **K parallel `generate()` calls** per step each follow a different slot of the *same* circuit; cumprod verification + reallocation kill weak slots and let the next permutation adapt.
+
+One engine, one canvas — but over a full generation you are not running one reasoning style. You are running a **sequence of circuits** sampled from a space whose single-step cardinality is already thousands to millions, then fused back into one committed output. That is the Million-Brains idea: **combinatorially many possible orchestration circuits, compounded over diffusion time, collapsed into one answer.**
+
 ## What it is
 
 | Component | Role |
@@ -35,7 +59,7 @@ When competition data is attached, the script evaluates ARC-AGI **without** the 
 
 **Phase 1 — spatial hypothesis pool** (`ARC_HYPOTHESIS_SLOTS = 8`)
 
-1. `PermutationFeatureSlotAllocator` permutes 8 primitives from the 12-lens bank.
+1. `PermutationFeatureSlotAllocator` picks one of **6,652,800** possible 8-slot circuits from the 12-lens bank (hash → unrank).
 2. Per slot: spatial-lens prompt (train pairs + test input + primitive instruction).
 3. HF `generate()` calls (`ARC_PHASE1_PROMPT_PARALLELISM` controls batching vs sequential).
 4. `ARC_SPATIAL_ENABLE_THINKING = False` — greedy JSON decode, `[[` prefill, thinking off.
@@ -54,7 +78,7 @@ Only when running `--demo-only` or when ARC paths are unavailable:
 
 At each denoise super-block (`DIFFUSION_DENOISE_CHUNK = 6` tokens):
 
-1. Hash history → permutation of **K=4** features from 12 primitives.
+1. Hash history → one of **11,880** possible 4-slot circuits from 12 primitives (new draw each super-block).
 2. **CTSB** circuit smoothing limits slot swaps between super-blocks.
 3. **K** parallel `generate()` calls with per-slot lens prompts.
 4. Cross-stream fusion + cumprod logprob verification + adaptive reallocation.
