@@ -4,9 +4,9 @@
 
 **Permutation-Gated Feature-Slot Diffusion** on DiffusionGemma — HuggingFace block-diffusion with a Million-Brains orchestration layer (prompt + sampling conditioning, not draft-model speculative decoding).
 
-Single Kaggle script: `million_brains_dflash.py`. `SCRIPT_VERSION = 2026-06-21-diffusion-d-hf`. HuggingFace-only (`DiffusionGemmaForBlockDiffusion`); no vLLM. Wanted to see what happened if i live-wired a QNN from my open-deepthink problem into a diffusion superblock.
+Single Kaggle script: `million_brains_dflash.py`. `SCRIPT_VERSION = 2026-06-21-diffusion-d-hf`. HuggingFace-only (`DiffusionGemmaForBlockDiffusion`); no vLLM. Wanted to see what happened if i live-wired a QNN from my open-deepthink project into a diffusion superblock.
 
-**DISCLAIMER: CURRENT PERFORMANCE OF THIS TECHNIQUE IN ARC-AGI-2 IS 2/120 - SO IM ADDING THIS TO MY COLLECTION OF TOYS**
+**DISCLAIMER: CURRENT PERFORMANCE OF THIS TECHNIQUE IN ARC-AGI-2 IS 2/120 - SO IM ADDING THIS CURIOSITY TO MY COLLECTION OF TOYS AND TRYING SOMETHING ELSE**
 
 ## What it is
 
